@@ -1,9 +1,17 @@
 import requests 
 import json
+import time
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 import boto3
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()                          
 api_key = os.getenv("ZTM_API_KEY")
@@ -22,17 +30,32 @@ s3 = boto3.client(
 )
 
 
-def fetch_positions(vehicle_type):
+def fetch_positions(vehicle_type, max_attempts=3):
     params = {
         "resource_id": "f2e5503e-927d-4ad3-9500-4ab9e55deb59",
         "apikey": api_key,
         "type": vehicle_type
     }
-    response = requests.get(url, params=params)
-    data = response.json()
-    return data["result"]
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            result = data["result"]
+            if not isinstance(result, list):
+                raise ValueError(f"API zwróciło błąd: {result}")
+            return result
+        except (requests.RequestException, ValueError) as e:
+            if attempt == max_attempts:
+                logger.error(f"All {max_attempts} attempts failed for vehicle type {vehicle_type}: {e}")
+                raise
+            logger.warning(f"Attempt {attempt}/{max_attempts} failed for vehicle type {vehicle_type}: {e}")
+            time.sleep(2** attempt)  
 
 def save_to_bronze(records, vehicle_label):
+    if not records:
+        logger.warning(f"No records fetched for vehicle type {vehicle_label}")
+        return
     
     ingested_at = datetime.now(timezone.utc)
 
@@ -55,11 +78,11 @@ def save_to_bronze(records, vehicle_label):
     s3.put_object(Bucket="bronze", Key=key, Body=body.encode("utf-8"))
 
     
-    print(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
+    logger.info(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
 
 buses = fetch_positions(1)
 trams = fetch_positions(2)
-print(len(buses), len(trams))
+logger.info(f"Fetched {len(buses)} buses and {len(trams)} trams")
   
 save_to_bronze(buses, "bus")
 save_to_bronze(trams, "tram")
