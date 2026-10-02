@@ -42,7 +42,7 @@ The same code will run against AWS S3 by changing a single environment variable.
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/<mati290>/<REPO_NAME>.git
+   git clone https://github.com/<mati290>/<ZTM_data_proccesing>.git
    cd <ZTM_data_processing>
    ```
 
