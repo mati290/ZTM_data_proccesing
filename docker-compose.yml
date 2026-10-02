@@ -1,0 +1,16 @@
+services:
+  minio:                                              # nazwa usługi (dowolna)
+    image: cgr.dev/chainguard/minio:latest
+    user: root   # obraz do pobrania, konkretna wersja
+    command: server /data --console-address ":9001"   # uruchom serwer, konsola WWW na porcie 9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}                  # login, wczytany z .env
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}          # hasło, wczytane z .env
+    ports:
+      - "9000:9000"                                   # port API S3 (tu łączy się Python)
+      - "9001:9001"                                   # port konsoli w przeglądarce
+    volumes:
+      - minio_data:/data                              # dane przetrwają restart kontenera
+
+volumes:
+  minio_data:

@@ -3,7 +3,7 @@ import json
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone
-from pathlib import Path
+import boto3
 
 load_dotenv()                          
 api_key = os.getenv("ZTM_API_KEY")
@@ -13,6 +13,13 @@ if not api_key:
 
 
 url = "https://api.um.warszawa.pl/api/action/busestrams_get/"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://localhost:9000",   # adres MinIO; na AWS ta linia zniknie
+    aws_access_key_id=os.getenv("MINIO_USER"),
+    aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
+)
 
 
 def fetch_positions(vehicle_type):
@@ -26,31 +33,29 @@ def fetch_positions(vehicle_type):
     return data["result"]
 
 def save_to_bronze(records, vehicle_label):
-    #moment pobrania danych 
+    
     ingested_at = datetime.now(timezone.utc)
 
-    # sciezka folderu  
-    folder = (
-        Path("data") / "bronze"
-        / f"vehicle_type={vehicle_label}"                  # tekst "bus" / "tram", NIE lista
-        / f"date={ingested_at.strftime('%Y-%m-%d')}"       # np. 2026-10-02
-        / f"hour={ingested_at.strftime('%H')}"             # np. 08
-    )
-
-    # Nazwa pliku z pełnym czasem 
+    
     file_name = f"positions_{ingested_at.strftime('%Y%m%dT%H%M%S')}.jsonl"
+    
+    key = (f"vehicle_type={vehicle_label}/"
+           f"date={ingested_at.strftime('%Y-%m-%d')}/"
+           f"hour={ingested_at.strftime('%H')}/"
+           f"{file_name}")
+    
+    
+    lines = []
+    for record in records:
+        record["_ingested_at"] = ingested_at.isoformat()
+        lines.append(json.dumps(record, ensure_ascii=False))
+        
+    body = "\n".join(lines)
 
-    # Tworzymy foldery
-    folder.mkdir(parents=True, exist_ok=True)
+    s3.put_object(Bucket="bronze", Key=key, Body=body.encode("utf-8"))
 
-    # Zapisuuje rekordy jeden na linię
-    with open(folder / file_name, "w", encoding="utf-8") as f:
-        for record in records:
-            record["_ingested_at"] = ingested_at.isoformat()
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    #informacja czy pliki zostaly pobrane 
-    print(f"Zapisano {len(records)} rekordów do {folder / file_name}")
+    
+    print(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
 
 buses = fetch_positions(1)
 trams = fetch_positions(2)
