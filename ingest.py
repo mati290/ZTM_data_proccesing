@@ -24,7 +24,7 @@ url = "https://api.um.warszawa.pl/api/action/busestrams_get/"
 
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://localhost:9000",   # adres MinIO; na AWS ta linia zniknie
+    endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),   # adres MinIO; na AWS ta linia zniknie
     aws_access_key_id=os.getenv("MINIO_USER"),
     aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
 )
@@ -51,6 +51,7 @@ def fetch_positions(vehicle_type, max_attempts=3):
                 raise
             logger.warning(f"Attempt {attempt}/{max_attempts} failed for vehicle type {vehicle_type}: {e}")
             time.sleep(2** attempt)  
+    raise RuntimeError(f"Failed to fetch positions for vehicle type {vehicle_type}")
 
 def save_to_bronze(records, vehicle_label):
     if not records:
@@ -80,10 +81,26 @@ def save_to_bronze(records, vehicle_label):
     
     logger.info(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
 
-buses = fetch_positions(1)
-trams = fetch_positions(2)
-logger.info(f"Fetched {len(buses)} buses and {len(trams)} trams")
-  
-save_to_bronze(buses, "bus")
-save_to_bronze(trams, "tram")
 
+def run_once():
+    buses = fetch_positions(1)
+    trams = fetch_positions(2)
+    logger.info(f"Fetched {len(buses)} buses and {len(trams)} trams")
+    
+    save_to_bronze(buses, "bus")
+    save_to_bronze(trams, "tram")
+ 
+    
+def main():
+    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+    logger.info(f"Starting main loop with interval {interval} seconds")
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            logger.exception(f"Ingestion cycle failed, retrying in next cycle:")
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

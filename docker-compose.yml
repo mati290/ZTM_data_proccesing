@@ -11,6 +11,13 @@ services:
       - "9001:9001"                                   # port konsoli w przeglądarce
     volumes:
       - minio_data:/data                              # dane przetrwają restart kontenera
-
+  ingestion:
+    build: .                                  # zbuduj obraz z Dockerfile w tym folderze
+    env_file: .env                            # przekaż zmienne z .env do kontenera
+    environment:
+      S3_ENDPOINT_URL: http://minio:9000      # nadpisuje adres: w Dockerze to "minio"
+    depends_on:
+      - minio                                 # uruchom po MinIO
+    restart: unless-stopped                   # po awarii uruchom ponownie
 volumes:
   minio_data:
