@@ -15,7 +15,6 @@ from bronze_to_silver import (
     REJECTED_SQL,
     TRANSFORM_SQL,
     BronzeDataMissingError,
-    check_bronze_freshness,
     copy_s3_object,
     delete_s3_object,
     get_connection,
@@ -489,118 +488,6 @@ class PartitionValidationTests(unittest.TestCase):
         for hour_str in invalid_hours:
             with self.subTest(hour_str=hour_str), self.assertRaises(ValueError):
                 validate_partition("2026-10-09", hour_str)
-
-    def test_check_bronze_freshness_accepts_recent_partition(self):
-        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        s3_client = Mock()
-        s3_client.list_objects_v2.side_effect = [
-            {
-                "Contents": [
-                    {
-                        "LastModified": datetime(
-                            2026, 10, 9, 12, 20, tzinfo=timezone.utc
-                        )
-                    },
-                    {
-                        "LastModified": datetime(
-                            2026, 10, 9, 12, 25, tzinfo=timezone.utc
-                        )
-                    },
-                ]
-            },
-            {
-                "Contents": [
-                    {"LastModified": datetime(2026, 10, 9, 12, 23, tzinfo=timezone.utc)}
-                ]
-            },
-        ]
-        result = check_bronze_freshness(
-            "2026-10-09", "12", now_utc=now, s3_client=s3_client
-        )
-
-        self.assertEqual(result["date"], "2026-10-09")
-        self.assertEqual(result["hour"], "12")
-        self.assertEqual(result["file_count"], 3)
-        self.assertEqual(result["age_minutes"], 5)
-        self.assertEqual(
-            result["newest_object_time"],
-            datetime(2026, 10, 9, 12, 25, tzinfo=timezone.utc),
-        )
-        self.assertEqual(s3_client.list_objects_v2.call_count, 2)
-
-    def test_check_bronze_freshness_fails_without_files(self):
-        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        s3_client = Mock()
-        s3_client.list_objects_v2.side_effect = [{}, {}]
-
-        with self.assertRaises(BronzeDataMissingError):
-            check_bronze_freshness("2026-10-09", "12", now_utc=now, s3_client=s3_client)
-
-    def test_check_bronze_freshness_rejects_stale_partition(self):
-        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        s3_client = Mock()
-        s3_client.list_objects_v2.side_effect = [
-            {
-                "Contents": [
-                    {"LastModified": datetime(2026, 10, 8, 12, tzinfo=timezone.utc)}
-                ]
-            },
-            {},
-        ]
-        with self.assertRaises(ValueError):
-            check_bronze_freshness(
-                "2026-10-08",
-                "12",
-                max_age_minutes=30,
-                now_utc=now,
-                s3_client=s3_client,
-            )
-
-    def test_check_bronze_freshness_rejects_stale_objects_in_a_recent_partition(self):
-        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        s3_client = Mock()
-        s3_client.list_objects_v2.side_effect = [
-            {
-                "Contents": [
-                    {"LastModified": datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)}
-                ]
-            },
-            {},
-        ]
-
-        with self.assertRaisesRegex(ValueError, "newest object age 30 minutes"):
-            check_bronze_freshness("2026-10-09", "12", now_utc=now, s3_client=s3_client)
-
-    def test_check_bronze_freshness_paginates_s3_listing(self):
-        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        s3_client = Mock()
-        s3_client.list_objects_v2.side_effect = [
-            {
-                "Contents": [
-                    {"LastModified": datetime(2026, 10, 9, 12, 28, tzinfo=timezone.utc)}
-                ],
-                "IsTruncated": True,
-                "NextContinuationToken": "next-page",
-            },
-            {
-                "Contents": [
-                    {"LastModified": datetime(2026, 10, 9, 12, 29, tzinfo=timezone.utc)}
-                ],
-                "IsTruncated": False,
-            },
-            {},
-        ]
-
-        result = check_bronze_freshness(
-            "2026-10-09", "12", now_utc=now, s3_client=s3_client
-        )
-
-        self.assertEqual(result["file_count"], 2)
-        self.assertEqual(s3_client.list_objects_v2.call_count, 3)
-        self.assertEqual(
-            s3_client.list_objects_v2.call_args_list[1].kwargs["ContinuationToken"],
-            "next-page",
-        )
 
 
 if __name__ == "__main__":

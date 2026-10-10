@@ -390,91 +390,6 @@ def validate_output_quality(
         )
 
 
-def check_bronze_freshness(
-    date_str: str,
-    hour_str: str,
-    max_age_minutes: int = 10,
-    now_utc: datetime | None = None,
-    s3_client=None,
-):
-    date_str, hour_str = validate_partition(date_str, hour_str)
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-
-    partition_dt = datetime.strptime(
-        f"{date_str} {hour_str}:00:00",
-        "%Y-%m-%d %H:%M:%S",
-    ).replace(tzinfo=timezone.utc)
-    partition_age_minutes = (now_utc - partition_dt).total_seconds() / 60
-    if partition_age_minutes < 0:
-        raise ValueError(
-            f"Bronze partition {date_str} hour {hour_str} is in the future; "
-            "cannot validate freshness for a future hour."
-        )
-
-    if max_age_minutes <= 0:
-        raise ValueError("max_age_minutes must be positive")
-
-    s3_client = s3_client or _s3_client()
-    file_count = 0
-    newest_object_time = None
-    for vehicle_type in ("bus", "tram"):
-        prefix = f"vehicle_type={vehicle_type}/date={date_str}/hour={hour_str}/"
-        continuation_token = None
-        while True:
-            request = {"Bucket": "bronze", "Prefix": prefix}
-            if continuation_token:
-                request["ContinuationToken"] = continuation_token
-            response = s3_client.list_objects_v2(**request)
-            for item in response.get("Contents", []):
-                file_count += 1
-                modified_at = item.get("LastModified")
-                if modified_at and (
-                    newest_object_time is None or modified_at > newest_object_time
-                ):
-                    newest_object_time = modified_at
-            if not response.get("IsTruncated"):
-                break
-            continuation_token = response.get("NextContinuationToken")
-            if not continuation_token:
-                raise RuntimeError(
-                    f"Bronze listing for {date_str} hour {hour_str} was truncated "
-                    "without a continuation token."
-                )
-
-    if not file_count:
-        raise BronzeDataMissingError(
-            f"No bronze files found for {date_str} hour {hour_str}; "
-            "data freshness check failed."
-        )
-
-    if newest_object_time is None:
-        raise RuntimeError(
-            f"Bronze objects for {date_str} hour {hour_str} have no LastModified timestamp."
-        )
-
-    age_minutes = (now_utc - newest_object_time).total_seconds() / 60
-    if age_minutes < 0:
-        raise ValueError(
-            f"Newest Bronze object for {date_str} hour {hour_str} is timestamped "
-            "in the future."
-        )
-    if age_minutes > max_age_minutes:
-        raise ValueError(
-            f"Bronze data for {date_str} hour {hour_str} is stale: "
-            f"newest object age {age_minutes:.0f} minutes exceeds the "
-            f"{max_age_minutes}-minute threshold."
-        )
-
-    return {
-        "date": date_str,
-        "hour": hour_str,
-        "age_minutes": round(age_minutes, 2),
-        "file_count": file_count,
-        "newest_object_time": newest_object_time,
-    }
-
-
 def transform_hour(con, date_str, hour_str, overwrite=True):
     date_str, hour_str = validate_partition(date_str, hour_str)
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
@@ -486,7 +401,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"{silver_dir}/_staging/{uuid.uuid4()}.rejected.parquet.pending"
     )
 
-    # glob() nie przyjmuje parametrów w duckdb 1.2.x; ścieżka pochodzi ze zwalidowanej partycji
+    # glob() nie przyjmuje parametrĂłw w duckdb 1.2.x; Ĺ›cieĹĽka pochodzi ze zwalidowanej partycji
     bronze_file = con.execute(
         f"SELECT file FROM glob('{bronze_path}') LIMIT 1"
     ).fetchone()
@@ -578,15 +493,15 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"duplicates={duplicates}, "
         f"quarantined={rejected_count}, "
         f"silver={after}, "
-        f"dropped={dropped_pct:.1%} → {output_file}"
+        f"dropped={dropped_pct:.1%} â†’ {output_file}"
     )
 
 
 def main():
-    # domyślnie: poprzednia pełna godzina w UTC
+    # domyĹ›lnie: poprzednia peĹ‚na godzina w UTC
     previous_hour = datetime.now(timezone.utc) - timedelta(hours=1)
 
-    parser = argparse.ArgumentParser(description="Bronze → silver for one hour")
+    parser = argparse.ArgumentParser(description="Bronze â†’ silver for one hour")
     parser.add_argument("--date", default=previous_hour.strftime("%Y-%m-%d"))
     parser.add_argument("--hour", default=previous_hour.strftime("%H"))
     args = parser.parse_args()

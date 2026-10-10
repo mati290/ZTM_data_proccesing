@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 from datetime import datetime, timezone
@@ -198,6 +199,11 @@ def run_once(api_key, s3):
     }
 
 
+def _handle_sigterm(signum, frame):
+    logger.info("Received SIGTERM, shutting down")
+    raise SystemExit(0)
+
+
 def main():
     load_dotenv()
     api_key = os.getenv("ZTM_API_KEY")
@@ -220,6 +226,7 @@ def main():
     if alert_threshold <= 0:
         raise ValueError("DEGRADED_CYCLES_ALERT_THRESHOLD must be a positive integer")
     logger.info(f"Starting main loop with interval {interval} seconds")
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     degraded_cycles = 0
     while True:
         degraded = True
