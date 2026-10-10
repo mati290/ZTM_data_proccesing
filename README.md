@@ -176,7 +176,8 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
 
 - [x] **Stage 1** – ZTM API ingestion to MinIO Bronze, Dockerized
 - [x] **Stage 2** – hourly Airflow and DuckDB transformation from Bronze to
-      partitioned Silver Parquet, with freshness checks, quality metrics,
+      partitioned Silver Parquet, with missing-Bronze detection (task is
+      skipped), per-record GPS freshness validation, quality metrics,
       quarantine output, and deterministic deduplication
 - [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
       GitHub Actions CI
