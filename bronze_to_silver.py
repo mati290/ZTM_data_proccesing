@@ -146,24 +146,26 @@ def transform_hour(con, date_str, hour_str):
     silver_path = (
         f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}/data.parquet"
     )
-
-    try:
-        quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
-        (
-            before,
-            after_coordinates,
-            after_time,
-            future_gps_time,
-            stale_gps_time,
-            stale_5_to_10,
-            stale_10_to_30,
-            stale_over_30,
-            missing_gps_time,
-            after,
-        ) = con.execute(quality_sql).fetchone()
-    except duckdb.IOException:
+    bronze_file = con.execute(
+        "SELECT file FROM glob(?) LIMIT 1",
+        [bronze_path],
+    ).fetchone()
+    if bronze_file is None:
         logger.warning(f"No bronze data for {date_str} hour {hour_str}, skipping")
         return
+    quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
+    (
+        before,
+        after_coordinates,
+        after_time,
+        future_gps_time,
+        stale_gps_time,
+        stale_5_to_10,
+        stale_10_to_30,
+        stale_over_30,
+        missing_gps_time,
+        after,
+    ) = con.execute(quality_sql).fetchone()
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
     con.execute(f"COPY ({sql}) TO '{silver_path}' (FORMAT parquet)")
 

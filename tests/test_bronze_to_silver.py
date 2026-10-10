@@ -3,10 +3,16 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import duckdb
 
-from bronze_to_silver import QUALITY_SQL, TRANSFORM_SQL, validate_partition
+from bronze_to_silver import (
+    QUALITY_SQL,
+    TRANSFORM_SQL,
+    transform_hour,
+    validate_partition,
+)
 
 
 class BronzeToSilverSqlTests(unittest.TestCase):
@@ -74,6 +80,26 @@ class BronzeToSilverSqlTests(unittest.TestCase):
             rows[0][7],
             datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc),
         )
+
+
+class TransformHourTests(unittest.TestCase):
+    def test_skips_when_bronze_partition_has_no_files(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.return_value = None
+
+        transform_hour(connection, "2026-10-09", "7")
+
+        connection.execute.assert_called_once_with(
+            "SELECT file FROM glob(?) LIMIT 1",
+            ["s3://bronze/vehicle_type=*/date=2026-10-09/hour=07/*.jsonl"],
+        )
+
+    def test_propagates_bronze_discovery_io_error(self):
+        connection = Mock()
+        connection.execute.side_effect = duckdb.IOException("MinIO unavailable")
+
+        with self.assertRaises(duckdb.IOException):
+            transform_hour(connection, "2026-10-09", "7")
 
 
 class PartitionValidationTests(unittest.TestCase):
