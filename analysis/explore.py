@@ -1,24 +1,6 @@
-import os
+from bronze_to_silver import get_connection
 
-import duckdb
-from dotenv import load_dotenv
-
-load_dotenv()
-
-con = duckdb.connect()
-con.execute("INSTALL httpfs; LOAD httpfs;")
-con.execute("SET TimeZone = 'UTC';")  # wszystkie obliczenia czasu w UTC
-
-con.execute(f"""
-    CREATE SECRET minio (
-        TYPE s3,
-        KEY_ID '{os.getenv("MINIO_USER")}',
-        SECRET '{os.getenv("MINIO_PASSWORD")}',
-        ENDPOINT 'localhost:9000',
-        URL_STYLE 'path',
-        USE_SSL false
-    );
-""")
+con = get_connection()
 
 # Wczytujemy bronze RAZ do tabeli w pamięci
 con.execute("""

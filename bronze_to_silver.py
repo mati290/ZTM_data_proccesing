@@ -47,7 +47,7 @@ WITH source AS (
     SELECT *
     FROM read_json_auto('{bronze_path}', hive_partitioning = true)
 ),
-typed AS (
+typed_base AS (
     SELECT
         vehicle_type,
         VehicleNumber AS vehicle_number,
@@ -55,10 +55,32 @@ typed AS (
         Brigade       AS brigade,
         TRY_CAST(Lat AS DOUBLE) AS lat,
         TRY_CAST(Lon AS DOUBLE) AS lon,
-        TRY_CAST(TRY_CAST("Time" AS TIMESTAMP) AT TIME ZONE 'Europe/Warsaw' AS TIMESTAMPTZ)
-            AS gps_time_utc,
+        TRY_CAST("Time" AS TIMESTAMP) AS gps_time_local,
         TRY_CAST(_ingested_at AS TIMESTAMPTZ) AS ingested_at
     FROM source
+),
+typed AS (
+    SELECT
+        *,
+        TRY_CAST(gps_time_local AT TIME ZONE 'Europe/Warsaw' AS TIMESTAMPTZ)
+            AS gps_time_utc,
+        CASE
+            WHEN gps_time_local IS NULL THEN NULL
+            ELSE
+                CAST(
+                    timezone(
+                        'Europe/Warsaw',
+                        (gps_time_local AT TIME ZONE 'UTC') - INTERVAL 1 HOUR
+                    ) = gps_time_local AS INTEGER
+                )
+                + CAST(
+                    timezone(
+                        'Europe/Warsaw',
+                        (gps_time_local AT TIME ZONE 'UTC') - INTERVAL 2 HOUR
+                    ) = gps_time_local AS INTEGER
+                )
+        END AS local_time_candidate_count
+    FROM typed_base
 ),
 valid_coordinates AS (
     SELECT *
@@ -66,11 +88,29 @@ valid_coordinates AS (
     WHERE lat BETWEEN 51.9 AND 52.6
     AND lon BETWEEN 20.5 AND 21.6
 ),
-valid_gps_time AS (
+valid_vehicle AS (
     SELECT *
     FROM valid_coordinates
-    WHERE ingested_at - gps_time_utc >= INTERVAL 0 SECOND
+    WHERE vehicle_number IS NOT NULL
+      AND TRIM(CAST(vehicle_number AS VARCHAR)) <> ''
+),
+valid_gps_time AS (
+    SELECT *
+    FROM valid_vehicle
+    WHERE gps_time_utc IS NOT NULL
+    AND ingested_at IS NOT NULL
+    AND local_time_candidate_count = 1
+    AND ingested_at - gps_time_utc >= INTERVAL 0 SECOND
     AND ingested_at - gps_time_utc <= INTERVAL 5 MINUTE
+),
+ranked_valid_gps_time AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY vehicle_type, vehicle_number, gps_time_utc
+            ORDER BY ingested_at DESC, lat, lon, line, brigade
+        ) AS row_num
+    FROM valid_gps_time
 ),
 deduplicated AS (
     SELECT
@@ -82,27 +122,64 @@ deduplicated AS (
         lon,
         gps_time_utc,
         ingested_at
-    FROM (
-        SELECT
-            vehicle_type,
-            vehicle_number,
-            line,
-            brigade,
-            lat,
-            lon,
-            gps_time_utc,
-            ingested_at,
-            ROW_NUMBER() OVER (
-                PARTITION BY vehicle_type, vehicle_number, gps_time_utc
-                ORDER BY ingested_at, lat, lon, line, brigade
-            ) AS row_num
-        FROM valid_gps_time
-    )
+    FROM ranked_valid_gps_time
     WHERE row_num = 1
 )
 """
 
 TRANSFORM_SQL = BASE_CTES + "SELECT * FROM deduplicated"
+
+REJECTED_SQL = (
+    BASE_CTES
+    + """
+, rejected_records AS (
+    SELECT
+        vehicle_type, vehicle_number, line, brigade, lat, lon,
+        gps_time_utc, ingested_at, 'invalid_coordinates' AS rejection_reason
+    FROM typed
+    WHERE lat IS NULL OR lon IS NULL
+       OR lat NOT BETWEEN 51.9 AND 52.6
+       OR lon NOT BETWEEN 20.5 AND 21.6
+
+    UNION ALL
+
+    SELECT
+        vehicle_type, vehicle_number, line, brigade, lat, lon,
+        gps_time_utc, ingested_at, 'missing_vehicle_number' AS rejection_reason
+    FROM valid_coordinates
+    WHERE vehicle_number IS NULL
+       OR TRIM(CAST(vehicle_number AS VARCHAR)) = ''
+
+    UNION ALL
+
+    SELECT
+        vehicle_type, vehicle_number, line, brigade, lat, lon,
+        gps_time_utc, ingested_at,
+        CASE
+            WHEN local_time_candidate_count > 1 THEN 'ambiguous_local_time'
+            WHEN local_time_candidate_count = 0 THEN 'nonexistent_local_time'
+            WHEN gps_time_utc IS NULL OR ingested_at IS NULL
+                THEN 'missing_or_invalid_timestamp'
+            WHEN gps_time_utc > ingested_at THEN 'future_gps_time'
+            ELSE 'stale_gps_time'
+        END AS rejection_reason
+    FROM valid_vehicle
+    WHERE gps_time_utc IS NULL OR ingested_at IS NULL
+       OR local_time_candidate_count <> 1
+       OR ingested_at - gps_time_utc < INTERVAL 0 SECOND
+       OR ingested_at - gps_time_utc > INTERVAL 5 MINUTE
+
+    UNION ALL
+
+    SELECT
+        vehicle_type, vehicle_number, line, brigade, lat, lon,
+        gps_time_utc, ingested_at, 'duplicate' AS rejection_reason
+    FROM ranked_valid_gps_time
+    WHERE row_num > 1
+)
+SELECT * FROM rejected_records
+"""
+)
 
 QUALITY_SQL = (
     BASE_CTES
@@ -110,39 +187,56 @@ QUALITY_SQL = (
 SELECT
     (SELECT COUNT(*) FROM source) AS bronze_count,
     (SELECT COUNT(*) FROM valid_coordinates) AS after_coordinates_count,
+    (SELECT COUNT(*) FROM valid_vehicle) AS after_vehicle_count,
     (SELECT COUNT(*) FROM valid_gps_time) AS after_time_count,
     (
         SELECT COUNT(*)
-        FROM valid_coordinates
-        WHERE gps_time_utc > ingested_at
+        FROM valid_vehicle
+        WHERE local_time_candidate_count = 1
+          AND gps_time_utc IS NOT NULL
+          AND ingested_at IS NOT NULL
+          AND gps_time_utc > ingested_at
     ) AS future_gps_time_count,
     (
         SELECT COUNT(*)
-        FROM valid_coordinates
-        WHERE ingested_at - gps_time_utc > INTERVAL 5 MINUTE
+        FROM valid_vehicle
+        WHERE local_time_candidate_count = 1
+          AND gps_time_utc IS NOT NULL
+          AND ingested_at IS NOT NULL
+          AND ingested_at - gps_time_utc > INTERVAL 5 MINUTE
     ) AS stale_gps_time_count,
     (
         SELECT COUNT(*)
-        FROM valid_coordinates
-        WHERE ingested_at - gps_time_utc > INTERVAL 5 MINUTE
+        FROM valid_vehicle
+        WHERE local_time_candidate_count = 1
+          AND gps_time_utc IS NOT NULL
+          AND ingested_at IS NOT NULL
+          AND ingested_at - gps_time_utc > INTERVAL 5 MINUTE
         AND ingested_at - gps_time_utc <= INTERVAL 10 MINUTE
     ) AS stale_5_to_10_minutes_count,
     (
         SELECT COUNT(*)
-        FROM valid_coordinates
-        WHERE ingested_at - gps_time_utc > INTERVAL 10 MINUTE
+        FROM valid_vehicle
+        WHERE local_time_candidate_count = 1
+          AND gps_time_utc IS NOT NULL
+          AND ingested_at IS NOT NULL
+          AND ingested_at - gps_time_utc > INTERVAL 10 MINUTE
         AND ingested_at - gps_time_utc <= INTERVAL 30 MINUTE
     ) AS stale_10_to_30_minutes_count,
     (
         SELECT COUNT(*)
-        FROM valid_coordinates
-        WHERE ingested_at - gps_time_utc > INTERVAL 30 MINUTE
+        FROM valid_vehicle
+        WHERE local_time_candidate_count = 1
+          AND gps_time_utc IS NOT NULL
+          AND ingested_at IS NOT NULL
+          AND ingested_at - gps_time_utc > INTERVAL 30 MINUTE
     ) AS stale_over_30_minutes_count,
     (
         SELECT COUNT(*)
-        FROM valid_coordinates
+        FROM valid_vehicle
         WHERE gps_time_utc IS NULL OR ingested_at IS NULL
-    ) AS missing_gps_time_count,
+           OR local_time_candidate_count <> 1
+    ) AS invalid_gps_time_count,
     (SELECT COUNT(*) FROM deduplicated) AS silver_count
 """
 )
@@ -167,10 +261,15 @@ def get_connection():
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("SET TimeZone = 'UTC';")
+
+    # DuckDB 1.2 does not accept bound parameters in CREATE SECRET.
+    def literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
     con.execute(
-        "CREATE SECRET minio (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, "
-        "URL_STYLE 'path', USE_SSL ?)",
-        [user, password, endpoint, use_ssl],
+        f"CREATE SECRET minio (TYPE s3, KEY_ID {literal(user)}, "
+        f"SECRET {literal(password)}, ENDPOINT {literal(endpoint)}, "
+        f"URL_STYLE 'path', USE_SSL {'true' if use_ssl else 'false'})"
     )
     return con
 
@@ -197,9 +296,9 @@ def validate_partition(date_str: str, hour_str: str) -> tuple[str, str]:
 def validate_silver_schema(con, silver_path):
     try:
         schema = con.execute(
-            f"DESCRIBE SELECT * FROM read_parquet('{silver_path}')"
+            f"DESCRIBE SELECT * FROM read_parquet('{silver_path}', hive_partitioning = false)"
         ).fetchall()
-    except Exception as exc:
+    except duckdb.Error as exc:
         raise ValueError(
             f"Silver schema validation failed for {silver_path}: {exc}"
         ) from exc
@@ -211,6 +310,14 @@ def validate_silver_schema(con, silver_path):
     if missing:
         raise ValueError(
             f"Silver schema validation failed for {silver_path}: missing columns {missing}"
+        )
+    unexpected = [
+        column for column in actual_types if column not in EXPECTED_SILVER_COLUMNS
+    ]
+    if unexpected:
+        raise ValueError(
+            f"Silver schema validation failed for {silver_path}: "
+            f"unexpected columns {unexpected}"
         )
 
     wrong_types = {
@@ -284,11 +391,11 @@ def validate_output_quality(
 
 
 def check_bronze_freshness(
-    con,
     date_str: str,
     hour_str: str,
-    max_age_minutes: int = 90,
+    max_age_minutes: int = 10,
     now_utc: datetime | None = None,
+    s3_client=None,
 ):
     date_str, hour_str = validate_partition(date_str, hour_str)
     if now_utc is None:
@@ -298,41 +405,73 @@ def check_bronze_freshness(
         f"{date_str} {hour_str}:00:00",
         "%Y-%m-%d %H:%M:%S",
     ).replace(tzinfo=timezone.utc)
-    age_minutes = (now_utc - partition_dt).total_seconds() / 60
-
-    if age_minutes < 0:
+    partition_age_minutes = (now_utc - partition_dt).total_seconds() / 60
+    if partition_age_minutes < 0:
         raise ValueError(
             f"Bronze partition {date_str} hour {hour_str} is in the future; "
             "cannot validate freshness for a future hour."
         )
 
-    if age_minutes > max_age_minutes:
-        raise ValueError(
-            f"Bronze partition {date_str} hour {hour_str} is stale: "
-            f"age {age_minutes:.0f} minutes exceeds the {max_age_minutes}-minute threshold."
-        )
+    if max_age_minutes <= 0:
+        raise ValueError("max_age_minutes must be positive")
 
-    bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
-    try:
-        files = con.execute(
-            "SELECT file FROM glob(?) LIMIT 1", [bronze_path]
-        ).fetchall()
-    except duckdb.Error as exc:
-        raise RuntimeError(
-            f"Bronze file enumeration failed for {date_str} hour {hour_str} at {bronze_path}: {exc}"
-        ) from exc
+    s3_client = s3_client or _s3_client()
+    file_count = 0
+    newest_object_time = None
+    for vehicle_type in ("bus", "tram"):
+        prefix = f"vehicle_type={vehicle_type}/date={date_str}/hour={hour_str}/"
+        continuation_token = None
+        while True:
+            request = {"Bucket": "bronze", "Prefix": prefix}
+            if continuation_token:
+                request["ContinuationToken"] = continuation_token
+            response = s3_client.list_objects_v2(**request)
+            for item in response.get("Contents", []):
+                file_count += 1
+                modified_at = item.get("LastModified")
+                if modified_at and (
+                    newest_object_time is None or modified_at > newest_object_time
+                ):
+                    newest_object_time = modified_at
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                raise RuntimeError(
+                    f"Bronze listing for {date_str} hour {hour_str} was truncated "
+                    "without a continuation token."
+                )
 
-    if not files:
+    if not file_count:
         raise BronzeDataMissingError(
             f"No bronze files found for {date_str} hour {hour_str}; "
             "data freshness check failed."
+        )
+
+    if newest_object_time is None:
+        raise RuntimeError(
+            f"Bronze objects for {date_str} hour {hour_str} have no LastModified timestamp."
+        )
+
+    age_minutes = (now_utc - newest_object_time).total_seconds() / 60
+    if age_minutes < 0:
+        raise ValueError(
+            f"Newest Bronze object for {date_str} hour {hour_str} is timestamped "
+            "in the future."
+        )
+    if age_minutes > max_age_minutes:
+        raise ValueError(
+            f"Bronze data for {date_str} hour {hour_str} is stale: "
+            f"newest object age {age_minutes:.0f} minutes exceeds the "
+            f"{max_age_minutes}-minute threshold."
         )
 
     return {
         "date": date_str,
         "hour": hour_str,
         "age_minutes": round(age_minutes, 2),
-        "file_count": len(files),
+        "file_count": file_count,
+        "newest_object_time": newest_object_time,
     }
 
 
@@ -342,10 +481,14 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     silver_dir = f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}"
     output_file = f"{silver_dir}/data.parquet"
     temp_file = f"{silver_dir}/_staging/{uuid.uuid4()}.parquet.pending"
+    rejected_file = f"s3://silver/quarantine/vehicle_positions/date={date_str}/hour={hour_str}/data.parquet"
+    rejected_temp_file = (
+        f"{silver_dir}/_staging/{uuid.uuid4()}.rejected.parquet.pending"
+    )
 
+    # glob() nie przyjmuje parametrów w duckdb 1.2.x; ścieżka pochodzi ze zwalidowanej partycji
     bronze_file = con.execute(
-        "SELECT file FROM glob(?) LIMIT 1",
-        [bronze_path],
+        f"SELECT file FROM glob('{bronze_path}') LIMIT 1"
     ).fetchone()
     if bronze_file is None:
         raise BronzeDataMissingError(
@@ -357,19 +500,39 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     (
         before,
         after_coordinates,
+        after_vehicle,
         after_time,
         future_gps_time,
         stale_gps_time,
         stale_5_to_10,
         stale_10_to_30,
         stale_over_30,
-        missing_gps_time,
+        invalid_gps_time,
         after,
     ) = con.execute(quality_sql).fetchone()
     validate_output_quality(date_str, hour_str, before, after)
 
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
+    rejected_sql = REJECTED_SQL.format(bronze_path=bronze_path)
+    rejected_count = before - after
+    if not overwrite and (
+        s3_object_exists(output_file) or s3_object_exists(rejected_file)
+    ):
+        raise FileExistsError(f"Silver output already exists: {output_file}")
     try:
+        con.execute(
+            f"COPY ({rejected_sql}) TO '{rejected_temp_file}' "
+            "(FORMAT parquet, OVERWRITE_OR_IGNORE true)"
+        )
+        rejected_output_count = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{rejected_temp_file}')"
+        ).fetchone()[0]
+        if rejected_output_count != rejected_count:
+            raise ValueError(
+                f"Rejected-record validation failed for {date_str} hour {hour_str}: "
+                f"temporary output has {rejected_output_count} rows, expected "
+                f"{rejected_count}; refusing to publish."
+            )
         con.execute(
             f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
         )
@@ -384,19 +547,20 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
                 "refusing to publish."
             )
 
-        if not overwrite and s3_object_exists(output_file):
-            raise FileExistsError(f"Silver output already exists: {output_file}")
+        copy_s3_object(rejected_temp_file, rejected_file)
         copy_s3_object(temp_file, output_file)
     finally:
-        try:
-            delete_s3_object(temp_file)
-        except (BotoCoreError, ClientError) as exc:
-            logger.warning(
-                "Could not remove temporary Silver object %s: %s", temp_file, exc
-            )
+        for temp_path in (temp_file, rejected_temp_file):
+            try:
+                delete_s3_object(temp_path)
+            except (BotoCoreError, ClientError) as exc:
+                logger.warning(
+                    "Could not remove temporary Silver object %s: %s", temp_path, exc
+                )
 
     rejected_coordinates = before - after_coordinates
-    rejected_gps_time = after_coordinates - after_time
+    rejected_vehicle = after_coordinates - after_vehicle
+    rejected_gps_time = after_vehicle - after_time
     duplicates = after_time - after
     dropped_pct = (before - after) / before if before else 0
 
@@ -404,13 +568,15 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"{date_str} hour {hour_str}: "
         f"bronze={before}, "
         f"rejected_coordinates={rejected_coordinates}, "
+        f"rejected_vehicle_number={rejected_vehicle}, "
         f"rejected_gps_time={rejected_gps_time} "
         f"(future={future_gps_time}, stale_total={stale_gps_time}, "
         f"stale_5_to_10={stale_5_to_10}, "
         f"stale_10_to_30={stale_10_to_30}, "
         f"stale_over_30={stale_over_30}, "
-        f"missing={missing_gps_time}), "
+        f"invalid_or_ambiguous={invalid_gps_time}), "
         f"duplicates={duplicates}, "
+        f"quarantined={rejected_count}, "
         f"silver={after}, "
         f"dropped={dropped_pct:.1%} → {output_file}"
     )
@@ -426,7 +592,10 @@ def main():
     args = parser.parse_args()
 
     con = get_connection()
-    transform_hour(con, args.date, args.hour)
+    try:
+        transform_hour(con, args.date, args.hour)
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":

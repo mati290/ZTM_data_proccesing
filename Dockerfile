@@ -1,15 +1,13 @@
-# obraz bazowy:  Linux z Pythonem
+# Minimalny obraz Pythona dla procesu ingestion.
 FROM python:3.12-slim
 
-# folder roboczy w kontenerze
 WORKDIR /app
 
-# najpierw same zależności 
+# Instalacja zależności osobno poprawia wykorzystanie cache warstw.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# potem kod
-COPY ingest.py .
+COPY --chown=10001:10001 ingest.py .
 
-# komenda startowa kontenera
+USER 10001:10001
 CMD ["python", "ingest.py"]

@@ -1,4 +1,6 @@
+import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -10,12 +12,14 @@ from botocore.exceptions import ClientError
 
 from bronze_to_silver import (
     QUALITY_SQL,
+    REJECTED_SQL,
     TRANSFORM_SQL,
     BronzeDataMissingError,
     check_bronze_freshness,
     copy_s3_object,
     delete_s3_object,
     get_connection,
+    main,
     parse_s3_endpoint,
     s3_object_exists,
     transform_hour,
@@ -40,7 +44,7 @@ class BronzeToSilverSqlTests(unittest.TestCase):
 
         metrics = self.connection.execute(query).fetchone()
 
-        self.assertEqual(metrics, (11, 9, 3, 1, 3, 1, 1, 1, 2, 1))
+        self.assertEqual(metrics, (11, 9, 9, 3, 1, 3, 1, 1, 1, 2, 1))
 
     def test_transform_keeps_only_fresh_valid_unique_record(self):
         query = TRANSFORM_SQL.format(bronze_path=self.bronze_path)
@@ -52,7 +56,74 @@ class BronzeToSilverSqlTests(unittest.TestCase):
         self.assertEqual(rows[0][4], 52.2)
         self.assertEqual(
             rows[0][7],
-            datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 15, 12, 0, 30, tzinfo=timezone.utc),
+        )
+
+    def test_rejected_records_include_reason_and_duplicates(self):
+        query = REJECTED_SQL.format(bronze_path=self.bronze_path)
+
+        counts = dict(
+            self.connection.execute(
+                f"SELECT rejection_reason, COUNT(*) FROM ({query}) "
+                "GROUP BY rejection_reason"
+            ).fetchall()
+        )
+
+        self.assertEqual(counts["duplicate"], 2)
+        self.assertEqual(counts["invalid_coordinates"], 2)
+        self.assertEqual(counts["stale_gps_time"], 3)
+        self.assertEqual(counts["future_gps_time"], 1)
+
+    def test_local_dst_fold_and_gap_are_quarantined(self):
+        records = [
+            {
+                "vehicle_type": "bus",
+                "VehicleNumber": "fold",
+                "Lines": "1",
+                "Brigade": "1",
+                "Lat": 52.2,
+                "Lon": 21.0,
+                "Time": "2026-10-25 02:30:00",
+                "_ingested_at": "2026-10-25T00:31:00+00:00",
+            },
+            {
+                "vehicle_type": "bus",
+                "VehicleNumber": "gap",
+                "Lines": "1",
+                "Brigade": "1",
+                "Lat": 52.2,
+                "Lon": 21.0,
+                "Time": "2026-03-29 02:30:00",
+                "_ingested_at": "2026-03-29T01:31:00+00:00",
+            },
+            {
+                "vehicle_type": "bus",
+                "VehicleNumber": "",
+                "Lines": "1",
+                "Brigade": "1",
+                "Lat": 52.2,
+                "Lon": 21.0,
+                "Time": "2026-07-15 14:00:00",
+                "_ingested_at": "2026-07-15T12:00:30+00:00",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dst.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+            )
+            rows = self.connection.execute(
+                REJECTED_SQL.format(bronze_path=path.as_posix())
+            ).fetchall()
+
+        reasons = {row[-1] for row in rows}
+        self.assertEqual(
+            reasons,
+            {
+                "ambiguous_local_time",
+                "nonexistent_local_time",
+                "missing_vehicle_number",
+            },
         )
 
 
@@ -62,7 +133,8 @@ class TransformHourTests(unittest.TestCase):
         connection = Mock()
         connection.execute.return_value.fetchone.side_effect = [
             ("bronze-file.jsonl",),
-            (1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+            (1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+            (0,),
             (1,),
         ]
         return connection
@@ -75,8 +147,8 @@ class TransformHourTests(unittest.TestCase):
             transform_hour(connection, "2026-10-09", "7")
 
         connection.execute.assert_called_once_with(
-            "SELECT file FROM glob(?) LIMIT 1",
-            ["s3://bronze/vehicle_type=*/date=2026-10-09/hour=07/*.jsonl"],
+            "SELECT file FROM glob("
+            "'s3://bronze/vehicle_type=*/date=2026-10-09/hour=07/*.jsonl') LIMIT 1"
         )
 
     def test_propagates_bronze_discovery_io_error(self):
@@ -101,14 +173,44 @@ class TransformHourTests(unittest.TestCase):
             for call in connection.execute.call_args_list
             if call.args[0].startswith("COPY ")
         ]
-        self.assertEqual(len(copy_statements), 1)
+        self.assertEqual(len(copy_statements), 2)
         source, destination = copy_mock.call_args.args
         self.assertTrue(source.endswith(".parquet.pending"))
         self.assertEqual(
             destination,
             "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
         )
-        delete_mock.assert_called_once_with(source)
+        self.assertEqual(
+            copy_mock.call_args_list[0].args[1],
+            "s3://silver/quarantine/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
+        )
+        delete_mock.assert_any_call(source)
+        self.assertEqual(delete_mock.call_count, 2)
+
+    def test_publishes_rejected_rows_to_quarantine(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.side_effect = [
+            ("bronze-file.jsonl",),
+            (2, 2, 2, 1, 0, 1, 0, 0, 1, 0, 1),
+            (1,),
+            (1,),
+        ]
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.copy_s3_object") as copy_mock,
+            patch("bronze_to_silver.delete_s3_object"),
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+
+        destinations = [call.args[1] for call in copy_mock.call_args_list]
+        self.assertEqual(
+            destinations,
+            [
+                "s3://silver/quarantine/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
+                "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
+            ],
+        )
 
     def test_overwrite_false_refuses_to_replace_existing_output(self):
         connection = self._happy_path_connection()
@@ -123,13 +225,14 @@ class TransformHourTests(unittest.TestCase):
             transform_hour(connection, "2026-10-09", "7", overwrite=False)
 
         copy_mock.assert_not_called()
-        delete_mock.assert_called_once()
+        delete_mock.assert_not_called()
 
     def test_does_not_publish_when_row_count_differs_from_quality_count(self):
         connection = Mock()
         connection.execute.return_value.fetchone.side_effect = [
             ("bronze-file.jsonl",),
-            (1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+            (1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+            (0,),
             (0,),
         ]
 
@@ -142,7 +245,7 @@ class TransformHourTests(unittest.TestCase):
             transform_hour(connection, "2026-10-09", "7")
 
         copy_mock.assert_not_called()
-        delete_mock.assert_called_once()
+        self.assertEqual(delete_mock.call_count, 2)
 
     def test_does_not_publish_when_schema_validation_fails(self):
         connection = self._happy_path_connection()
@@ -159,13 +262,13 @@ class TransformHourTests(unittest.TestCase):
             transform_hour(connection, "2026-10-09", "7")
 
         copy_mock.assert_not_called()
-        delete_mock.assert_called_once()
+        self.assertEqual(delete_mock.call_count, 2)
 
     def test_transform_propagates_write_error_and_still_cleans_temp_file(self):
         connection = Mock()
         connection.execute.side_effect = [
             Mock(fetchone=Mock(return_value=("bronze-file.jsonl",))),
-            Mock(fetchone=Mock(return_value=(1, 1, 1, 0, 0, 0, 0, 0, 0, 1))),
+            Mock(fetchone=Mock(return_value=(1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1))),
             RuntimeError("write failed"),
         ]
 
@@ -177,7 +280,7 @@ class TransformHourTests(unittest.TestCase):
             transform_hour(connection, "2026-10-09", "7")
 
         copy_mock.assert_not_called()
-        delete_mock.assert_called_once()
+        self.assertEqual(delete_mock.call_count, 2)
 
 
 class ConnectionConfigTests(unittest.TestCase):
@@ -197,7 +300,7 @@ class ConnectionConfigTests(unittest.TestCase):
         ):
             get_connection()
 
-    def test_get_connection_passes_secrets_as_parameters(self):
+    def test_get_connection_escapes_secrets(self):
         env = {
             "MINIO_USER": "u'ser",
             "MINIO_PASSWORD": "p'w",
@@ -210,9 +313,29 @@ class ConnectionConfigTests(unittest.TestCase):
         ):
             get_connection()
 
-        sql, params = con.execute.call_args_list[-1].args
-        self.assertNotIn("u'ser", sql)
-        self.assertEqual(params, ["u'ser", "p'w", "s3.example.com", True])
+        (sql,) = con.execute.call_args_list[-1].args
+        self.assertIn("KEY_ID 'u''ser'", sql)
+        self.assertIn("SECRET 'p''w'", sql)
+        self.assertIn("ENDPOINT 's3.example.com'", sql)
+        self.assertIn("USE_SSL true", sql)
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_main_closes_connection_after_transform(self):
+        connection = Mock()
+        with (
+            patch("bronze_to_silver.get_connection", return_value=connection),
+            patch("bronze_to_silver.transform_hour") as transform,
+            patch.object(
+                sys,
+                "argv",
+                ["bronze_to_silver.py", "--date", "2026-10-09", "--hour", "07"],
+            ),
+        ):
+            main()
+
+        transform.assert_called_once_with(connection, "2026-10-09", "07")
+        connection.close.assert_called_once()
 
 
 class SilverSchemaTests(unittest.TestCase):
@@ -369,29 +492,115 @@ class PartitionValidationTests(unittest.TestCase):
 
     def test_check_bronze_freshness_accepts_recent_partition(self):
         now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        connection = Mock()
-        connection.execute.return_value.fetchall.return_value = [("f.jsonl",)]
-        result = check_bronze_freshness(connection, "2026-10-09", "12", now_utc=now)
+        s3_client = Mock()
+        s3_client.list_objects_v2.side_effect = [
+            {
+                "Contents": [
+                    {
+                        "LastModified": datetime(
+                            2026, 10, 9, 12, 20, tzinfo=timezone.utc
+                        )
+                    },
+                    {
+                        "LastModified": datetime(
+                            2026, 10, 9, 12, 25, tzinfo=timezone.utc
+                        )
+                    },
+                ]
+            },
+            {
+                "Contents": [
+                    {"LastModified": datetime(2026, 10, 9, 12, 23, tzinfo=timezone.utc)}
+                ]
+            },
+        ]
+        result = check_bronze_freshness(
+            "2026-10-09", "12", now_utc=now, s3_client=s3_client
+        )
 
         self.assertEqual(result["date"], "2026-10-09")
         self.assertEqual(result["hour"], "12")
-        self.assertEqual(result["file_count"], 1)
-        self.assertGreaterEqual(result["age_minutes"], 0)
+        self.assertEqual(result["file_count"], 3)
+        self.assertEqual(result["age_minutes"], 5)
+        self.assertEqual(
+            result["newest_object_time"],
+            datetime(2026, 10, 9, 12, 25, tzinfo=timezone.utc),
+        )
+        self.assertEqual(s3_client.list_objects_v2.call_count, 2)
 
     def test_check_bronze_freshness_fails_without_files(self):
         now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        connection = Mock()
-        connection.execute.return_value.fetchall.return_value = []
+        s3_client = Mock()
+        s3_client.list_objects_v2.side_effect = [{}, {}]
 
         with self.assertRaises(BronzeDataMissingError):
-            check_bronze_freshness(connection, "2026-10-09", "12", now_utc=now)
+            check_bronze_freshness("2026-10-09", "12", now_utc=now, s3_client=s3_client)
 
     def test_check_bronze_freshness_rejects_stale_partition(self):
         now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
+        s3_client = Mock()
+        s3_client.list_objects_v2.side_effect = [
+            {
+                "Contents": [
+                    {"LastModified": datetime(2026, 10, 8, 12, tzinfo=timezone.utc)}
+                ]
+            },
+            {},
+        ]
         with self.assertRaises(ValueError):
             check_bronze_freshness(
-                self.connection, "2026-10-08", "12", max_age_minutes=30, now_utc=now
+                "2026-10-08",
+                "12",
+                max_age_minutes=30,
+                now_utc=now,
+                s3_client=s3_client,
             )
+
+    def test_check_bronze_freshness_rejects_stale_objects_in_a_recent_partition(self):
+        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
+        s3_client = Mock()
+        s3_client.list_objects_v2.side_effect = [
+            {
+                "Contents": [
+                    {"LastModified": datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)}
+                ]
+            },
+            {},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "newest object age 30 minutes"):
+            check_bronze_freshness("2026-10-09", "12", now_utc=now, s3_client=s3_client)
+
+    def test_check_bronze_freshness_paginates_s3_listing(self):
+        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
+        s3_client = Mock()
+        s3_client.list_objects_v2.side_effect = [
+            {
+                "Contents": [
+                    {"LastModified": datetime(2026, 10, 9, 12, 28, tzinfo=timezone.utc)}
+                ],
+                "IsTruncated": True,
+                "NextContinuationToken": "next-page",
+            },
+            {
+                "Contents": [
+                    {"LastModified": datetime(2026, 10, 9, 12, 29, tzinfo=timezone.utc)}
+                ],
+                "IsTruncated": False,
+            },
+            {},
+        ]
+
+        result = check_bronze_freshness(
+            "2026-10-09", "12", now_utc=now, s3_client=s3_client
+        )
+
+        self.assertEqual(result["file_count"], 2)
+        self.assertEqual(s3_client.list_objects_v2.call_count, 3)
+        self.assertEqual(
+            s3_client.list_objects_v2.call_args_list[1].kwargs["ContinuationToken"],
+            "next-page",
+        )
 
 
 if __name__ == "__main__":

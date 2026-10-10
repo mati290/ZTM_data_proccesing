@@ -1,5 +1,7 @@
 services:
   minio:
+    # The Chainguard public registry provides the free `latest` channel.
+    # Pin this to a digest before using the stack outside local development.
     image: cgr.dev/chainguard/minio:latest
     command: server /data --console-address ":9001"
     environment:
@@ -10,12 +12,17 @@ services:
       - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
+    restart: unless-stopped
 
   ingestion:
     build: .
-    env_file: .env
     environment:
+      ZTM_API_KEY: ${ZTM_API_KEY:?set ZTM_API_KEY in .env}
+      MINIO_USER: ${MINIO_USER:?set MINIO_USER in .env}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:?set MINIO_PASSWORD in .env}
       S3_ENDPOINT_URL: http://minio:9000
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
+      DEGRADED_CYCLES_ALERT_THRESHOLD: ${DEGRADED_CYCLES_ALERT_THRESHOLD:-10}
     depends_on:
       - minio
     restart: unless-stopped
@@ -32,6 +39,7 @@ services:
       MINIO_USER: ${MINIO_USER}
       MINIO_PASSWORD: ${MINIO_PASSWORD}
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
       AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY:?set AIRFLOW__CORE__FERNET_KEY in .env}"
@@ -42,6 +50,7 @@ services:
       - airflow_metadata:/opt/airflow
     depends_on:
       - minio
+    restart: unless-stopped
 
 volumes:
   minio_data:

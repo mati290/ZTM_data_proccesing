@@ -3,12 +3,13 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, call, patch
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from requests import HTTPError, Timeout
 
 from ingest import (
     ZTMApiError,
     ensure_bucket,
+    ensure_bucket_with_retry,
     fetch_positions,
     main,
     run_once,
@@ -107,14 +108,23 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(2)
 
-    def test_run_once_raises_when_no_vehicle_positions_are_returned(self):
+    def test_run_once_reports_empty_successful_api_responses(self):
         with (
             patch("ingest.fetch_positions", side_effect=[[], []]),
             patch("ingest.save_to_bronze") as save_mock,
-            self.assertRaises(RuntimeError),
         ):
-            run_once("test-key", Mock())
+            result = run_once("test-key", Mock())
 
+        self.assertEqual(
+            result,
+            {
+                "buses": 0,
+                "trams": 0,
+                "total": 0,
+                "failed_sources": [],
+                "empty_sources": ["bus", "tram"],
+            },
+        )
         save_mock.assert_not_called()
 
     def test_run_once_returns_counts_for_buses_and_trams(self):
@@ -129,7 +139,13 @@ class SaveToBronzeTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            {"buses": 1, "trams": 1, "total": 2, "failed_sources": []},
+            {
+                "buses": 1,
+                "trams": 1,
+                "total": 2,
+                "failed_sources": [],
+                "empty_sources": [],
+            },
         )
         self.assertEqual(save_mock.call_count, 2)
 
@@ -144,12 +160,24 @@ class SaveToBronzeTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            {"buses": 1, "trams": 0, "total": 1, "failed_sources": ["tram"]},
+            {
+                "buses": 1,
+                "trams": 0,
+                "total": 1,
+                "failed_sources": ["tram"],
+                "empty_sources": [],
+            },
         )
         save_mock.assert_called_once_with(s3, bus_records, "bus")
 
     def test_main_alerts_after_consecutive_degraded_cycles(self):
-        degraded = {"buses": 1, "trams": 0, "total": 1, "failed_sources": ["tram"]}
+        degraded = {
+            "buses": 1,
+            "trams": 0,
+            "total": 1,
+            "failed_sources": ["tram"],
+            "empty_sources": [],
+        }
         with (
             patch.dict(
                 "os.environ",
@@ -161,9 +189,38 @@ class SaveToBronzeTests(unittest.TestCase):
             ),
             patch("ingest.load_dotenv"),
             patch("ingest.boto3.client", return_value=Mock()),
-            patch("ingest.ensure_bucket"),
+            patch("ingest.ensure_bucket_with_retry"),
             patch("ingest.run_once", return_value=degraded),
             patch("ingest.time.sleep", side_effect=[None, KeyboardInterrupt]),
+            self.assertLogs("ingest", level="CRITICAL") as captured,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        self.assertIn("ALERT", "\n".join(captured.output))
+
+    def test_main_alerts_when_api_successfully_returns_empty_windows(self):
+        empty = {
+            "buses": 0,
+            "trams": 0,
+            "total": 0,
+            "failed_sources": [],
+            "empty_sources": ["bus", "tram"],
+        }
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ZTM_API_KEY": "test-key",
+                    "POLL_INTERVAL_SECONDS": "1",
+                    "DEGRADED_CYCLES_ALERT_THRESHOLD": "1",
+                },
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=Mock()),
+            patch("ingest.ensure_bucket_with_retry"),
+            patch("ingest.run_once", return_value=empty),
+            patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
             self.assertLogs("ingest", level="CRITICAL") as captured,
             self.assertRaises(KeyboardInterrupt),
         ):
@@ -179,7 +236,7 @@ class SaveToBronzeTests(unittest.TestCase):
             ),
             patch("ingest.load_dotenv"),
             patch("ingest.boto3.client", return_value=Mock()),
-            patch("ingest.ensure_bucket"),
+            patch("ingest.ensure_bucket_with_retry"),
             patch("ingest.run_once", side_effect=RuntimeError("empty source window")),
             patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
             self.assertLogs("ingest", level="ERROR") as captured,
@@ -220,6 +277,20 @@ class SaveToBronzeTests(unittest.TestCase):
             ensure_bucket(s3)
 
         s3.create_bucket.assert_not_called()
+
+    def test_ensure_bucket_retries_transient_storage_connection_error(self):
+        s3 = Mock()
+        s3.head_bucket.side_effect = [
+            BotoCoreError(error_msg="not ready"),
+            None,
+            None,
+        ]
+
+        with patch("ingest.time.sleep") as sleep:
+            ensure_bucket_with_retry(s3, max_attempts=3)
+
+        self.assertEqual(s3.head_bucket.call_count, 3)
+        sleep.assert_called_once_with(2)
 
 
 if __name__ == "__main__":

@@ -106,6 +106,30 @@ def ensure_bucket(s3, buckets=("bronze", "silver")):
         _ensure_single_bucket(s3, bucket)
 
 
+def ensure_bucket_with_retry(s3, max_attempts=10, initial_delay_seconds=2):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ensure_bucket(s3)
+            return
+        except (BotoCoreError, ClientError) as error:
+            if isinstance(error, ClientError):
+                status = error.response.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode"
+                )
+                if status not in {429, 500, 502, 503, 504}:
+                    raise
+            if attempt == max_attempts:
+                raise
+            delay = initial_delay_seconds * attempt
+            logger.warning(
+                "Object storage is not ready (attempt %s/%s); retrying in %s seconds",
+                attempt,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+
+
 def _ensure_single_bucket(s3, bucket):
     try:
         s3.head_bucket(Bucket=bucket)
@@ -127,6 +151,7 @@ def run_once(api_key, s3):
     buses = []
     trams = []
     failed_sources = []
+    empty_sources = []
 
     for vehicle_type, label in ((1, "bus"), (2, "tram")):
         try:
@@ -145,13 +170,10 @@ def run_once(api_key, s3):
         else:
             trams = records
 
-    total = len(buses) + len(trams)
+        if not records and label not in failed_sources:
+            empty_sources.append(label)
 
-    if not buses and not trams:
-        raise RuntimeError(
-            "ZTM API returned no vehicle positions for this cycle; "
-            "refusing to persist an empty source window"
-        )
+    total = len(buses) + len(trams)
 
     if not buses:
         logger.warning("No bus positions returned by the ZTM API in this cycle")
@@ -172,6 +194,7 @@ def run_once(api_key, s3):
         "trams": len(trams),
         "total": total,
         "failed_sources": failed_sources,
+        "empty_sources": empty_sources,
     }
 
 
@@ -188,7 +211,7 @@ def main():
         aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
     )
 
-    ensure_bucket(s3)
+    ensure_bucket_with_retry(s3)
 
     interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
     if interval <= 0:
@@ -202,7 +225,7 @@ def main():
         degraded = True
         try:
             result = run_once(api_key, s3)
-            degraded = bool(result["failed_sources"])
+            degraded = bool(result["failed_sources"] or result["empty_sources"])
         except (
             requests.RequestException,
             ZTMApiError,

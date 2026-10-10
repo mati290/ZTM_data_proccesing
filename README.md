@@ -65,7 +65,7 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
    ```
 
    Compose starts MinIO, the ingestion container, and Airflow. Ingestion creates
-   the `bronze` bucket if it does not exist.
+   the `bronze` and `silver` buckets if they do not exist.
 
 4. Check ingestion logs:
    ```bash
@@ -74,9 +74,11 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 
 5. Open the Airflow UI at http://localhost:8080 and check the
    `bronze_to_silver_hourly` DAG. It processes the completed UTC hour and writes
-   Parquet output to Silver. Missed hourly intervals are caught up one at a
-   time, and transient task failures are retried. MinIO's console is at
-   http://localhost:9001.
+   Parquet output to Silver. The DAG checks Bronze freshness before processing;
+   missing or stale Bronze data fails the task, so the data gap stays visible
+   and can be retried after ingestion recovers. Automatic catchup is disabled
+   to avoid creating historical runs for hours before this local pipeline was
+   collecting data. MinIO's console is at http://localhost:9001.
 
 To stop the services, run `docker compose down`. Bronze and Silver objects are
 kept in the `minio_data` Docker volume.
@@ -106,16 +108,21 @@ The Silver layer contains one Parquet file per processed hour:
 s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
 ```
 
+Rejected records are written with a `rejection_reason` column under
+`s3://silver/quarantine/vehicle_positions/date=.../hour=.../data.parquet`.
+The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
+
 ## Design decisions
 
 - **Raw data in bronze is never modified.** Only an `_ingested_at` field is
   added (the underscore marks fields added by the pipeline, not the source).
   If a bug is found in later transformations, silver can always be rebuilt
   from the original data.
-- **All ingestion timestamps and partitions are in UTC** to avoid DST
-  ambiguity: in local time the hour 02:00–03:00 occurs twice in October and
-  doesn't exist in March. Note: the API's `Time` field is in Warsaw local
-  time – this is handled in the silver layer.
+- **Ingestion timestamps and partitions are in UTC.** The API's `Time` field
+  is Warsaw local time without an explicit UTC offset. During the repeated hour
+  at the autumn DST transition, the source value alone cannot identify which
+  occurrence it means; the pipeline's time filter and quarantine preserve that
+  limitation instead of claiming perfect UTC reconstruction.
 - **Hive-style partitioning** (`key=value` folders by vehicle type, date and
   hour) allows query engines like Spark, Athena or DuckDB to skip irrelevant
   data (partition pruning).
@@ -129,7 +136,8 @@ s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
   process.
 - **Failures stay visible.** An empty Bronze partition is detected by listing
   matching S3 objects. Storage/listing errors propagate and fail the Airflow
-  task instead of being reported as an empty hour.
+  task instead of being reported as an empty hour. The DAG also fails when the
+  newest Bronze object in the processed hour is more than 10 minutes old.
 - **Secrets are kept out of logs.** Request errors are summarized by exception
   type and HTTP status, without logging a request URL that may contain the API
   key.
@@ -137,9 +145,9 @@ s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
 - **Configuration via environment variables** (12-factor app). Secrets live
   in `.env`, which is excluded from Git and from the Docker image
   (`.dockerignore`).
-- **Image versioning.** Both the Airflow and MinIO images are pinned to explicit
-  versions in the compose stack to improve reproducibility and reduce surprise
-  upgrades.
+- **Image versioning.** Airflow uses an explicit image version. The free
+  Chainguard MinIO channel supplies `latest`; use a tested image digest before
+  deploying outside local development.
 - **Docker layer caching:** dependencies are installed before the code is
   copied, so code changes rebuild the image in seconds.
 
@@ -151,20 +159,24 @@ s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
 - The local Airflow metadata database is now persisted in a Docker volume so
   task history and DAG metadata survive container restarts. MinIO object data
   remains in its own named volume as well.
-- This is a local portfolio environment, not a production deployment. AWS S3,
-  cloud infrastructure, and alerting are not yet configured.
+- A successful API response with an empty result is logged and counted as a
+  degraded source window. Alerts are currently log-based; no external alert
+  destination is configured.
+- This is a local portfolio environment, not a production deployment. AWS S3
+  and cloud infrastructure are not yet configured.
 
 ## Roadmap
 
 - [x] **Stage 1** – ZTM API ingestion to MinIO Bronze, Dockerized
 - [x] **Stage 2** – hourly Airflow and DuckDB transformation from Bronze to
-      partitioned Silver Parquet, with data-quality metrics and deduplication
+      partitioned Silver Parquet, with freshness checks, quality metrics,
+      quarantine output, and deterministic deduplication
 - [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
       GitHub Actions CI
 - [ ] **Next** – build Gold analytics (for example, hourly vehicle activity or
       route-level aggregates); consider dbt when the models justify it
-- [ ] **Next** – add data freshness/volume checks, alerting, and persistent
-      Airflow metadata for a more reliable deployment
+- [ ] **Next** – add volume thresholds, external alerting, and integration
+      coverage for a more reliable deployment
 - [ ] **Could** – deploy to AWS S3 and provision infrastructure with Terraform
 - [ ] **Could** – add a dashboard (for example, Metabase) after Gold metrics
       exist
