@@ -148,24 +148,30 @@ SELECT
 )
 
 
+def parse_s3_endpoint(url: str) -> tuple[str, bool]:
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Invalid S3_ENDPOINT_URL: {url!r}")
+    return parsed.netloc, parsed.scheme == "https"
+
+
 def get_connection():
-    endpoint = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000").replace(
-        "http://", ""
+    user = os.getenv("MINIO_USER")
+    password = os.getenv("MINIO_PASSWORD")
+    if not user or not password:
+        raise RuntimeError("MINIO_USER and MINIO_PASSWORD must be set")
+    endpoint, use_ssl = parse_s3_endpoint(
+        os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
     )
 
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("SET TimeZone = 'UTC';")
-    con.execute(f"""
-        CREATE SECRET minio (
-            TYPE s3,
-            KEY_ID '{os.getenv("MINIO_USER")}',
-            SECRET '{os.getenv("MINIO_PASSWORD")}',
-            ENDPOINT '{endpoint}',
-            URL_STYLE 'path',
-            USE_SSL false
-        );
-    """)
+    con.execute(
+        "CREATE SECRET minio (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, "
+        "URL_STYLE 'path', USE_SSL ?)",
+        [user, password, endpoint, use_ssl],
+    )
     return con
 
 

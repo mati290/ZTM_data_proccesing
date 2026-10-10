@@ -15,6 +15,8 @@ from bronze_to_silver import (
     check_bronze_freshness,
     copy_s3_object,
     delete_s3_object,
+    get_connection,
+    parse_s3_endpoint,
     s3_object_exists,
     transform_hour,
     validate_partition,
@@ -176,6 +178,41 @@ class TransformHourTests(unittest.TestCase):
 
         copy_mock.assert_not_called()
         delete_mock.assert_called_once()
+
+
+class ConnectionConfigTests(unittest.TestCase):
+    def test_parse_s3_endpoint(self):
+        self.assertEqual(parse_s3_endpoint("http://minio:9000"), ("minio:9000", False))
+        self.assertEqual(
+            parse_s3_endpoint("https://s3.example.com"), ("s3.example.com", True)
+        )
+        self.assertEqual(parse_s3_endpoint("localhost:9000"), ("localhost:9000", False))
+        with self.assertRaises(ValueError):
+            parse_s3_endpoint("ftp://x")
+
+    def test_get_connection_requires_credentials(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            self.assertRaises(RuntimeError),
+        ):
+            get_connection()
+
+    def test_get_connection_passes_secrets_as_parameters(self):
+        env = {
+            "MINIO_USER": "u'ser",
+            "MINIO_PASSWORD": "p'w",
+            "S3_ENDPOINT_URL": "https://s3.example.com",
+        }
+        con = Mock()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("bronze_to_silver.duckdb.connect", return_value=con),
+        ):
+            get_connection()
+
+        sql, params = con.execute.call_args_list[-1].args
+        self.assertNotIn("u'ser", sql)
+        self.assertEqual(params, ["u'ser", "p'w", "s3.example.com", True])
 
 
 class SilverSchemaTests(unittest.TestCase):
