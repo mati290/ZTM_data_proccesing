@@ -6,7 +6,14 @@ from unittest.mock import Mock, patch
 from botocore.exceptions import ClientError
 from requests import HTTPError, Timeout
 
-from ingest import ZTMApiError, ensure_bucket, fetch_positions, run_once, save_to_bronze
+from ingest import (
+    ZTMApiError,
+    ensure_bucket,
+    fetch_positions,
+    main,
+    run_once,
+    save_to_bronze,
+)
 
 
 class SaveToBronzeTests(unittest.TestCase):
@@ -112,13 +119,46 @@ class SaveToBronzeTests(unittest.TestCase):
 
     def test_run_once_returns_counts_for_buses_and_trams(self):
         with (
-            patch("ingest.fetch_positions", side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]]),
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]],
+            ),
             patch("ingest.save_to_bronze") as save_mock,
         ):
             result = run_once("test-key", Mock())
 
         self.assertEqual(result, {"buses": 1, "trams": 1, "total": 2})
         self.assertEqual(save_mock.call_count, 2)
+
+    def test_run_once_saves_successful_vehicle_type_when_other_source_fails(self):
+        bus_records = [{"VehicleNumber": "1"}]
+        s3 = Mock()
+        with (
+            patch("ingest.fetch_positions", side_effect=[bus_records, Timeout()]),
+            patch("ingest.save_to_bronze") as save_mock,
+        ):
+            result = run_once("test-key", s3)
+
+        self.assertEqual(result, {"buses": 1, "trams": 0, "total": 1})
+        save_mock.assert_called_once_with(s3, bus_records, "bus")
+
+    def test_main_retries_next_cycle_after_empty_source_window(self):
+        with (
+            patch.dict(
+                "os.environ",
+                {"ZTM_API_KEY": "test-key", "POLL_INTERVAL_SECONDS": "1"},
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=Mock()),
+            patch("ingest.ensure_bucket"),
+            patch("ingest.run_once", side_effect=RuntimeError("empty source window")),
+            patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
+            self.assertLogs("ingest", level="ERROR") as captured,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        self.assertIn("retrying in next cycle", "\n".join(captured.output))
 
     def test_ensure_bucket_creates_missing_bucket(self):
         s3 = Mock()

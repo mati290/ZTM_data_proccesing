@@ -119,24 +119,46 @@ def ensure_bucket(s3):
 
 
 def run_once(api_key, s3):
-    buses = fetch_positions(1, api_key=api_key)
-    trams = fetch_positions(2, api_key=api_key)
+    buses = []
+    trams = []
+
+    for vehicle_type, label in ((1, "bus"), (2, "tram")):
+        try:
+            records = fetch_positions(vehicle_type, api_key=api_key)
+        except (requests.RequestException, ZTMApiError, RuntimeError) as error:
+            logger.error(
+                "Skipping %s positions for this cycle because the source failed: %s",
+                label,
+                _safe_error_summary(error),
+            )
+            records = []
+
+        if label == "bus":
+            buses = records
+        else:
+            trams = records
+
     total = len(buses) + len(trams)
+
+    if not buses and not trams:
+        raise RuntimeError(
+            "ZTM API returned no vehicle positions for this cycle; "
+            "refusing to persist an empty source window"
+        )
 
     if not buses:
         logger.warning("No bus positions returned by the ZTM API in this cycle")
     if not trams:
         logger.warning("No tram positions returned by the ZTM API in this cycle")
-    if total == 0:
-        raise RuntimeError(
-            "ZTM API returned no vehicle positions for this cycle; "
-            "the source may be unavailable or temporarily empty"
-        )
 
-    logger.info("Fetched %s buses and %s trams (%s total)", len(buses), len(trams), total)
+    logger.info(
+        "Fetched %s buses and %s trams (%s total)", len(buses), len(trams), total
+    )
 
-    save_to_bronze(s3, buses, "bus")
-    save_to_bronze(s3, trams, "tram")
+    if buses:
+        save_to_bronze(s3, buses, "bus")
+    if trams:
+        save_to_bronze(s3, trams, "tram")
 
     return {"buses": len(buses), "trams": len(trams), "total": total}
 
@@ -168,6 +190,7 @@ def main():
             ZTMApiError,
             BotoCoreError,
             ClientError,
+            RuntimeError,
         ) as error:
             logger.error(
                 "Ingestion cycle failed (%s); retrying in next cycle",

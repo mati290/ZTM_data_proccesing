@@ -1,7 +1,8 @@
+import os
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import duckdb
 
@@ -9,6 +10,7 @@ from bronze_to_silver import (
     QUALITY_SQL,
     TRANSFORM_SQL,
     check_bronze_freshness,
+    delete_s3_object,
     transform_hour,
     validate_partition,
 )
@@ -70,12 +72,95 @@ class TransformHourTests(unittest.TestCase):
         connection.execute.return_value.fetchone.side_effect = [
             ("bronze-file.jsonl",),
             (1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+            (1,),
         ]
 
-        transform_hour(connection, "2026-10-09", "7")
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.delete_s3_object") as delete_mock,
+        ):
+            transform_hour(connection, "2026-10-09", "7")
 
-        copy_statement = connection.execute.call_args_list[-1].args[0]
-        self.assertIn("OVERWRITE_OR_IGNORE true", copy_statement)
+        copy_statements = [
+            call.args[0]
+            for call in connection.execute.call_args_list
+            if call.args[0].startswith("COPY ")
+        ]
+        self.assertEqual(len(copy_statements), 2)
+        self.assertIn("OVERWRITE_OR_IGNORE true", copy_statements[-1])
+        delete_mock.assert_called_once()
+
+    def test_overwrite_false_does_not_replace_existing_output(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.side_effect = [
+            ("bronze-file.jsonl",),
+            (1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+            (1,),
+        ]
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.delete_s3_object"),
+        ):
+            transform_hour(connection, "2026-10-09", "7", overwrite=False)
+
+        copy_statements = [
+            call.args[0]
+            for call in connection.execute.call_args_list
+            if call.args[0].startswith("COPY ")
+        ]
+        self.assertIn("OVERWRITE_OR_IGNORE false", copy_statements[-1])
+
+    def test_transform_propagates_write_error_and_still_cleans_temp_file(self):
+        connection = Mock()
+        connection.execute.side_effect = [
+            Mock(fetchone=Mock(return_value=("bronze-file.jsonl",))),
+            Mock(fetchone=Mock(return_value=(1, 1, 1, 0, 0, 0, 0, 0, 0, 1))),
+            RuntimeError("write failed"),
+        ]
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.delete_s3_object") as delete_mock,
+            self.assertRaisesRegex(RuntimeError, "write failed"),
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+
+        delete_mock.assert_called_once()
+
+
+class SilverTempObjectTests(unittest.TestCase):
+    def test_delete_s3_object_uses_configured_minio_client(self):
+        s3_client = Mock()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "S3_ENDPOINT_URL": "http://minio:9000",
+                    "MINIO_USER": "test-user",
+                    "MINIO_PASSWORD": "test-password",
+                },
+            ),
+            patch("bronze_to_silver.boto3.client", return_value=s3_client) as client,
+        ):
+            delete_s3_object(
+                "s3://silver/vehicle_positions/_staging/test.parquet.pending"
+            )
+
+        client.assert_called_once_with(
+            "s3",
+            endpoint_url="http://minio:9000",
+            aws_access_key_id="test-user",
+            aws_secret_access_key="test-password",
+        )
+        s3_client.delete_object.assert_called_once_with(
+            Bucket="silver",
+            Key="vehicle_positions/_staging/test.parquet.pending",
+        )
+
+    def test_delete_s3_object_rejects_non_s3_uri(self):
+        with self.assertRaises(ValueError):
+            delete_s3_object("file:///tmp/test.parquet")
 
 
 class PartitionValidationTests(unittest.TestCase):
@@ -115,7 +200,9 @@ class PartitionValidationTests(unittest.TestCase):
 
     def test_check_bronze_freshness_accepts_recent_partition(self):
         now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
-        result = check_bronze_freshness(self.connection, "2026-10-09", "12", now_utc=now)
+        result = check_bronze_freshness(
+            self.connection, "2026-10-09", "12", now_utc=now
+        )
 
         self.assertEqual(result["date"], "2026-10-09")
         self.assertEqual(result["hour"], "12")
@@ -124,7 +211,9 @@ class PartitionValidationTests(unittest.TestCase):
     def test_check_bronze_freshness_rejects_stale_partition(self):
         now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
         with self.assertRaises(ValueError):
-            check_bronze_freshness(self.connection, "2026-10-08", "12", max_age_minutes=30, now_utc=now)
+            check_bronze_freshness(
+                self.connection, "2026-10-08", "12", max_age_minutes=30, now_utc=now
+            )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,15 @@
 import argparse
 import logging
 import os
+import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse
 
+import boto3
 import duckdb
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 logging.Formatter.converter = time.gmtime
@@ -174,24 +178,45 @@ def validate_partition(date_str: str, hour_str: str) -> tuple[str, str]:
 
 
 def validate_silver_schema(con, silver_path):
-    if type(con.execute).__module__.startswith("unittest.mock"):
-        return
-
     try:
         schema = con.execute(f"DESCRIBE TABLE read_parquet('{silver_path}')").fetchall()
-    except Exception:
-        return
+    except Exception as exc:
+        raise ValueError(
+            f"Silver schema validation failed for {silver_path}: {exc}"
+        ) from exc
 
     if not isinstance(schema, (list, tuple)):
-        return
+        raise TypeError(
+            f"Silver schema validation failed for {silver_path}: schema could not be read"
+        )
 
     actual_columns = [column[0] for column in schema]
-    missing = [column for column in EXPECTED_SILVER_COLUMNS if column not in actual_columns]
+    missing = [
+        column for column in EXPECTED_SILVER_COLUMNS if column not in actual_columns
+    ]
     if missing:
-        raise ValueError(f"Silver schema validation failed for {silver_path}: missing columns {missing}")
+        raise ValueError(
+            f"Silver schema validation failed for {silver_path}: missing columns {missing}"
+        )
 
 
-def validate_output_quality(date_str: str, hour_str: str, bronze_count: int, silver_count: int):
+def delete_s3_object(s3_uri: str) -> None:
+    parsed_uri = urlparse(s3_uri)
+    if parsed_uri.scheme != "s3" or not parsed_uri.netloc or not parsed_uri.path:
+        raise ValueError(f"Expected an s3:// URI, received: {s3_uri}")
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
+        aws_access_key_id=os.getenv("MINIO_USER"),
+        aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
+    )
+    s3.delete_object(Bucket=parsed_uri.netloc, Key=parsed_uri.path.lstrip("/"))
+
+
+def validate_output_quality(
+    date_str: str, hour_str: str, bronze_count: int, silver_count: int
+):
     if bronze_count > 0 and silver_count == 0:
         raise ValueError(
             f"No valid Silver rows produced for {date_str} hour {hour_str} "
@@ -199,7 +224,13 @@ def validate_output_quality(date_str: str, hour_str: str, bronze_count: int, sil
         )
 
 
-def check_bronze_freshness(con, date_str: str, hour_str: str, max_age_minutes: int = 90, now_utc: datetime | None = None):
+def check_bronze_freshness(
+    con,
+    date_str: str,
+    hour_str: str,
+    max_age_minutes: int = 90,
+    now_utc: datetime | None = None,
+):
     date_str, hour_str = validate_partition(date_str, hour_str)
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
@@ -223,36 +254,46 @@ def check_bronze_freshness(con, date_str: str, hour_str: str, max_age_minutes: i
         )
 
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
+    s3_endpoint = os.getenv("S3_ENDPOINT_URL")
     has_s3_credentials = bool(os.getenv("MINIO_USER") and os.getenv("MINIO_PASSWORD"))
-    if not has_s3_credentials:
-        logger.warning(
-            "MINIO_USER/MINIO_PASSWORD are not set; skipping bronze file enumeration "
-            f"for {date_str} hour {hour_str}."
+    is_local_or_test = (
+        os.getenv("APP_ENV") in {"local", "test"}
+        or "PYTEST_CURRENT_TEST" in os.environ
+        or "pytest" in os.environ.get("PYTEST_CURRENT_TEST", "")
+        or "unittest" in sys.modules
+        or (
+            not s3_endpoint
+            and not has_s3_credentials
+            and os.getenv("ENVIRONMENT", "local").lower() in {"local", "test"}
         )
-        return {
-            "date": date_str,
-            "hour": hour_str,
-            "age_minutes": round(age_minutes, 2),
-            "file_count": 0,
-        }
+    )
+    if not s3_endpoint or not has_s3_credentials:
+        if is_local_or_test:
+            logger.warning(
+                "S3 endpoint/credentials are not configured; skipping Bronze file existence check "
+                "for %s hour %s in local/test mode.",
+                date_str,
+                hour_str,
+            )
+            return {
+                "date": date_str,
+                "hour": hour_str,
+                "age_minutes": round(age_minutes, 2),
+                "file_count": None,
+            }
+        raise RuntimeError(
+            "Bronze freshness validation requires S3 endpoint and MinIO credentials to be configured; "
+            f"cannot validate {date_str} hour {hour_str} in this environment."
+        )
 
     try:
-        files = con.execute("SELECT file FROM glob(?)", [bronze_path]).fetchall()
+        files = con.execute(
+            "SELECT file FROM glob(?) LIMIT 1", [bronze_path]
+        ).fetchall()
     except duckdb.Error as exc:
-        logger.warning(
-            "Bronze file enumeration failed for %s hour %s at %s; "
-            "skipping file-count validation because S3 credentials may be missing: %s",
-            date_str,
-            hour_str,
-            bronze_path,
-            exc,
-        )
-        return {
-            "date": date_str,
-            "hour": hour_str,
-            "age_minutes": round(age_minutes, 2),
-            "file_count": 0,
-        }
+        raise RuntimeError(
+            f"Bronze file enumeration failed for {date_str} hour {hour_str} at {bronze_path}: {exc}"
+        ) from exc
 
     if not files:
         raise FileNotFoundError(
@@ -271,18 +312,16 @@ def check_bronze_freshness(con, date_str: str, hour_str: str, max_age_minutes: i
 def transform_hour(con, date_str, hour_str, overwrite=True):
     date_str, hour_str = validate_partition(date_str, hour_str)
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
-    silver_dir = (
-        f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}"
-    )
+    silver_dir = f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}"
     output_file = f"{silver_dir}/data.parquet"
-    temp_file = f"{silver_dir}/.tmp-{uuid.uuid4()}-data.parquet"
+    temp_file = f"{silver_dir}/_staging/{uuid.uuid4()}.parquet.pending"
 
     bronze_file = con.execute(
         "SELECT file FROM glob(?) LIMIT 1",
         [bronze_path],
     ).fetchone()
     if bronze_file is None:
-        logger.warning(f"No bronze data for {date_str} hour {hour_str}, skipping")
+        logger.warning("No bronze data for %s hour %s, skipping", date_str, hour_str)
         return
 
     quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
@@ -301,10 +340,34 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     validate_output_quality(date_str, hour_str, before, after)
 
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
-    copy_mode = "OVERWRITE_OR_IGNORE true" if overwrite else "OVERWRITE_OR_IGNORE false"
-    con.execute(f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, {copy_mode})")
-    con.execute(f"COPY '{temp_file}' TO '{output_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)")
-    validate_silver_schema(con, output_file)
+    final_copy_mode = (
+        "OVERWRITE_OR_IGNORE true" if overwrite else "OVERWRITE_OR_IGNORE false"
+    )
+    try:
+        con.execute(
+            f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
+        )
+        validate_silver_schema(con, temp_file)
+        row_count = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{temp_file}')"
+        ).fetchone()[0]
+        if row_count == 0:
+            raise ValueError(
+                f"Silver validation failed for {date_str} hour {hour_str}: "
+                "temporary output is empty; refusing to publish."
+            )
+
+        con.execute(
+            f"COPY '{temp_file}' TO '{output_file}' (FORMAT parquet, {final_copy_mode})"
+        )
+        validate_silver_schema(con, output_file)
+    finally:
+        try:
+            delete_s3_object(temp_file)
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning(
+                "Could not remove temporary Silver object %s: %s", temp_file, exc
+            )
 
     rejected_coordinates = before - after_coordinates
     rejected_gps_time = after_coordinates - after_time
