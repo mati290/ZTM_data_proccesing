@@ -65,6 +65,11 @@ def main():
         rejected = f"s3://silver/quarantine/vehicle_positions/date={DATE}/hour={HOUR}/data.parquet"
         row = con.execute(f"SELECT COUNT(*) FROM read_parquet('{rejected}')").fetchone()
         assert row is not None and row[0] == 3, row
+        marker = s3.get_object(
+            Bucket="silver",
+            Key=f"vehicle_positions/date={DATE}/hour={HOUR}/_completeness.json",
+        )
+        assert json.loads(marker["Body"].read())["status"] == "unknown"
     finally:
         con.close()
         for bucket, prefix in (

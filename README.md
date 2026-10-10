@@ -166,6 +166,14 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
   per-hour count reconciliation. Gold models must deduplicate again, e.g.
   `QUALIFY ROW_NUMBER() OVER (PARTITION BY vehicle_type, vehicle_number,
   gps_time_utc ORDER BY ingested_at DESC) = 1`.
+- Completeness: every ingestion cycle writes a manifest to
+  `s3://bronze/_manifests/date=/hour=/` (`complete` only if both bus and tram
+  were fetched). The Silver transform writes
+  `vehicle_positions/date=/hour=/_completeness.json` with status `complete`
+  (≥90% of cycles complete), `incomplete`, or `unknown` (no manifests, e.g.
+  data from before this feature). Silver is still published for incomplete
+  hours, but Gold/dashboards should check the marker before trusting
+  bus+tram totals.
 - A successful API response with an empty result is logged and counted as a
   degraded source window. Alerts are currently log-based; no external alert
   destination is configured.

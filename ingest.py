@@ -148,6 +148,30 @@ def _ensure_single_bucket(s3, bucket):
         s3.create_bucket(Bucket=bucket)
 
 
+def write_cycle_manifest(s3, bus_count, tram_count, failed_sources, empty_sources):
+    """Record whether a cycle fetched both sources, so Silver can flag partial hours."""
+    now = datetime.now(timezone.utc)
+    complete = bus_count > 0 and tram_count > 0
+    manifest = {
+        "ingested_at": now.isoformat(),
+        "status": "complete" if complete else "partial",
+        "buses": bus_count,
+        "trams": tram_count,
+        "failed_sources": failed_sources,
+        "empty_sources": empty_sources,
+    }
+    key = (
+        f"_manifests/date={now.strftime('%Y-%m-%d')}/hour={now.strftime('%H')}/"
+        f"cycle_{now.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.json"
+    )
+    try:
+        s3.put_object(
+            Bucket="bronze", Key=key, Body=json.dumps(manifest).encode("utf-8")
+        )
+    except (BotoCoreError, ClientError) as error:
+        logger.warning("Could not write cycle manifest: %s", _safe_error_summary(error))
+
+
 def run_once(api_key, s3):
     buses = []
     trams = []
@@ -189,6 +213,8 @@ def run_once(api_key, s3):
         save_to_bronze(s3, buses, "bus")
     if trams:
         save_to_bronze(s3, trams, "tram")
+
+    write_cycle_manifest(s3, len(buses), len(trams), failed_sources, empty_sources)
 
     return {
         "buses": len(buses),

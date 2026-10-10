@@ -169,6 +169,25 @@ class SaveToBronzeTests(unittest.TestCase):
             },
         )
         save_mock.assert_called_once_with(s3, bus_records, "bus")
+        manifest_call = s3.put_object.call_args
+        self.assertTrue(manifest_call.kwargs["Key"].startswith("_manifests/"))
+        manifest = json.loads(manifest_call.kwargs["Body"])
+        self.assertEqual(manifest["status"], "partial")
+        self.assertEqual(manifest["failed_sources"], ["tram"])
+
+    def test_run_once_manifest_marks_complete_cycle(self):
+        s3 = Mock()
+        with (
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]],
+            ),
+            patch("ingest.save_to_bronze"),
+        ):
+            run_once("test-key", s3)
+
+        manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
+        self.assertEqual(manifest["status"], "complete")
 
     def test_main_alerts_after_consecutive_degraded_cycles(self):
         degraded = {

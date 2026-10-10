@@ -15,6 +15,7 @@ from bronze_to_silver import (
     REJECTED_SQL,
     TRANSFORM_SQL,
     BronzeDataMissingError,
+    assess_completeness,
     copy_s3_object,
     delete_s3_object,
     get_connection,
@@ -25,6 +26,46 @@ from bronze_to_silver import (
     validate_partition,
     validate_silver_schema,
 )
+
+
+class CompletenessTests(unittest.TestCase):
+    @staticmethod
+    def _client(statuses):
+        client = Mock()
+        keys = [
+            f"_manifests/date=2026-10-09/hour=07/c{i}.json"
+            for i in range(len(statuses))
+        ]
+        client.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": key} for key in keys]}
+        ]
+        bodies = {
+            key: json.dumps({"status": status}).encode()
+            for key, status in zip(keys, statuses)
+        }
+        client.get_object.side_effect = lambda Bucket, Key: {
+            "Body": Mock(read=Mock(return_value=bodies[Key]))
+        }
+        return client
+
+    def test_complete_when_all_cycles_have_both_sources(self):
+        result = assess_completeness(
+            "2026-10-09", "07", self._client(["complete"] * 10)
+        )
+        self.assertEqual(result["status"], "complete")
+
+    def test_incomplete_when_many_cycles_partial(self):
+        result = assess_completeness(
+            "2026-10-09", "07", self._client(["complete", "partial", "partial"])
+        )
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["partial_cycles"], 2)
+
+    def test_unknown_without_manifests(self):
+        client = Mock()
+        client.get_paginator.return_value.paginate.return_value = [{}]
+        result = assess_completeness("2026-10-09", "07", client)
+        self.assertEqual(result["status"], "unknown")
 
 
 class BronzeToSilverSqlTests(unittest.TestCase):
@@ -127,6 +168,12 @@ class BronzeToSilverSqlTests(unittest.TestCase):
 
 
 class TransformHourTests(unittest.TestCase):
+    def setUp(self):
+        for name in ("assess_completeness", "write_completeness_marker"):
+            patcher = patch(f"bronze_to_silver.{name}")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @staticmethod
     def _happy_path_connection():
         connection = Mock()

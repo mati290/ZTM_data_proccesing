@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import time
@@ -380,6 +381,50 @@ def copy_s3_object(source_uri: str, destination_uri: str) -> None:
     )
 
 
+MIN_COMPLETE_CYCLE_RATIO = 0.9
+
+
+def assess_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
+    """Summarize ingestion cycle manifests for an hour (bus + tram both fetched)."""
+    s3_client = s3_client or _s3_client()
+    prefix = f"_manifests/date={date_str}/hour={hour_str}/"
+    keys = []
+    for page in s3_client.get_paginator("list_objects_v2").paginate(
+        Bucket="bronze", Prefix=prefix
+    ):
+        keys.extend(obj["Key"] for obj in page.get("Contents", []))
+
+    complete = 0
+    for key in keys:
+        body = s3_client.get_object(Bucket="bronze", Key=key)["Body"].read()
+        if json.loads(body).get("status") == "complete":
+            complete += 1
+
+    total = len(keys)
+    if total == 0:
+        status = "unknown"
+    elif complete / total >= MIN_COMPLETE_CYCLE_RATIO:
+        status = "complete"
+    else:
+        status = "incomplete"
+    return {
+        "date": date_str,
+        "hour": hour_str,
+        "status": status,
+        "cycles": total,
+        "complete_cycles": complete,
+        "partial_cycles": total - complete,
+        "min_complete_ratio": MIN_COMPLETE_CYCLE_RATIO,
+    }
+
+
+def write_completeness_marker(completeness: dict, silver_dir: str) -> None:
+    bucket, key = _parse_s3_uri(f"{silver_dir}/_completeness.json")
+    _s3_client().put_object(
+        Bucket=bucket, Key=key, Body=json.dumps(completeness).encode("utf-8")
+    )
+
+
 def validate_output_quality(
     date_str: str, hour_str: str, bronze_count: int, silver_count: int
 ):
@@ -464,6 +509,18 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
 
         copy_s3_object(rejected_temp_file, rejected_file)
         copy_s3_object(temp_file, output_file)
+        completeness = assess_completeness(date_str, hour_str)
+        write_completeness_marker(completeness, silver_dir)
+        if completeness["status"] != "complete":
+            logger.warning(
+                "%s hour %s Silver completeness is %s: %s/%s ingestion cycles had "
+                "both bus and tram data; business metrics may be understated.",
+                date_str,
+                hour_str,
+                completeness["status"],
+                completeness["complete_cycles"],
+                completeness["cycles"],
+            )
     finally:
         for temp_path in (temp_file, rejected_temp_file):
             try:
