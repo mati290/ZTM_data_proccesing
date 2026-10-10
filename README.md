@@ -3,23 +3,26 @@
 A data engineering project that continuously collects **real-time GPS positions
 of all Warsaw public transport vehicles** (ZTM buses and trams) from the
 [UM Warszawa Open Data API](https://api.um.warszawa.pl) and stores them in an
-S3-compatible data lake, following the **medallion architecture**
-(bronze → silver → gold).
+S3-compatible data lake. The implemented pipeline follows a **medallion
+architecture**: raw JSON Lines in bronze and cleaned, hourly Parquet in silver;
+gold analytics are planned.
 
-> 🚧 Work in progress – Stage 1 (ingestion) is complete. See the [roadmap](#roadmap).
+> 🚧 Work in progress – API ingestion, the hourly bronze → silver pipeline,
+> tests, and GitHub Actions CI are implemented. See the [roadmap](#roadmap).
 
 ## Architecture
 
-```
-┌──────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
-│   ZTM API    │────▶│  Python ingestion    │────▶│  MinIO (S3)          │
-│ (every 30 s) │     │  Docker container    │     │  bronze bucket       │
-└──────────────┘     │  retry + validation  │     │  raw JSON Lines      │
-                     └──────────────────────┘     └──────────────────────┘
+```mermaid
+flowchart LR
+    API[ZTM API] -->|every 30 seconds| Ingest[Python ingestion container]
+    Ingest -->|raw JSON Lines| Bronze[MinIO Bronze bucket]
+    Bronze -->|completed UTC hour| Airflow[Apache Airflow hourly DAG]
+    Airflow --> Transform[Python transformation with DuckDB]
+    Transform -->|cleaned hourly Parquet| Silver[MinIO Silver bucket]
 ```
 
-Locally the data lake runs on **MinIO**, which speaks the same API as **AWS S3**.
-The same code will run against AWS S3 by changing a single environment variable.
+Locally the data lake runs on **MinIO**, which provides an S3-compatible API.
+The pipeline has not yet been deployed or validated end to end on AWS S3.
 
 ## Tech stack
 
@@ -27,9 +30,13 @@ The same code will run against AWS S3 by changing a single environment variable.
 |---|---|
 | Language | Python 3.12 |
 | Data source | UM Warszawa REST API |
-| Data lake | MinIO (S3-compatible), boto3 |
+| Object storage | MinIO (S3-compatible), boto3 |
+| Orchestration | Apache Airflow 3 |
+| Transformation | DuckDB |
 | Containerization | Docker, Docker Compose |
-| Data format | JSON Lines, Hive-style partitioning |
+| Data formats | JSON Lines (bronze), Parquet (silver), Hive-style partitioning |
+| Testing and linting | unittest, Ruff |
+| CI | GitHub Actions |
 
 ## How to run
 
@@ -42,32 +49,35 @@ The same code will run against AWS S3 by changing a single environment variable.
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/<mati290>/<ZTM_data_proccesing>.git
-   cd <ZTM_data_processing>
+   git clone https://github.com/mati290/ZTM_data_proccesing.git
+   cd ZTM_data_proccesing
    ```
 
 2. Create your `.env` file from the template and fill in the values:
    ```bash
    cp .env.example .env
    ```
+   Keep your real API key and MinIO credentials in `.env`; never commit that file.
 
-3. Start MinIO:
-   ```bash
-   docker compose up -d minio
-   ```
-
-4. Open the MinIO console at http://localhost:9001, log in with the
-   credentials from `.env` and create a bucket named `bronze`.
-
-5. Start the ingestion:
+3. Build and start the local stack:
    ```bash
    docker compose up -d --build
+   ```
+
+   Compose starts MinIO, the ingestion container, and Airflow. Ingestion creates
+   the `bronze` bucket if it does not exist.
+
+4. Check ingestion logs:
+   ```bash
    docker compose logs -f ingestion
    ```
 
-6. After ~30 seconds new files appear in the `bronze` bucket.
+5. Open the Airflow UI at http://localhost:8080 and check the
+   `bronze_to_silver_hourly` DAG. It processes the completed UTC hour and writes
+   Parquet output to Silver. MinIO's console is at http://localhost:9001.
 
-To stop everything: `docker compose down` (data is kept in a Docker volume).
+To stop the services, run `docker compose down`. Bronze and Silver objects are
+kept in the `minio_data` Docker volume.
 
 ## Data layout (bronze layer)
 
@@ -76,7 +86,7 @@ s3://bronze/
 └── vehicle_type=bus/
     └── date=2026-10-02/
         └── hour=08/
-            └── positions_20261002T083205.jsonl
+            └── positions_20261002T083205_<uuid>.jsonl
 └── vehicle_type=tram/
     └── ...
 ```
@@ -86,6 +96,12 @@ plus an `_ingested_at` metadata field:
 
 ```json
 {"Lines": "180", "Lon": 21.01, "VehicleNumber": "1234", "Time": "2026-10-02 10:32:01", "Lat": 52.23, "Brigade": "3", "_ingested_at": "2026-10-02T08:32:05+00:00"}
+```
+
+The Silver layer contains one Parquet file per processed hour:
+
+```text
+s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
 ```
 
 ## Design decisions
@@ -109,34 +125,49 @@ plus an `_ingested_at` metadata field:
 - **Retry with exponential backoff** (2 s, 4 s) for transient network and API
   errors. A single failed cycle is logged and doesn't stop the long-running
   process.
+- **Failures stay visible.** An empty Bronze partition is detected by listing
+  matching S3 objects. Storage/listing errors propagate and fail the Airflow
+  task instead of being reported as an empty hour.
+- **Secrets are kept out of logs.** Request errors are summarized by exception
+  type and HTTP status, without logging a request URL that may contain the API
+  key.
 - **Empty batches are skipped** to avoid creating empty files.
 - **Configuration via environment variables** (12-factor app). Secrets live
   in `.env`, which is excluded from Git and from the Docker image
   (`.dockerignore`).
-- **Pinned image versions.** In September 2026 MinIO removed its images from
-  Docker Hub, which broke projects pulling `minio/minio`. This project uses an
-  alternative registry and pinned versions – a real-world example of
-  supply-chain risk in dependencies.
+- **Image versioning.** The Airflow image is pinned to 3.2.1. The MinIO image
+  currently uses a mutable `latest` tag, so pinning it is a reproducibility
+  improvement still to do.
 - **Docker layer caching:** dependencies are installed before the code is
   copied, so code changes rebuild the image in seconds.
 
 ## Known limitations
 
-- Polling every 30 s produces thousands of small files per day (~1 GB/day).
-  This "small files problem" will be solved in Stage 2 by compacting bronze
-  into Parquet in the silver layer.
-- The `bronze` bucket is currently created manually.
+- Polling every 30 seconds produces thousands of small JSONL objects in
+  Bronze. The hourly Silver output compacts transformed records into Parquet,
+  but raw Bronze objects are not compacted or expired yet.
+- The local Airflow standalone service uses its default metadata database
+  inside the container. Recreating that container can reset Airflow history;
+  only MinIO object data has a named persistent volume.
+- This is a local portfolio environment, not a production deployment. AWS S3,
+  cloud infrastructure, and alerting are not yet configured.
 
 ## Roadmap
 
-- [x] **Stage 1** – ingestion from the ZTM API to the bronze layer, Docker
-- [ ] **Stage 2** – Apache Airflow: bronze → silver (deduplication, data
-      cleaning, Parquet)
-- [ ] **Stage 3** – dbt models: average speeds, delays vs. timetable
-- [ ] **Stage 4** – Apache Kafka + Spark Structured Streaming
-- [ ] **Stage 5** – dashboard (Metabase)
-- [ ] **Stage 6** – deployment to AWS with Terraform
-- [ ] Tests and CI with GitHub Actions
+- [x] **Stage 1** – ZTM API ingestion to MinIO Bronze, Dockerized
+- [x] **Stage 2** – hourly Airflow and DuckDB transformation from Bronze to
+      partitioned Silver Parquet, with data-quality metrics and deduplication
+- [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
+      GitHub Actions CI
+- [ ] **Next** – build Gold analytics (for example, hourly vehicle activity or
+      route-level aggregates); consider dbt when the models justify it
+- [ ] **Next** – add data freshness/volume checks, alerting, and persistent
+      Airflow metadata for a more reliable deployment
+- [ ] **Could** – deploy to AWS S3 and provision infrastructure with Terraform
+- [ ] **Could** – add a dashboard (for example, Metabase) after Gold metrics
+      exist
+- [ ] Kafka and Spark are intentionally deferred until a streaming-scale use
+      case justifies their operational cost.
 
 ## Data source
 
