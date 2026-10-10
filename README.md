@@ -74,7 +74,9 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 
 5. Open the Airflow UI at http://localhost:8080 and check the
    `bronze_to_silver_hourly` DAG. It processes the completed UTC hour and writes
-   Parquet output to Silver. MinIO's console is at http://localhost:9001.
+   Parquet output to Silver. Missed hourly intervals are caught up one at a
+   time, and transient task failures are retried. MinIO's console is at
+   http://localhost:9001.
 
 To stop the services, run `docker compose down`. Bronze and Silver objects are
 kept in the `minio_data` Docker volume.
@@ -135,9 +137,9 @@ s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
 - **Configuration via environment variables** (12-factor app). Secrets live
   in `.env`, which is excluded from Git and from the Docker image
   (`.dockerignore`).
-- **Image versioning.** The Airflow image is pinned to 3.2.1. The MinIO image
-  currently uses a mutable `latest` tag, so pinning it is a reproducibility
-  improvement still to do.
+- **Image versioning.** Both the Airflow and MinIO images are pinned to explicit
+  versions in the compose stack to improve reproducibility and reduce surprise
+  upgrades.
 - **Docker layer caching:** dependencies are installed before the code is
   copied, so code changes rebuild the image in seconds.
 
@@ -146,9 +148,9 @@ s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
 - Polling every 30 seconds produces thousands of small JSONL objects in
   Bronze. The hourly Silver output compacts transformed records into Parquet,
   but raw Bronze objects are not compacted or expired yet.
-- The local Airflow standalone service uses its default metadata database
-  inside the container. Recreating that container can reset Airflow history;
-  only MinIO object data has a named persistent volume.
+- The local Airflow metadata database is now persisted in a Docker volume so
+  task history and DAG metadata survive container restarts. MinIO object data
+  remains in its own named volume as well.
 - This is a local portfolio environment, not a production deployment. AWS S3,
   cloud infrastructure, and alerting are not yet configured.
 

@@ -1,14 +1,14 @@
 services:
   minio:
-    image: cgr.dev/chainguard/minio:latest    # Docker Hub images removed in Sept 2026
-    user: root                                # chainguard image needs root to write /data
+    image: quay.io/minio/minio:RELEASE.2025-09-13T00-42-17Z
+    user: root
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # web console
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
 
@@ -27,18 +27,23 @@ services:
       dockerfile: airflow/Dockerfile
     command: standalone
     ports:
-      - "8080:8080"
-    env_file: .env
+      - "127.0.0.1:8080:8080"
     environment:
       S3_ENDPOINT_URL: http://minio:9000
+      MINIO_USER: ${MINIO_USER}
+      MINIO_PASSWORD: ${MINIO_PASSWORD}
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"   # local dev only!
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+      AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+      AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY:-Q2thQ0lXWVFqT0JQeVhGQ0dVd0dLaUpmM3k4VVNQdFk=}"
       PYTHONPATH: /opt/airflow/src
     volumes:
       - ./dags:/opt/airflow/dags
       - ./bronze_to_silver.py:/opt/airflow/src/bronze_to_silver.py
+      - airflow_metadata:/opt/airflow
     depends_on:
       - minio
 
 volumes:
   minio_data:
+  airflow_metadata:

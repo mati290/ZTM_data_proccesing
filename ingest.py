@@ -43,11 +43,22 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
+            if not isinstance(data, dict) or "result" not in data:
+                raise ZTMApiError("API response is missing the result field")
             result = data["result"]
-            if not isinstance(result, list):
-                raise ZTMApiError(f"API zwróciło błąd: {result}")
+            if not isinstance(result, list) or any(
+                not isinstance(record, dict) for record in result
+            ):
+                raise ZTMApiError("API result is not a list of position records")
             return result
-        except (requests.RequestException, ZTMApiError) as e:
+        except ZTMApiError as error:
+            logger.error(
+                "Invalid API response for vehicle type %s: %s",
+                vehicle_type,
+                _safe_error_summary(error),
+            )
+            raise
+        except requests.RequestException as e:
             if attempt == max_attempts:
                 logger.error(
                     f"All {max_attempts} attempts failed for vehicle type {vehicle_type}: {_safe_error_summary(e)}"
@@ -110,10 +121,24 @@ def ensure_bucket(s3):
 def run_once(api_key, s3):
     buses = fetch_positions(1, api_key=api_key)
     trams = fetch_positions(2, api_key=api_key)
-    logger.info(f"Fetched {len(buses)} buses and {len(trams)} trams")
+    total = len(buses) + len(trams)
+
+    if not buses:
+        logger.warning("No bus positions returned by the ZTM API in this cycle")
+    if not trams:
+        logger.warning("No tram positions returned by the ZTM API in this cycle")
+    if total == 0:
+        raise RuntimeError(
+            "ZTM API returned no vehicle positions for this cycle; "
+            "the source may be unavailable or temporarily empty"
+        )
+
+    logger.info("Fetched %s buses and %s trams (%s total)", len(buses), len(trams), total)
 
     save_to_bronze(s3, buses, "bus")
     save_to_bronze(s3, trams, "tram")
+
+    return {"buses": len(buses), "trams": len(trams), "total": total}
 
 
 def main():
@@ -132,6 +157,8 @@ def main():
     ensure_bucket(s3)
 
     interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+    if interval <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
     logger.info(f"Starting main loop with interval {interval} seconds")
     while True:
         try:

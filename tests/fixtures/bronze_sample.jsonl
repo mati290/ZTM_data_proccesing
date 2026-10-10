@@ -1,0 +1,11 @@
+{"vehicle_type":"bus","VehicleNumber":"valid","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"2026-07-15 13:58:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"valid","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"2026-07-15 13:58:00","_ingested_at":"2026-07-15T12:00:30+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"valid","Lines":"1","Brigade":"001","Lat":52.3,"Lon":21.0,"Time":"2026-07-15 13:58:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"outside","Lines":"1","Brigade":"001","Lat":50.0,"Lon":21.0,"Time":"2026-07-15 13:58:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"future","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"2026-07-15 14:01:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"stale_5_10","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"2026-07-15 13:54:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"stale_10_30","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"2026-07-15 13:45:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"stale_over_30","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"2026-07-15 13:00:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"missing_time","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":null,"_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"invalid_coordinates","Lines":"1","Brigade":"001","Lat":"invalid","Lon":21.0,"Time":"2026-07-15 13:58:00","_ingested_at":"2026-07-15T12:00:00+00:00"}
+{"vehicle_type":"bus","VehicleNumber":"invalid_time","Lines":"1","Brigade":"001","Lat":52.2,"Lon":21.0,"Time":"not-a-time","_ingested_at":"2026-07-15T12:00:00+00:00"}

@@ -1,14 +1,18 @@
-import pendulum
+from datetime import timedelta
 
+import pendulum
 from airflow.sdk import dag, get_current_context, task
 from airflow.timetables.interval import CronDataIntervalTimetable
+
 
 @dag(
     dag_id="bronze_to_silver_hourly",
     description="Transforms one hour of ZTM bronze data into silver Parquet",
     schedule=CronDataIntervalTimetable("0 * * * *", timezone="UTC"),
     start_date=pendulum.datetime(2026, 10, 1, tz="UTC"),
-    catchup=False,
+    catchup=True,
+    max_active_runs=1,
+    default_args={"retries": 3, "retry_delay": timedelta(minutes=5)},
     tags=["ztm", "bronze-to-silver"],
 )
 def bronze_to_silver_hourly():

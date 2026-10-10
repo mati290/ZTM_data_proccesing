@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 from botocore.exceptions import ClientError
 from requests import HTTPError, Timeout
 
-from ingest import ZTMApiError, ensure_bucket, fetch_positions, save_to_bronze
+from ingest import ZTMApiError, ensure_bucket, fetch_positions, run_once, save_to_bronze
 
 
 class SaveToBronzeTests(unittest.TestCase):
@@ -45,10 +45,26 @@ class SaveToBronzeTests(unittest.TestCase):
         response.json.return_value = {"result": "Invalid API key"}
 
         with (
-            patch("ingest.requests.get", return_value=response),
+            patch("ingest.requests.get", return_value=response) as request,
             self.assertRaises(ZTMApiError),
         ):
             fetch_positions(1, "test-key", max_attempts=1)
+        request.assert_called_once()
+
+    def test_fetch_positions_rejects_malformed_api_payload_without_retry(self):
+        malformed_payloads = ({}, {"result": {"VehicleNumber": "123"}})
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                response = Mock()
+                response.json.return_value = payload
+                with (
+                    patch("ingest.requests.get", return_value=response) as request,
+                    patch("ingest.time.sleep") as sleep,
+                    self.assertRaises(ZTMApiError),
+                ):
+                    fetch_positions(1, "test-key", max_attempts=3)
+                request.assert_called_once()
+                sleep.assert_not_called()
 
     def test_fetch_positions_does_not_log_api_key_on_http_error(self):
         api_key = "test-secret-key"
@@ -83,6 +99,26 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(records, [])
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(2)
+
+    def test_run_once_raises_when_no_vehicle_positions_are_returned(self):
+        with (
+            patch("ingest.fetch_positions", side_effect=[[], []]),
+            patch("ingest.save_to_bronze") as save_mock,
+            self.assertRaises(RuntimeError),
+        ):
+            run_once("test-key", Mock())
+
+        save_mock.assert_not_called()
+
+    def test_run_once_returns_counts_for_buses_and_trams(self):
+        with (
+            patch("ingest.fetch_positions", side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]]),
+            patch("ingest.save_to_bronze") as save_mock,
+        ):
+            result = run_once("test-key", Mock())
+
+        self.assertEqual(result, {"buses": 1, "trams": 1, "total": 2})
+        self.assertEqual(save_mock.call_count, 2)
 
     def test_ensure_bucket_creates_missing_bucket(self):
         s3 = Mock()

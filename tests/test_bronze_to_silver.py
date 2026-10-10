@@ -1,5 +1,3 @@
-import json
-import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +8,7 @@ import duckdb
 from bronze_to_silver import (
     QUALITY_SQL,
     TRANSFORM_SQL,
+    check_bronze_freshness,
     transform_hour,
     validate_partition,
 )
@@ -17,57 +16,21 @@ from bronze_to_silver import (
 
 class BronzeToSilverSqlTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.bronze_path = (Path(self.temp_dir.name) / "bronze.jsonl").as_posix()
+        self.bronze_path = (
+            Path(__file__).parent / "fixtures" / "bronze_sample.jsonl"
+        ).as_posix()
         self.connection = duckdb.connect()
         self.connection.execute("SET TimeZone = 'UTC';")
 
-        def record(
-            vehicle_number: str,
-            gps_time: str | None,
-            *,
-            lat: float = 52.2,
-            ingested_at: str = "2026-07-15T12:00:00+00:00",
-        ) -> dict[str, object]:
-            return {
-                "vehicle_type": "bus",
-                "VehicleNumber": vehicle_number,
-                "Lines": "1",
-                "Brigade": "001",
-                "Lat": lat,
-                "Lon": 21.0,
-                "Time": gps_time,
-                "_ingested_at": ingested_at,
-            }
-
-        records = [
-            record("valid", "2026-07-15 13:58:00"),
-            record(
-                "valid",
-                "2026-07-15 13:58:00",
-                ingested_at="2026-07-15T12:00:30+00:00",
-            ),
-            record("outside", "2026-07-15 13:58:00", lat=50.0),
-            record("future", "2026-07-15 14:01:00"),
-            record("stale_5_10", "2026-07-15 13:54:00"),
-            record("stale_10_30", "2026-07-15 13:45:00"),
-            record("stale_over_30", "2026-07-15 13:00:00"),
-            record("missing_time", None),
-        ]
-
-        with Path(self.bronze_path).open("w", encoding="utf-8") as file:
-            file.writelines(json.dumps(item) + "\n" for item in records)
-
     def tearDown(self):
         self.connection.close()
-        self.temp_dir.cleanup()
 
     def test_quality_metrics_count_each_rejection_reason(self):
         query = QUALITY_SQL.format(bronze_path=self.bronze_path)
 
         metrics = self.connection.execute(query).fetchone()
 
-        self.assertEqual(metrics, (8, 7, 2, 1, 3, 1, 1, 1, 1, 1))
+        self.assertEqual(metrics, (11, 9, 3, 1, 3, 1, 1, 1, 2, 1))
 
     def test_transform_keeps_only_fresh_valid_unique_record(self):
         query = TRANSFORM_SQL.format(bronze_path=self.bronze_path)
@@ -76,6 +39,7 @@ class BronzeToSilverSqlTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1], "valid")
+        self.assertEqual(rows[0][4], 52.2)
         self.assertEqual(
             rows[0][7],
             datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc),
@@ -101,8 +65,27 @@ class TransformHourTests(unittest.TestCase):
         with self.assertRaises(duckdb.IOException):
             transform_hour(connection, "2026-10-09", "7")
 
+    def test_overwrites_existing_silver_partition_on_rerun(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.side_effect = [
+            ("bronze-file.jsonl",),
+            (1, 1, 1, 0, 0, 0, 0, 0, 0, 1),
+        ]
+
+        transform_hour(connection, "2026-10-09", "7")
+
+        copy_statement = connection.execute.call_args_list[-1].args[0]
+        self.assertIn("OVERWRITE_OR_IGNORE true", copy_statement)
+
 
 class PartitionValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = duckdb.connect()
+        self.connection.execute("SET TimeZone = 'UTC';")
+
+    def tearDown(self):
+        self.connection.close()
+
     def test_normalizes_single_digit_hour(self):
         result = validate_partition("2026-10-09", "7")
 
@@ -129,6 +112,19 @@ class PartitionValidationTests(unittest.TestCase):
         for hour_str in invalid_hours:
             with self.subTest(hour_str=hour_str), self.assertRaises(ValueError):
                 validate_partition("2026-10-09", hour_str)
+
+    def test_check_bronze_freshness_accepts_recent_partition(self):
+        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
+        result = check_bronze_freshness(self.connection, "2026-10-09", "12", now_utc=now)
+
+        self.assertEqual(result["date"], "2026-10-09")
+        self.assertEqual(result["hour"], "12")
+        self.assertGreaterEqual(result["age_minutes"], 0)
+
+    def test_check_bronze_freshness_rejects_stale_partition(self):
+        now = datetime(2026, 10, 9, 12, 30, tzinfo=timezone.utc)
+        with self.assertRaises(ValueError):
+            check_bronze_freshness(self.connection, "2026-10-08", "12", max_age_minutes=30, now_utc=now)
 
 
 if __name__ == "__main__":

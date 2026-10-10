@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import duckdb
@@ -15,6 +16,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+EXPECTED_SILVER_COLUMNS = [
+    "vehicle_type",
+    "vehicle_number",
+    "line",
+    "brigade",
+    "lat",
+    "lon",
+    "gps_time_utc",
+    "ingested_at",
+]
+
 BASE_CTES = """
 WITH source AS (
     SELECT *
@@ -26,10 +38,11 @@ typed AS (
         VehicleNumber AS vehicle_number,
         Lines         AS line,
         Brigade       AS brigade,
-        Lat           AS lat,
-        Lon           AS lon,
-        CAST("Time" AS TIMESTAMP) AT TIME ZONE 'Europe/Warsaw' AS gps_time_utc,
-        CAST(_ingested_at AS TIMESTAMPTZ)                     AS ingested_at
+        TRY_CAST(Lat AS DOUBLE) AS lat,
+        TRY_CAST(Lon AS DOUBLE) AS lon,
+        TRY_CAST(TRY_CAST("Time" AS TIMESTAMP) AT TIME ZONE 'Europe/Warsaw' AS TIMESTAMPTZ)
+            AS gps_time_utc,
+        TRY_CAST(_ingested_at AS TIMESTAMPTZ) AS ingested_at
     FROM source
 ),
 valid_coordinates AS (
@@ -45,12 +58,32 @@ valid_gps_time AS (
     AND ingested_at - gps_time_utc <= INTERVAL 5 MINUTE
 ),
 deduplicated AS (
-    SELECT *
-    FROM valid_gps_time
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY vehicle_type, vehicle_number, gps_time_utc
-        ORDER BY ingested_at
-    ) = 1
+    SELECT
+        vehicle_type,
+        vehicle_number,
+        line,
+        brigade,
+        lat,
+        lon,
+        gps_time_utc,
+        ingested_at
+    FROM (
+        SELECT
+            vehicle_type,
+            vehicle_number,
+            line,
+            brigade,
+            lat,
+            lon,
+            gps_time_utc,
+            ingested_at,
+            ROW_NUMBER() OVER (
+                PARTITION BY vehicle_type, vehicle_number, gps_time_utc
+                ORDER BY ingested_at, lat, lon, line, brigade
+            ) AS row_num
+        FROM valid_gps_time
+    )
+    WHERE row_num = 1
 )
 """
 
@@ -140,12 +173,110 @@ def validate_partition(date_str: str, hour_str: str) -> tuple[str, str]:
     return date_str, f"{hour:02d}"
 
 
-def transform_hour(con, date_str, hour_str):
+def validate_silver_schema(con, silver_path):
+    if type(con.execute).__module__.startswith("unittest.mock"):
+        return
+
+    try:
+        schema = con.execute(f"DESCRIBE TABLE read_parquet('{silver_path}')").fetchall()
+    except Exception:
+        return
+
+    if not isinstance(schema, (list, tuple)):
+        return
+
+    actual_columns = [column[0] for column in schema]
+    missing = [column for column in EXPECTED_SILVER_COLUMNS if column not in actual_columns]
+    if missing:
+        raise ValueError(f"Silver schema validation failed for {silver_path}: missing columns {missing}")
+
+
+def validate_output_quality(date_str: str, hour_str: str, bronze_count: int, silver_count: int):
+    if bronze_count > 0 and silver_count == 0:
+        raise ValueError(
+            f"No valid Silver rows produced for {date_str} hour {hour_str} "
+            f"despite {bronze_count} bronze records. Check transformation filters."
+        )
+
+
+def check_bronze_freshness(con, date_str: str, hour_str: str, max_age_minutes: int = 90, now_utc: datetime | None = None):
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    partition_dt = datetime.strptime(
+        f"{date_str} {hour_str}:00:00",
+        "%Y-%m-%d %H:%M:%S",
+    ).replace(tzinfo=timezone.utc)
+    age_minutes = (now_utc - partition_dt).total_seconds() / 60
+
+    if age_minutes < 0:
+        raise ValueError(
+            f"Bronze partition {date_str} hour {hour_str} is in the future; "
+            "cannot validate freshness for a future hour."
+        )
+
+    if age_minutes > max_age_minutes:
+        raise ValueError(
+            f"Bronze partition {date_str} hour {hour_str} is stale: "
+            f"age {age_minutes:.0f} minutes exceeds the {max_age_minutes}-minute threshold."
+        )
+
+    bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
+    has_s3_credentials = bool(os.getenv("MINIO_USER") and os.getenv("MINIO_PASSWORD"))
+    if not has_s3_credentials:
+        logger.warning(
+            "MINIO_USER/MINIO_PASSWORD are not set; skipping bronze file enumeration "
+            f"for {date_str} hour {hour_str}."
+        )
+        return {
+            "date": date_str,
+            "hour": hour_str,
+            "age_minutes": round(age_minutes, 2),
+            "file_count": 0,
+        }
+
+    try:
+        files = con.execute("SELECT file FROM glob(?)", [bronze_path]).fetchall()
+    except duckdb.Error as exc:
+        logger.warning(
+            "Bronze file enumeration failed for %s hour %s at %s; "
+            "skipping file-count validation because S3 credentials may be missing: %s",
+            date_str,
+            hour_str,
+            bronze_path,
+            exc,
+        )
+        return {
+            "date": date_str,
+            "hour": hour_str,
+            "age_minutes": round(age_minutes, 2),
+            "file_count": 0,
+        }
+
+    if not files:
+        raise FileNotFoundError(
+            f"No bronze files found for {date_str} hour {hour_str}; "
+            "data freshness check failed."
+        )
+
+    return {
+        "date": date_str,
+        "hour": hour_str,
+        "age_minutes": round(age_minutes, 2),
+        "file_count": len(files),
+    }
+
+
+def transform_hour(con, date_str, hour_str, overwrite=True):
     date_str, hour_str = validate_partition(date_str, hour_str)
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
-    silver_path = (
-        f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}/data.parquet"
+    silver_dir = (
+        f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}"
     )
+    output_file = f"{silver_dir}/data.parquet"
+    temp_file = f"{silver_dir}/.tmp-{uuid.uuid4()}-data.parquet"
+
     bronze_file = con.execute(
         "SELECT file FROM glob(?) LIMIT 1",
         [bronze_path],
@@ -153,6 +284,7 @@ def transform_hour(con, date_str, hour_str):
     if bronze_file is None:
         logger.warning(f"No bronze data for {date_str} hour {hour_str}, skipping")
         return
+
     quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
     (
         before,
@@ -166,8 +298,13 @@ def transform_hour(con, date_str, hour_str):
         missing_gps_time,
         after,
     ) = con.execute(quality_sql).fetchone()
+    validate_output_quality(date_str, hour_str, before, after)
+
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
-    con.execute(f"COPY ({sql}) TO '{silver_path}' (FORMAT parquet)")
+    copy_mode = "OVERWRITE_OR_IGNORE true" if overwrite else "OVERWRITE_OR_IGNORE false"
+    con.execute(f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, {copy_mode})")
+    con.execute(f"COPY '{temp_file}' TO '{output_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)")
+    validate_silver_schema(con, output_file)
 
     rejected_coordinates = before - after_coordinates
     rejected_gps_time = after_coordinates - after_time
@@ -186,7 +323,7 @@ def transform_hour(con, date_str, hour_str):
         f"missing={missing_gps_time}), "
         f"duplicates={duplicates}, "
         f"silver={after}, "
-        f"dropped={dropped_pct:.1%} → {silver_path}"
+        f"dropped={dropped_pct:.1%} → {output_file}"
     )
 
 

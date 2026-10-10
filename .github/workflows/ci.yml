@@ -28,10 +28,10 @@ jobs:
           pip install ruff==0.16.10
 
       - name: Check lint
-        run: ruff check ingest.py bronze_to_silver.py tests
+        run: ruff check ingest.py bronze_to_silver.py dags tests
 
       - name: Check formatting
-        run: ruff format --check ingest.py bronze_to_silver.py tests
+        run: ruff format --check ingest.py bronze_to_silver.py dags tests
 
       - name: Run tests
         run: python -B -m unittest discover -s tests -v
