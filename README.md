@@ -137,8 +137,10 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
   process.
 - **Failures stay visible.** An empty Bronze partition is detected by listing
   matching S3 objects. Storage/listing errors propagate and fail the Airflow
-  task instead of being reported as an empty hour. The DAG also fails when the
-  newest Bronze object in the processed hour is more than 10 minutes old.
+  task instead of being reported as an empty hour. Records whose GPS `Time`
+  is more than 5 minutes older than `_ingested_at` (or later than it) are
+  rejected to quarantine; whole-hour completeness is tracked via ingestion
+  manifests and a `_completeness.json` marker.
 - **Secrets are kept out of logs.** Request errors are summarized by exception
   type and HTTP status, without logging a request URL that may contain the API
   key.
