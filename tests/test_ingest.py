@@ -127,7 +127,10 @@ class SaveToBronzeTests(unittest.TestCase):
         ):
             result = run_once("test-key", Mock())
 
-        self.assertEqual(result, {"buses": 1, "trams": 1, "total": 2})
+        self.assertEqual(
+            result,
+            {"buses": 1, "trams": 1, "total": 2, "failed_sources": []},
+        )
         self.assertEqual(save_mock.call_count, 2)
 
     def test_run_once_saves_successful_vehicle_type_when_other_source_fails(self):
@@ -139,8 +142,34 @@ class SaveToBronzeTests(unittest.TestCase):
         ):
             result = run_once("test-key", s3)
 
-        self.assertEqual(result, {"buses": 1, "trams": 0, "total": 1})
+        self.assertEqual(
+            result,
+            {"buses": 1, "trams": 0, "total": 1, "failed_sources": ["tram"]},
+        )
         save_mock.assert_called_once_with(s3, bus_records, "bus")
+
+    def test_main_alerts_after_consecutive_degraded_cycles(self):
+        degraded = {"buses": 1, "trams": 0, "total": 1, "failed_sources": ["tram"]}
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ZTM_API_KEY": "test-key",
+                    "POLL_INTERVAL_SECONDS": "1",
+                    "DEGRADED_CYCLES_ALERT_THRESHOLD": "2",
+                },
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=Mock()),
+            patch("ingest.ensure_bucket"),
+            patch("ingest.run_once", return_value=degraded),
+            patch("ingest.time.sleep", side_effect=[None, KeyboardInterrupt]),
+            self.assertLogs("ingest", level="CRITICAL") as captured,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        self.assertIn("ALERT", "\n".join(captured.output))
 
     def test_main_retries_next_cycle_after_empty_source_window(self):
         with (

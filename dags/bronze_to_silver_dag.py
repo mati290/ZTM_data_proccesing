@@ -2,6 +2,7 @@ from datetime import timedelta
 
 import pendulum
 from airflow.sdk import dag, get_current_context, task
+from airflow.sdk.exceptions import AirflowSkipException
 from airflow.timetables.interval import CronDataIntervalTimetable
 
 
@@ -30,6 +31,8 @@ def bronze_to_silver_hourly():
                 interval_start.strftime("%Y-%m-%d"),
                 interval_start.strftime("%H"),
             )
+        except bronze_to_silver.BronzeDataMissingError as exc:
+            raise AirflowSkipException(str(exc)) from exc
         finally:
             connection.close()
 

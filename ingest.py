@@ -121,6 +121,7 @@ def ensure_bucket(s3):
 def run_once(api_key, s3):
     buses = []
     trams = []
+    failed_sources = []
 
     for vehicle_type, label in ((1, "bus"), (2, "tram")):
         try:
@@ -132,6 +133,7 @@ def run_once(api_key, s3):
                 _safe_error_summary(error),
             )
             records = []
+            failed_sources.append(label)
 
         if label == "bus":
             buses = records
@@ -160,7 +162,12 @@ def run_once(api_key, s3):
     if trams:
         save_to_bronze(s3, trams, "tram")
 
-    return {"buses": len(buses), "trams": len(trams), "total": total}
+    return {
+        "buses": len(buses),
+        "trams": len(trams),
+        "total": total,
+        "failed_sources": failed_sources,
+    }
 
 
 def main():
@@ -181,10 +188,16 @@ def main():
     interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
     if interval <= 0:
         raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
+    alert_threshold = int(os.getenv("DEGRADED_CYCLES_ALERT_THRESHOLD", "10"))
+    if alert_threshold <= 0:
+        raise ValueError("DEGRADED_CYCLES_ALERT_THRESHOLD must be a positive integer")
     logger.info(f"Starting main loop with interval {interval} seconds")
+    degraded_cycles = 0
     while True:
+        degraded = True
         try:
-            run_once(api_key, s3)
+            result = run_once(api_key, s3)
+            degraded = bool(result["failed_sources"])
         except (
             requests.RequestException,
             ZTMApiError,
@@ -195,6 +208,11 @@ def main():
             logger.error(
                 "Ingestion cycle failed (%s); retrying in next cycle",
                 _safe_error_summary(error),
+            )
+        degraded_cycles = degraded_cycles + 1 if degraded else 0
+        if degraded_cycles == alert_threshold:
+            logger.critical(
+                "ALERT: ingestion degraded for %s consecutive cycles", degraded_cycles
             )
         time.sleep(interval)
 
