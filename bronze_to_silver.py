@@ -442,6 +442,26 @@ def write_completeness_marker(completeness: dict, silver_dir: str) -> None:
     )
 
 
+def read_completeness_marker(date_str: str, hour_str: str, s3_client=None) -> dict:
+    """Return the hour's marker, or status 'unknown' when it is missing."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    s3_client = s3_client or _s3_client()
+    key = f"vehicle_positions/date={date_str}/hour={hour_str}/_completeness.json"
+    try:
+        body = s3_client.get_object(Bucket="silver", Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return {"status": "unknown"}
+        raise
+    return json.loads(body)
+
+
+def is_hour_complete(date_str: str, hour_str: str, s3_client=None) -> bool:
+    """Gold/dashboard consumers should only aggregate hours where this is True."""
+    marker = read_completeness_marker(date_str, hour_str, s3_client)
+    return marker.get("status") == "complete"
+
+
 def validate_output_quality(
     date_str: str, hour_str: str, bronze_count: int, silver_count: int
 ):

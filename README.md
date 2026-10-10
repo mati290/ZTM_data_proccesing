@@ -176,8 +176,10 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
   `vehicle_positions/date=/hour=/_completeness.json` with status `complete`
   (≥90% of cycles complete), `incomplete`, or `unknown` (no manifests, e.g.
   data from before this feature). Silver is still published for incomplete
-  hours, but Gold/dashboards should check the marker before trusting
-  bus+tram totals.
+  hours, but Gold/dashboards must only aggregate hours for which
+  `is_hour_complete(date, hour)` (in `bronze_to_silver.py`) is true; a missing
+  marker is treated as `unknown`, i.e. not complete. Incomplete hours should be
+  excluded or flagged in the UI.
 - A successful API response with an empty result is logged and counted as a
   degraded source window. Alerts are currently log-based; no external alert
   destination is configured.

@@ -20,8 +20,10 @@ from bronze_to_silver import (
     delete_s3_object,
     get_connection,
     is_before_first_bronze_hour,
+    is_hour_complete,
     main,
     parse_s3_endpoint,
+    read_completeness_marker,
     s3_object_exists,
     transform_hour,
     validate_partition,
@@ -37,6 +39,40 @@ class CompletenessTests(unittest.TestCase):
             {"Contents": [{"Key": key}]} if key else {} for key in first_keys
         ]
         return client
+
+    @staticmethod
+    def _marker_client(status=None, error_code=None):
+        client = Mock()
+        if error_code:
+            client.get_object.side_effect = ClientError(
+                {"Error": {"Code": error_code}}, "GetObject"
+            )
+        else:
+            body = Mock()
+            body.read.return_value = json.dumps({"status": status}).encode()
+            client.get_object.return_value = {"Body": body}
+        return client
+
+    def test_is_hour_complete_only_for_complete(self):
+        for status, expected in (
+            ("complete", True),
+            ("incomplete", False),
+            ("unknown", False),
+        ):
+            client = self._marker_client(status)
+            self.assertIs(is_hour_complete("2026-10-09", "07", client), expected)
+
+    def test_missing_marker_is_unknown_not_complete(self):
+        client = self._marker_client(error_code="NoSuchKey")
+        self.assertEqual(
+            read_completeness_marker("2026-10-09", "07", client), {"status": "unknown"}
+        )
+        self.assertFalse(is_hour_complete("2026-10-09", "07", client))
+
+    def test_other_storage_errors_propagate(self):
+        client = self._marker_client(error_code="AccessDenied")
+        with self.assertRaises(ClientError):
+            is_hour_complete("2026-10-09", "07", client)
 
     def test_hour_before_first_bronze_is_pre_ingestion(self):
         client = self._listing(
