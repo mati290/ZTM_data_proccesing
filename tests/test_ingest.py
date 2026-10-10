@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 from botocore.exceptions import ClientError
-from requests import Timeout
+from requests import HTTPError, Timeout
 
 from ingest import ZTMApiError, ensure_bucket, fetch_positions, save_to_bronze
 
@@ -49,6 +49,26 @@ class SaveToBronzeTests(unittest.TestCase):
             self.assertRaises(ZTMApiError),
         ):
             fetch_positions(1, "test-key", max_attempts=1)
+
+    def test_fetch_positions_does_not_log_api_key_on_http_error(self):
+        api_key = "test-secret-key"
+        response = Mock()
+        response.raise_for_status.side_effect = HTTPError(
+            f"401 Client Error for url: https://example.test/?apikey={api_key}",
+            response=Mock(status_code=401),
+        )
+
+        with (
+            patch("ingest.requests.get", return_value=response),
+            patch("ingest.time.sleep"),
+            self.assertLogs("ingest", level="WARNING") as captured,
+            self.assertRaises(HTTPError),
+        ):
+            fetch_positions(1, api_key, max_attempts=2)
+
+        output = "\n".join(captured.output)
+        self.assertNotIn(api_key, output)
+        self.assertEqual(output.count("HTTPError (status=401)"), 2)
 
     def test_fetch_positions_retries_after_timeout(self):
         response = Mock()

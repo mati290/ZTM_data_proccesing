@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import boto3
 import requests
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 logging.Formatter.converter = time.gmtime
@@ -23,6 +23,13 @@ class ZTMApiError(Exception):
 
 
 url = "https://api.um.warszawa.pl/api/action/busestrams_get/"
+
+
+def _safe_error_summary(error: Exception) -> str:
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else "unknown"
+        return f"HTTPError (status={status})"
+    return type(error).__name__
 
 
 def fetch_positions(vehicle_type, api_key, max_attempts=3):
@@ -43,11 +50,11 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
         except (requests.RequestException, ZTMApiError) as e:
             if attempt == max_attempts:
                 logger.error(
-                    f"All {max_attempts} attempts failed for vehicle type {vehicle_type}: {e}"
+                    f"All {max_attempts} attempts failed for vehicle type {vehicle_type}: {_safe_error_summary(e)}"
                 )
                 raise
             logger.warning(
-                f"Attempt {attempt}/{max_attempts} failed for vehicle type {vehicle_type}: {e}"
+                f"Attempt {attempt}/{max_attempts} failed for vehicle type {vehicle_type}: {_safe_error_summary(e)}"
             )
             time.sleep(2**attempt)
     raise RuntimeError(f"Failed to fetch positions for vehicle type {vehicle_type}")
@@ -101,8 +108,8 @@ def ensure_bucket(s3):
 
 
 def run_once(api_key, s3):
-    buses = fetch_positions(1, api_key)
-    trams = fetch_positions(2, api_key)
+    buses = fetch_positions(1, api_key=api_key)
+    trams = fetch_positions(2, api_key=api_key)
     logger.info(f"Fetched {len(buses)} buses and {len(trams)} trams")
 
     save_to_bronze(s3, buses, "bus")
@@ -129,8 +136,16 @@ def main():
     while True:
         try:
             run_once(api_key, s3)
-        except Exception:
-            logger.exception("Ingestion cycle failed, retrying in next cycle:")
+        except (
+            requests.RequestException,
+            ZTMApiError,
+            BotoCoreError,
+            ClientError,
+        ) as error:
+            logger.error(
+                "Ingestion cycle failed (%s); retrying in next cycle",
+                _safe_error_summary(error),
+            )
         time.sleep(interval)
 
 
