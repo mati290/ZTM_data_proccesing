@@ -237,10 +237,14 @@ class BronzeToSilverSqlTests(unittest.TestCase):
 
 class TransformHourTests(unittest.TestCase):
     def setUp(self):
-        for name in ("assess_completeness", "write_completeness_marker"):
-            patcher = patch(f"bronze_to_silver.{name}")
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        self.completeness = {"status": "complete", "cycles": 10, "complete_cycles": 10}
+        self.assess_mock = patch(
+            "bronze_to_silver.assess_completeness", return_value=self.completeness
+        ).start()
+        self.write_marker_mock = patch(
+            "bronze_to_silver.write_completeness_marker"
+        ).start()
+        self.addCleanup(patch.stopall)
 
     @staticmethod
     def _happy_path_connection():
@@ -300,6 +304,31 @@ class TransformHourTests(unittest.TestCase):
         )
         delete_mock.assert_any_call(source)
         self.assertEqual(delete_mock.call_count, 2)
+        self.assess_mock.assert_called_once_with("2026-10-09", "07")
+        self.write_marker_mock.assert_called_once_with(
+            self.completeness,
+            "s3://silver/vehicle_positions/date=2026-10-09/hour=07",
+        )
+
+    def test_warns_and_still_publishes_when_hour_is_incomplete(self):
+        self.assess_mock.return_value = {
+            "status": "incomplete",
+            "cycles": 10,
+            "complete_cycles": 5,
+        }
+        connection = self._happy_path_connection()
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.copy_s3_object") as copy_mock,
+            patch("bronze_to_silver.delete_s3_object"),
+            self.assertLogs("bronze_to_silver", level="WARNING") as logs,
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+
+        self.assertEqual(copy_mock.call_count, 2)
+        self.write_marker_mock.assert_called_once()
+        self.assertTrue(any("incomplete" in line for line in logs.output))
 
     def test_publishes_rejected_rows_to_quarantine(self):
         connection = Mock()
