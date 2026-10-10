@@ -158,6 +158,14 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
 - The local Airflow metadata database is now persisted in a Docker volume so
   task history and DAG metadata survive container restarts. MinIO object data
   remains in its own named volume as well.
+- Silver is partitioned by ingestion hour and deduplicated per hour only
+  (`vehicle_type`, `vehicle_number`, `gps_time_utc`, latest `_ingested_at`
+  wins). If the same GPS fix is ingested just before and just after an hour
+  boundary, it can appear in two consecutive Silver files. This is deliberate:
+  widening the window would change every quality/rejection query and break
+  per-hour count reconciliation. Gold models must deduplicate again, e.g.
+  `QUALIFY ROW_NUMBER() OVER (PARTITION BY vehicle_type, vehicle_number,
+  gps_time_utc ORDER BY ingested_at DESC) = 1`.
 - A successful API response with an empty result is logged and counted as a
   degraded source window. Alerts are currently log-based; no external alert
   destination is configured.
