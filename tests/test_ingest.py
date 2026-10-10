@@ -1,7 +1,7 @@
 import json
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from botocore.exceptions import ClientError
 from requests import HTTPError, Timeout
@@ -201,7 +201,10 @@ class SaveToBronzeTests(unittest.TestCase):
 
         ensure_bucket(s3)
 
-        s3.create_bucket.assert_called_once_with(Bucket="bronze")
+        s3.create_bucket.assert_has_calls(
+            [call(Bucket="bronze"), call(Bucket="silver")]
+        )
+        self.assertEqual(s3.create_bucket.call_count, 2)
 
     def test_ensure_bucket_does_not_hide_permission_error(self):
         s3 = Mock()

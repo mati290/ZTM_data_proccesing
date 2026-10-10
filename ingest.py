@@ -101,9 +101,14 @@ def save_to_bronze(s3, records, vehicle_label):
     logger.info(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
 
 
-def ensure_bucket(s3):
+def ensure_bucket(s3, buckets=("bronze", "silver")):
+    for bucket in buckets:
+        _ensure_single_bucket(s3, bucket)
+
+
+def _ensure_single_bucket(s3, bucket):
     try:
-        s3.head_bucket(Bucket="bronze")
+        s3.head_bucket(Bucket=bucket)
     except ClientError as exc:
         error = exc.response.get("Error", {})
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
@@ -115,7 +120,7 @@ def ensure_bucket(s3):
         }:
             raise
 
-        s3.create_bucket(Bucket="bronze")
+        s3.create_bucket(Bucket=bucket)
 
 
 def run_once(api_key, s3):

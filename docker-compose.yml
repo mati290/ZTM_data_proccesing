@@ -1,6 +1,6 @@
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-13T00-42-17Z
+    image: cgr.dev/chainguard/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_USER:?set MINIO_USER in .env}
@@ -10,19 +10,6 @@ services:
       - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
-
-  minio-init:
-    image: quay.io/minio/mc:latest
-    depends_on:
-      - minio
-    environment:
-      MINIO_USER: ${MINIO_USER}
-      MINIO_PASSWORD: ${MINIO_PASSWORD}
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set local http://minio:9000 \"$$MINIO_USER\" \"$$MINIO_PASSWORD\"; do sleep 2; done;
-      mc mb --ignore-existing local/bronze local/silver"
-    restart: "no"
 
   ingestion:
     build: .
