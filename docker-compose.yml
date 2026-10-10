@@ -36,8 +36,8 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       S3_ENDPOINT_URL: http://minio:9000
-      MINIO_USER: ${MINIO_USER}
-      MINIO_PASSWORD: ${MINIO_PASSWORD}
+      MINIO_USER: ${MINIO_USER:?set MINIO_USER in .env}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:?set MINIO_PASSWORD in .env}
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
