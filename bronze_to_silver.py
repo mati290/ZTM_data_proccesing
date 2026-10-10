@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import duckdb
 from dotenv import load_dotenv
@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-TRANSFORM_SQL = """
+BASE_CTES = """
 WITH source AS (
     SELECT *
     FROM read_json_auto('{bronze_path}', hive_partitioning = true)
@@ -32,23 +32,72 @@ typed AS (
         CAST(_ingested_at AS TIMESTAMPTZ)                     AS ingested_at
     FROM source
 ),
-filtered AS (
+valid_coordinates AS (
     SELECT *
     FROM typed
-    WHERE ingested_at - gps_time_utc <= INTERVAL 5 MINUTE
-      AND lat BETWEEN 51.9 AND 52.6
-      AND lon BETWEEN 20.5 AND 21.6
+    WHERE lat BETWEEN 51.9 AND 52.6
+    AND lon BETWEEN 20.5 AND 21.6
+),
+valid_gps_time AS (
+    SELECT *
+    FROM valid_coordinates
+    WHERE ingested_at - gps_time_utc >= INTERVAL 0 SECOND
+    AND ingested_at - gps_time_utc <= INTERVAL 5 MINUTE
 ),
 deduplicated AS (
     SELECT *
-    FROM filtered
+    FROM valid_gps_time
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY vehicle_type, vehicle_number, gps_time_utc
         ORDER BY ingested_at
     ) = 1
 )
-SELECT * FROM deduplicated
 """
+
+TRANSFORM_SQL = BASE_CTES + "SELECT * FROM deduplicated"
+
+QUALITY_SQL = (
+    BASE_CTES
+    + """
+SELECT
+    (SELECT COUNT(*) FROM source) AS bronze_count,
+    (SELECT COUNT(*) FROM valid_coordinates) AS after_coordinates_count,
+    (SELECT COUNT(*) FROM valid_gps_time) AS after_time_count,
+    (
+        SELECT COUNT(*)
+        FROM valid_coordinates
+        WHERE gps_time_utc > ingested_at
+    ) AS future_gps_time_count,
+    (
+        SELECT COUNT(*)
+        FROM valid_coordinates
+        WHERE ingested_at - gps_time_utc > INTERVAL 5 MINUTE
+    ) AS stale_gps_time_count,
+    (
+        SELECT COUNT(*)
+        FROM valid_coordinates
+        WHERE ingested_at - gps_time_utc > INTERVAL 5 MINUTE
+        AND ingested_at - gps_time_utc <= INTERVAL 10 MINUTE
+    ) AS stale_5_to_10_minutes_count,
+    (
+        SELECT COUNT(*)
+        FROM valid_coordinates
+        WHERE ingested_at - gps_time_utc > INTERVAL 10 MINUTE
+        AND ingested_at - gps_time_utc <= INTERVAL 30 MINUTE
+    ) AS stale_10_to_30_minutes_count,
+    (
+        SELECT COUNT(*)
+        FROM valid_coordinates
+        WHERE ingested_at - gps_time_utc > INTERVAL 30 MINUTE
+    ) AS stale_over_30_minutes_count,
+    (
+        SELECT COUNT(*)
+        FROM valid_coordinates
+        WHERE gps_time_utc IS NULL OR ingested_at IS NULL
+    ) AS missing_gps_time_count,
+    (SELECT COUNT(*) FROM deduplicated) AS silver_count
+"""
+)
 
 
 def get_connection():
@@ -72,32 +121,69 @@ def get_connection():
     return con
 
 
+def validate_partition(date_str: str, hour_str: str) -> tuple[str, str]:
+    try:
+        parsed_date = date.fromisoformat(date_str)
+    except ValueError as exc:
+        raise ValueError("date must use YYYY-MM-DD format") from exc
+
+    if parsed_date.strftime("%Y-%m-%d") != date_str:
+        raise ValueError("date must use YYYY-MM-DD format")
+
+    if not hour_str.isascii() or not hour_str.isdigit() or len(hour_str) not in (1, 2):
+        raise ValueError("hour must be between 0 and 23")
+
+    hour = int(hour_str)
+    if not 0 <= hour <= 23:
+        raise ValueError("hour must be between 0 and 23")
+
+    return date_str, f"{hour:02d}"
+
+
 def transform_hour(con, date_str, hour_str):
-    hour_str = hour_str.zfill(2)
+    date_str, hour_str = validate_partition(date_str, hour_str)
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
     silver_path = (
         f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}/data.parquet"
     )
 
-    # liczba rekordów w bronze; jeśli nie ma plików, DuckDB rzuca IOException
     try:
-        before = con.sql(
-            f"SELECT COUNT(*) FROM read_json_auto('{bronze_path}')"
-        ).fetchone()[0]
+        quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
+        (
+            before,
+            after_coordinates,
+            after_time,
+            future_gps_time,
+            stale_gps_time,
+            stale_5_to_10,
+            stale_10_to_30,
+            stale_over_30,
+            missing_gps_time,
+            after,
+        ) = con.execute(quality_sql).fetchone()
     except duckdb.IOException:
         logger.warning(f"No bronze data for {date_str} hour {hour_str}, skipping")
         return
-
-    # wypełniamy szablon prawdziwą ścieżką
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
-
-    after = con.sql(f"SELECT COUNT(*) FROM ({sql})").fetchone()[0]
-
     con.execute(f"COPY ({sql}) TO '{silver_path}' (FORMAT parquet)")
 
+    rejected_coordinates = before - after_coordinates
+    rejected_gps_time = after_coordinates - after_time
+    duplicates = after_time - after
     dropped_pct = (before - after) / before if before else 0
+
     logger.info(
-        f"{date_str} hour {hour_str}: bronze={before}, silver={after}, "
+        f"{date_str} hour {hour_str}: "
+        f"bronze={before}, "
+        f"rejected_coordinates={rejected_coordinates}, "
+        f"rejected_gps_time={rejected_gps_time} "
+        f"(future={future_gps_time}, stale_total={stale_gps_time}, "
+        f"stale_5_to_10={stale_5_to_10}, "
+        f"stale_10_to_30={stale_10_to_30}, "
+        f"stale_over_30={stale_over_30}, "
+        f"missing={missing_gps_time}), "
+        f"duplicates={duplicates}, "
+        f"silver={after}, "
         f"dropped={dropped_pct:.1%} → {silver_path}"
     )
 

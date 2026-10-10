@@ -2,10 +2,12 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 logging.Formatter.converter = time.gmtime
@@ -20,24 +22,10 @@ class ZTMApiError(Exception):
     """Raised when the ZTM API returns an error message instead of data."""
 
 
-load_dotenv()
-api_key = os.getenv("ZTM_API_KEY")
-
-if not api_key:
-    raise ValueError("API key not found. Please set ZTM_API_KEY in your .env file.")
-
-
 url = "https://api.um.warszawa.pl/api/action/busestrams_get/"
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
-    aws_access_key_id=os.getenv("MINIO_USER"),
-    aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
-)
 
-
-def fetch_positions(vehicle_type, max_attempts=3):
+def fetch_positions(vehicle_type, api_key, max_attempts=3):
     params = {
         "resource_id": "f2e5503e-927d-4ad3-9500-4ab9e55deb59",
         "apikey": api_key,
@@ -65,14 +53,16 @@ def fetch_positions(vehicle_type, max_attempts=3):
     raise RuntimeError(f"Failed to fetch positions for vehicle type {vehicle_type}")
 
 
-def save_to_bronze(records, vehicle_label):
+def save_to_bronze(s3, records, vehicle_label):
     if not records:
         logger.warning(f"No records fetched for vehicle type {vehicle_label}")
         return
 
     ingested_at = datetime.now(timezone.utc)
 
-    file_name = f"positions_{ingested_at.strftime('%Y%m%dT%H%M%S')}.jsonl"
+    file_name = (
+        f"positions_{ingested_at.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.jsonl"
+    )
 
     key = (
         f"vehicle_type={vehicle_label}/"
@@ -83,8 +73,8 @@ def save_to_bronze(records, vehicle_label):
 
     lines = []
     for record in records:
-        record["_ingested_at"] = ingested_at.isoformat()
-        lines.append(json.dumps(record, ensure_ascii=False))
+        enriched_record = {**record, "_ingested_at": ingested_at.isoformat()}
+        lines.append(json.dumps(enriched_record, ensure_ascii=False))
 
     body = "\n".join(lines)
 
@@ -93,21 +83,52 @@ def save_to_bronze(records, vehicle_label):
     logger.info(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
 
 
-def run_once():
-    buses = fetch_positions(1)
-    trams = fetch_positions(2)
+def ensure_bucket(s3):
+    try:
+        s3.head_bucket(Bucket="bronze")
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+
+        if status != 404 and error.get("Code") not in {
+            "404",
+            "NoSuchBucket",
+            "NotFound",
+        }:
+            raise
+
+        s3.create_bucket(Bucket="bronze")
+
+
+def run_once(api_key, s3):
+    buses = fetch_positions(1, api_key)
+    trams = fetch_positions(2, api_key)
     logger.info(f"Fetched {len(buses)} buses and {len(trams)} trams")
 
-    save_to_bronze(buses, "bus")
-    save_to_bronze(trams, "tram")
+    save_to_bronze(s3, buses, "bus")
+    save_to_bronze(s3, trams, "tram")
 
 
 def main():
+    load_dotenv()
+    api_key = os.getenv("ZTM_API_KEY")
+    if not api_key:
+        raise ValueError("API key not found. Please set ZTM_API_KEY in your .env file.")
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
+        aws_access_key_id=os.getenv("MINIO_USER"),
+        aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
+    )
+
+    ensure_bucket(s3)
+
     interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
     logger.info(f"Starting main loop with interval {interval} seconds")
     while True:
         try:
-            run_once()
+            run_once(api_key, s3)
         except Exception:
             logger.exception("Ingestion cycle failed, retrying in next cycle:")
         time.sleep(interval)
