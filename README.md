@@ -35,7 +35,7 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 | Transformation | DuckDB |
 | Containerization | Docker, Docker Compose |
 | Data formats | JSON Lines (bronze), Parquet (silver), Hive-style partitioning |
-| Testing and linting | unittest, Ruff |
+| Testing and linting | pytest / unittest, Ruff |
 | CI | GitHub Actions |
 
 ## How to run
@@ -74,11 +74,10 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 
 5. Open the Airflow UI at http://localhost:8080 and check the
    `bronze_to_silver_hourly` DAG. It processes the completed UTC hour and writes
-   Parquet output to Silver. The DAG checks Bronze freshness before processing;
-   missing or stale Bronze data fails the task, so the data gap stays visible
-   and can be retried after ingestion recovers. Automatic catchup is disabled
-   to avoid creating historical runs for hours before this local pipeline was
-   collecting data. MinIO's console is at http://localhost:9001.
+   Parquet output to Silver. Hours with no Bronze data are marked as skipped
+   rather than failed, and catchup is enabled from the DAG `start_date`, so
+   missed hours are processed automatically once Bronze data exists. MinIO's
+   console is at http://localhost:9001.
 
 To stop the services, run `docker compose down`. Bronze and Silver objects are
 kept in the `minio_data` Docker volume.
