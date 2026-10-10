@@ -63,10 +63,8 @@ def main():
         ).fetchall()
         assert len(rows) == 1 and str(rows[0][0]) == "1001", rows
         rejected = f"s3://silver/quarantine/vehicle_positions/date={DATE}/hour={HOUR}/data.parquet"
-        count = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{rejected}')"
-        ).fetchone()[0]
-        assert count == 3, count
+        row = con.execute(f"SELECT COUNT(*) FROM read_parquet('{rejected}')").fetchone()
+        assert row is not None and row[0] == 3, row
     finally:
         con.close()
         for bucket, prefix in (
