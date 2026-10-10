@@ -1,7 +1,6 @@
 import argparse
 import logging
 import os
-import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -30,6 +29,18 @@ EXPECTED_SILVER_COLUMNS = [
     "gps_time_utc",
     "ingested_at",
 ]
+
+EXPECTED_SILVER_TYPES = {
+    "lat": "DOUBLE",
+    "lon": "DOUBLE",
+    "gps_time_utc": "TIMESTAMP WITH TIME ZONE",
+    "ingested_at": "TIMESTAMP WITH TIME ZONE",
+}
+
+
+class BronzeDataMissingError(FileNotFoundError):
+    """Raised when an hourly Bronze partition contains no files."""
+
 
 BASE_CTES = """
 WITH source AS (
@@ -179,39 +190,81 @@ def validate_partition(date_str: str, hour_str: str) -> tuple[str, str]:
 
 def validate_silver_schema(con, silver_path):
     try:
-        schema = con.execute(f"DESCRIBE TABLE read_parquet('{silver_path}')").fetchall()
+        schema = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{silver_path}')"
+        ).fetchall()
     except Exception as exc:
         raise ValueError(
             f"Silver schema validation failed for {silver_path}: {exc}"
         ) from exc
 
-    if not isinstance(schema, (list, tuple)):
-        raise TypeError(
-            f"Silver schema validation failed for {silver_path}: schema could not be read"
-        )
-
-    actual_columns = [column[0] for column in schema]
+    actual_types = {column[0]: str(column[1]) for column in schema}
     missing = [
-        column for column in EXPECTED_SILVER_COLUMNS if column not in actual_columns
+        column for column in EXPECTED_SILVER_COLUMNS if column not in actual_types
     ]
     if missing:
         raise ValueError(
             f"Silver schema validation failed for {silver_path}: missing columns {missing}"
         )
 
+    wrong_types = {
+        column: actual_types[column]
+        for column, expected in EXPECTED_SILVER_TYPES.items()
+        if actual_types[column] != expected
+    }
+    if wrong_types:
+        raise ValueError(
+            f"Silver schema validation failed for {silver_path}: "
+            f"unexpected column types {wrong_types}"
+        )
 
-def delete_s3_object(s3_uri: str) -> None:
+
+def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     parsed_uri = urlparse(s3_uri)
     if parsed_uri.scheme != "s3" or not parsed_uri.netloc or not parsed_uri.path:
         raise ValueError(f"Expected an s3:// URI, received: {s3_uri}")
+    return parsed_uri.netloc, parsed_uri.path.lstrip("/")
 
-    s3 = boto3.client(
+
+def _s3_client():
+    return boto3.client(
         "s3",
         endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
         aws_access_key_id=os.getenv("MINIO_USER"),
         aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
     )
-    s3.delete_object(Bucket=parsed_uri.netloc, Key=parsed_uri.path.lstrip("/"))
+
+
+def delete_s3_object(s3_uri: str) -> None:
+    bucket, key = _parse_s3_uri(s3_uri)
+    _s3_client().delete_object(Bucket=bucket, Key=key)
+
+
+def s3_object_exists(s3_uri: str) -> bool:
+    bucket, key = _parse_s3_uri(s3_uri)
+    try:
+        _s3_client().head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status == 404 or exc.response.get("Error", {}).get("Code") in {
+            "404",
+            "NoSuchKey",
+            "NotFound",
+        }:
+            return False
+        raise
+    return True
+
+
+def copy_s3_object(source_uri: str, destination_uri: str) -> None:
+    """Server-side copy: the destination is replaced in a single operation."""
+    source_bucket, source_key = _parse_s3_uri(source_uri)
+    destination_bucket, destination_key = _parse_s3_uri(destination_uri)
+    _s3_client().copy_object(
+        Bucket=destination_bucket,
+        Key=destination_key,
+        CopySource={"Bucket": source_bucket, "Key": source_key},
+    )
 
 
 def validate_output_quality(
@@ -254,38 +307,6 @@ def check_bronze_freshness(
         )
 
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
-    s3_endpoint = os.getenv("S3_ENDPOINT_URL")
-    has_s3_credentials = bool(os.getenv("MINIO_USER") and os.getenv("MINIO_PASSWORD"))
-    is_local_or_test = (
-        os.getenv("APP_ENV") in {"local", "test"}
-        or "PYTEST_CURRENT_TEST" in os.environ
-        or "pytest" in os.environ.get("PYTEST_CURRENT_TEST", "")
-        or "unittest" in sys.modules
-        or (
-            not s3_endpoint
-            and not has_s3_credentials
-            and os.getenv("ENVIRONMENT", "local").lower() in {"local", "test"}
-        )
-    )
-    if not s3_endpoint or not has_s3_credentials:
-        if is_local_or_test:
-            logger.warning(
-                "S3 endpoint/credentials are not configured; skipping Bronze file existence check "
-                "for %s hour %s in local/test mode.",
-                date_str,
-                hour_str,
-            )
-            return {
-                "date": date_str,
-                "hour": hour_str,
-                "age_minutes": round(age_minutes, 2),
-                "file_count": None,
-            }
-        raise RuntimeError(
-            "Bronze freshness validation requires S3 endpoint and MinIO credentials to be configured; "
-            f"cannot validate {date_str} hour {hour_str} in this environment."
-        )
-
     try:
         files = con.execute(
             "SELECT file FROM glob(?) LIMIT 1", [bronze_path]
@@ -296,7 +317,7 @@ def check_bronze_freshness(
         ) from exc
 
     if not files:
-        raise FileNotFoundError(
+        raise BronzeDataMissingError(
             f"No bronze files found for {date_str} hour {hour_str}; "
             "data freshness check failed."
         )
@@ -321,8 +342,10 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         [bronze_path],
     ).fetchone()
     if bronze_file is None:
-        logger.warning("No bronze data for %s hour %s, skipping", date_str, hour_str)
-        return
+        raise BronzeDataMissingError(
+            f"No bronze files found for {date_str} hour {hour_str}; "
+            "refusing to report success for an empty partition."
+        )
 
     quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
     (
@@ -340,9 +363,6 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     validate_output_quality(date_str, hour_str, before, after)
 
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
-    final_copy_mode = (
-        "OVERWRITE_OR_IGNORE true" if overwrite else "OVERWRITE_OR_IGNORE false"
-    )
     try:
         con.execute(
             f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
@@ -351,16 +371,16 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         row_count = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{temp_file}')"
         ).fetchone()[0]
-        if row_count == 0:
+        if row_count != after:
             raise ValueError(
                 f"Silver validation failed for {date_str} hour {hour_str}: "
-                "temporary output is empty; refusing to publish."
+                f"temporary output has {row_count} rows, expected {after}; "
+                "refusing to publish."
             )
 
-        con.execute(
-            f"COPY '{temp_file}' TO '{output_file}' (FORMAT parquet, {final_copy_mode})"
-        )
-        validate_silver_schema(con, output_file)
+        if not overwrite and s3_object_exists(output_file):
+            raise FileExistsError(f"Silver output already exists: {output_file}")
+        copy_s3_object(temp_file, output_file)
     finally:
         try:
             delete_s3_object(temp_file)
