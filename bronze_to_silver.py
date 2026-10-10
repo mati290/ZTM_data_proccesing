@@ -483,7 +483,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"{silver_dir}/_staging/{uuid.uuid4()}.rejected.parquet.pending"
     )
 
-    # glob() nie przyjmuje parametrĂłw w duckdb 1.2.x; Ĺ›cieĹĽka pochodzi ze zwalidowanej partycji
+    # glob() does not accept bound parameters in duckdb 1.2.x; the path comes from a validated partition
     bronze_file = con.execute(
         f"SELECT file FROM glob('{bronze_path}') LIMIT 1"
     ).fetchone()
@@ -587,15 +587,15 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"duplicates={duplicates}, "
         f"quarantined={rejected_count}, "
         f"silver={after}, "
-        f"dropped={dropped_pct:.1%} â†’ {output_file}"
+        f"dropped={dropped_pct:.1%} -> {output_file}"
     )
 
 
 def main():
-    # domyĹ›lnie: poprzednia peĹ‚na godzina w UTC
+    # default: previous full hour in UTC
     previous_hour = datetime.now(timezone.utc) - timedelta(hours=1)
 
-    parser = argparse.ArgumentParser(description="Bronze â†’ silver for one hour")
+    parser = argparse.ArgumentParser(description="Bronze -> silver for one hour")
     parser.add_argument("--date", default=previous_hour.strftime("%Y-%m-%d"))
     parser.add_argument("--hour", default=previous_hour.strftime("%H"))
     args = parser.parse_args()
