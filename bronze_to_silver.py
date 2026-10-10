@@ -381,6 +381,23 @@ def copy_s3_object(source_uri: str, destination_uri: str) -> None:
     )
 
 
+def is_before_first_bronze_hour(date_str: str, hour_str: str, s3_client=None) -> bool:
+    """True when no Bronze data exists at or before this hour (pre-ingestion period)."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    s3_client = s3_client or _s3_client()
+    earliest = None
+    for label in ("bus", "tram"):
+        # Keys sort by date then hour, so the first key is the earliest hour.
+        response = s3_client.list_objects_v2(
+            Bucket="bronze", Prefix=f"vehicle_type={label}/", MaxKeys=1
+        )
+        for obj in response.get("Contents", []):
+            parts = dict(p.split("=", 1) for p in obj["Key"].split("/")[1:3])
+            candidate = (parts["date"], parts["hour"])
+            earliest = candidate if earliest is None else min(earliest, candidate)
+    return earliest is None or (date_str, hour_str) < earliest
+
+
 MIN_COMPLETE_CYCLE_RATIO = 0.9
 
 

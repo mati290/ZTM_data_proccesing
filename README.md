@@ -74,9 +74,11 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 
 5. Open the Airflow UI at http://localhost:8080 and check the
    `bronze_to_silver_hourly` DAG. It processes the completed UTC hour and writes
-   Parquet output to Silver. Hours with no Bronze data are marked as skipped
-   rather than failed, and catchup is enabled from the DAG `start_date`, so
-   missed hours are processed automatically once Bronze data exists. MinIO's
+   Parquet output to Silver. An hour with no Bronze data *after* ingestion has
+   started (an outage) **fails** the run after retries, so the gap is visible;
+   once Bronze data is available again, clear the failed run in the UI to
+   reprocess it. Hours before the first Bronze object are skipped. Catchup is
+   enabled from the DAG `start_date`. MinIO's
    console is at http://localhost:9001.
 
 To stop the services, run `docker compose down`. Bronze and Silver objects are
@@ -184,8 +186,8 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
 
 - [x] **Stage 1** – ZTM API ingestion to MinIO Bronze, Dockerized
 - [x] **Stage 2** – hourly Airflow and DuckDB transformation from Bronze to
-      partitioned Silver Parquet, with missing-Bronze detection (task is
-      skipped), per-record GPS freshness validation, quality metrics,
+      partitioned Silver Parquet, with missing-Bronze detection (outage gaps
+      fail the run), per-record GPS freshness validation, quality metrics,
       quarantine output, and deterministic deduplication
 - [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
       GitHub Actions CI

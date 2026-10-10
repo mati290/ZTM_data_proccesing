@@ -19,6 +19,7 @@ from bronze_to_silver import (
     copy_s3_object,
     delete_s3_object,
     get_connection,
+    is_before_first_bronze_hour,
     main,
     parse_s3_endpoint,
     s3_object_exists,
@@ -29,6 +30,37 @@ from bronze_to_silver import (
 
 
 class CompletenessTests(unittest.TestCase):
+    @staticmethod
+    def _listing(first_keys):
+        client = Mock()
+        client.list_objects_v2.side_effect = [
+            {"Contents": [{"Key": key}]} if key else {} for key in first_keys
+        ]
+        return client
+
+    def test_hour_before_first_bronze_is_pre_ingestion(self):
+        client = self._listing(
+            [
+                "vehicle_type=bus/date=2026-10-10/hour=12/a.jsonl",
+                "vehicle_type=tram/date=2026-10-10/hour=12/b.jsonl",
+            ]
+        )
+        self.assertTrue(is_before_first_bronze_hour("2026-10-10", "11", client))
+
+    def test_hour_after_first_bronze_is_a_gap(self):
+        client = self._listing(
+            [
+                "vehicle_type=bus/date=2026-10-10/hour=12/a.jsonl",
+                "vehicle_type=tram/date=2026-10-10/hour=12/b.jsonl",
+            ]
+        )
+        self.assertFalse(is_before_first_bronze_hour("2026-10-10", "14", client))
+
+    def test_empty_bronze_is_pre_ingestion(self):
+        self.assertTrue(
+            is_before_first_bronze_hour("2026-10-10", "14", self._listing([None, None]))
+        )
+
     @staticmethod
     def _client(statuses):
         client = Mock()

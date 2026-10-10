@@ -32,7 +32,13 @@ def bronze_to_silver_hourly():
                 interval_start.strftime("%H"),
             )
         except bronze_to_silver.BronzeDataMissingError as exc:
-            raise AirflowSkipException(str(exc)) from exc
+            # Hours before the first ever Bronze object are expected (backfill
+            # before ingestion started); any later gap is an outage and must fail.
+            if bronze_to_silver.is_before_first_bronze_hour(
+                interval_start.strftime("%Y-%m-%d"), interval_start.strftime("%H")
+            ):
+                raise AirflowSkipException(str(exc)) from exc
+            raise
         finally:
             connection.close()
 
