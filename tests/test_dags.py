@@ -36,6 +36,14 @@ class DagDefinitionTests(unittest.TestCase):
         self.assertEqual(str(gold.timetable.summary), str(silver.timetable.summary))
         self.assertEqual(gold.max_active_runs, 1)
 
+    def test_late_data_dag_is_single_run_with_retries(self):
+        dag = self.bag.get_dag("reprocess_late_data_hourly")
+        self.assertIsNotNone(dag)
+        self.assertEqual(dag.max_active_runs, 1)
+        self.assertFalse(dag.catchup)
+        self.assertGreaterEqual(dag.default_args["retries"], 1)
+        self.assertIn("reprocess", dag.task_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

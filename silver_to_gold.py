@@ -52,6 +52,8 @@ GOLD_SCHEMAS = {
         ("first_gps_time_utc", TSTZ),
         ("last_gps_time_utc", TSTZ),
         ("data_completeness_status", "VARCHAR"),
+        ("is_final", "BOOLEAN"),
+        ("source_max_ingested_at", TSTZ),
         ("pipeline_run_at", TSTZ),
     ],
     "hourly_line_metrics": [
@@ -65,6 +67,8 @@ GOLD_SCHEMAS = {
         ("first_gps_time_utc", TSTZ),
         ("last_gps_time_utc", TSTZ),
         ("data_completeness_status", "VARCHAR"),
+        ("is_final", "BOOLEAN"),
+        ("source_max_ingested_at", TSTZ),
         ("pipeline_run_at", TSTZ),
     ],
     "vehicle_activity_hourly": [
@@ -87,6 +91,8 @@ GOLD_SCHEMAS = {
         ("min_lon", "DOUBLE"),
         ("max_lon", "DOUBLE"),
         ("data_completeness_status", "VARCHAR"),
+        ("is_final", "BOOLEAN"),
+        ("source_max_ingested_at", TSTZ),
         ("pipeline_run_at", TSTZ),
     ],
     "hourly_data_quality": [
@@ -106,6 +112,8 @@ GOLD_SCHEMAS = {
         ("integrity_rejection_pct", "DOUBLE"),
         ("quarantined_by_reason", REASON_LIST),
         ("safe_for_dashboard", "BOOLEAN"),
+        ("is_final", "BOOLEAN"),
+        ("source_max_ingested_at", TSTZ),
         ("pipeline_run_at", TSTZ),
     ],
 }
@@ -115,6 +123,8 @@ UNKNOWN_LINE = "unknown"
 # therefore do not make an hour unsafe; everything else counts as an integrity issue.
 ROUTINE_REJECTION_REASONS = ("duplicate", "stale_gps_time")
 MAX_INTEGRITY_REJECTION_PCT = 5.0
+# Late Bronze data may still change an hour for this long after it closes.
+FINALITY_GRACE = timedelta(minutes=15)
 
 GOLD_KEYS = {
     "hourly_network_metrics": ("date", "hour"),
@@ -186,11 +196,22 @@ def _sql_bigint(value) -> str:
     return "CAST(NULL AS BIGINT)" if value is None else f"CAST({int(value)} AS BIGINT)"
 
 
+def is_hour_final(date_str: str, hour_str: str, run_at: datetime) -> bool:
+    """An hour is final only once it has closed and the grace period has passed."""
+    hour_start = datetime.strptime(f"{date_str} {hour_str}", "%Y-%m-%d %H").replace(
+        tzinfo=timezone.utc
+    )
+    return run_at >= hour_start + timedelta(hours=1) + FINALITY_GRACE
+
+
 def _common_columns(date_str: str, hour_str: str, status: str, run_at: datetime):
+    final = "TRUE" if is_hour_final(date_str, hour_str, run_at) else "FALSE"
     return (
         f"DATE '{date_str}' AS date, CAST({int(hour_str)} AS TINYINT) AS hour",
         (
             f"'{status}' AS data_completeness_status, "
+            f"{final} AS is_final, "
+            "(SELECT MAX(ingested_at) FROM silver_hour) AS source_max_ingested_at, "
             f"CAST('{run_at.isoformat()}' AS TIMESTAMPTZ) AS pipeline_run_at"
         ),
     )
@@ -209,7 +230,8 @@ def load_silver_hour(con, silver_uri: str) -> int:
             NULLIF(TRIM(CAST(brigade AS VARCHAR)), '') AS brigade,
             lat,
             lon,
-            gps_time_utc
+            gps_time_utc,
+            ingested_at
         FROM read_parquet('{silver_uri}', hive_partitioning = false)
         """
     )
@@ -387,8 +409,15 @@ def build_quality_table(
         if cycles is not None
         else _sql_bigint(None)
     )
+    final = "TRUE" if is_hour_final(date_str, hour_str, run_at) else "FALSE"
+    source_max = (
+        "(SELECT MAX(ingested_at) FROM silver_hour)"
+        if silver_rows is not None
+        else f"CAST(NULL AS {TSTZ})"
+    )
     safe = (
         f"{'TRUE' if completeness['status'] == 'complete' else 'FALSE'} "
+        f"AND {final} "
         f"AND {'TRUE' if silver_rows else 'FALSE'} "
         "AND integrity_rejection_pct IS NOT NULL "
         f"AND integrity_rejection_pct <= {MAX_INTEGRITY_REJECTION_PCT}"
@@ -432,6 +461,8 @@ def build_quality_table(
             CAST(integrity_rejection_pct AS DOUBLE) AS integrity_rejection_pct,
             CAST({by_reason} AS {REASON_LIST}) AS quarantined_by_reason,
             COALESCE({safe}, FALSE) AS safe_for_dashboard,
+            {final} AS is_final,
+            CAST({source_max} AS {TSTZ}) AS source_max_ingested_at,
             CAST('{run_at.isoformat()}' AS TIMESTAMPTZ) AS pipeline_run_at
         FROM pcts
         """
@@ -586,11 +617,19 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
             hour_str,
             completeness["status"],
         )
+    if not is_hour_final(date_str, hour_str, run_at):
+        logger.warning(
+            "%s hour %s is not final yet (still open to late data); "
+            "it is published with is_final = false and safe_for_dashboard = false.",
+            date_str,
+            hour_str,
+        )
     logger.info(
-        "%s hour %s Gold published: status=%s, rows=%s",
+        "%s hour %s Gold published: status=%s, final=%s, rows=%s",
         date_str,
         hour_str,
         completeness["status"],
+        is_hour_final(date_str, hour_str, run_at),
         row_counts,
     )
     return {"status": completeness["status"], "rows": row_counts}

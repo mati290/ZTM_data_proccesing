@@ -162,7 +162,7 @@ przetwarzaniem danych.
 | `duplicate_records` | Liczba wierszy kwarantanny z `rejection_reason = 'duplicate'`; `NULL`, gdy brak kwarantanny |
 | `integrity_rejection_pct` | Jak `rejection_pct`, ale bez przyczyn rutynowych (`duplicate`, `stale_gps_time`), tj. `invalid_coordinates`, `future_gps_time` itp. |
 | `quarantined_by_reason` | Liczności `GROUP BY rejection_reason` z kwarantanny; pusta lista tylko wtedy, gdy kwarantanna została odczytana i nie zawiera wierszy |
-| `safe_for_dashboard` | `TRUE` wtedy i tylko wtedy, gdy `data_completeness_status = 'complete'`, Silver ma co najmniej jeden wiersz, `bronze_records` jest znane i `integrity_rejection_pct <= 5`. Nigdy `NULL` (brak informacji = `FALSE`) |
+| `safe_for_dashboard` | `TRUE` wtedy i tylko wtedy, gdy `data_completeness_status = 'complete'`, Silver ma co najmniej jeden wiersz, `is_final = TRUE`, `bronze_records` jest znane i `integrity_rejection_pct <= 5`. Nigdy `NULL` (brak informacji = `FALSE`) |
 | `pipeline_run_at` | Czas UTC utworzenia wiersza jakości |
 
 Sama lista partycji Bronze, Silver i manifestów nie pozwala wykryć godziny,
@@ -187,6 +187,18 @@ brak aktywności.
    `MAX` oraz `GROUP BY`; nie są ręcznie interpretowanymi ocenami.
 5. Wszystkie tabele Gold są idempotentnie odtwarzane dla klucza godzinowego.
    `pipeline_run_at` jest metadanymi wykonania i nie stanowi części klucza.
+6. Każdy wiersz Gold ma `is_final` i `source_max_ingested_at`. Godzina jest
+   finalna (`is_final = TRUE`), gdy czas runu ≥ koniec godziny + 15 min
+   (`FINALITY_GRACE`); wcześniej jest nadal otwarta na późne dane.
+   `safe_for_dashboard` wymaga dodatkowo `is_final = TRUE`.
+   `source_max_ingested_at` to największy `ingested_at` w Silver użytym do
+   budowy partycji (`NULL`, gdy Silver nie istnieje); wzrost tej wartości po
+   ponownym przeliczeniu oznacza, że dotarły późne dane.
+7. Polityka korekt: DAG `reprocess_late_data_hourly` (co godzinę, `:30`)
+   przelicza Silver i Gold dla zamkniętych godzin z ostatnich 24 h, w których
+   obiekty Bronze są nowsze niż partycja Silver (lub Silver brakuje). Starsze
+   godziny są zamrożone. Nadpisanie partycji jest atomowe (server-side copy)
+   i idempotentne; równoległy przebieg z głównymi DAG-ami jest bezpieczny.
 
 
 ## Implementacja (silver_to_gold.py)

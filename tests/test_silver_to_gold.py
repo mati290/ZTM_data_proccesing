@@ -10,7 +10,7 @@ import duckdb
 
 import silver_to_gold as gold
 
-RUN_AT = datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc)
+RUN_AT = datetime(2026, 1, 15, 13, 20, tzinfo=timezone.utc)
 
 SILVER_SQL = """
 CREATE TABLE src AS SELECT * FROM (VALUES
@@ -462,6 +462,28 @@ class GoldProcessTests(LocalPipelineTestCase):
             self.assertEqual(len(first[table]) > 0, True)
         self.assertEqual(len(first["hourly_network_metrics"]), 1)
         self.assertEqual(len(first["hourly_data_quality"]), 1)
+
+    def test_hour_is_not_final_during_grace_period(self):
+        self.build(run_at=datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
+        quality = self.read_gold("hourly_data_quality")
+        cols = [c for c, _ in gold.GOLD_SCHEMAS["hourly_data_quality"]]
+        row = dict(zip(cols, quality[0]))
+        self.assertIs(row["is_final"], False)
+        self.assertIs(row["safe_for_dashboard"], False)
+        self.assertIsNotNone(row["source_max_ingested_at"])
+
+    def test_is_hour_final_boundaries(self):
+        f = gold.is_hour_final
+        utc = timezone.utc
+        self.assertFalse(
+            f("2026-01-15", "12", datetime(2026, 1, 15, 12, 30, tzinfo=utc))
+        )
+        self.assertFalse(
+            f("2026-01-15", "12", datetime(2026, 1, 15, 13, 14, tzinfo=utc))
+        )
+        self.assertTrue(
+            f("2026-01-15", "12", datetime(2026, 1, 15, 13, 15, tzinfo=utc))
+        )
 
     def test_rerun_with_changed_silver_replaces_not_appends(self):
         self.build()
