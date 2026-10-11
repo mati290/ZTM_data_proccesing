@@ -17,11 +17,13 @@ nie zostały zlane.
 `_completeness.json` z tej samej partycji Silver jest autorytatywnym źródłem
 `data_completeness_status`:
 
-- `complete` oznacza, że co najmniej 90% zapisanych manifestów ingestii dla
-  godziny ma status `complete` (API zwróciło niepuste dane dla obu typów);
-- `incomplete` oznacza, że istnieje co najmniej jeden manifest, ale udział
-  kompletnych cykli jest niższy niż 90%;
-- `unknown` oznacza brak manifestów albo brak markera.
+- `complete` oznacza jednocześnie:
+  - co najmniej 75% oczekiwanych cykli ingestu zostało zapisanych;
+  - co najmniej 90% zapisanych manifestów ma status `complete`;
+- `incomplete` oznacza, że zapisano co najmniej jeden manifest, ale:
+  - liczba zapisanych cykli jest mniejsza niż wymagane minimum; albo
+  - udział kompletnych cykli jest niższy niż 90%;
+- `unknown` oznacza brak manifestów albo brak markera
 
 `complete` nie gwarantuje, że każde wywołanie API zwróciło dane; to status
 według progu manifestów, a nie dowód pełnej obserwowalności. `unknown` nigdy

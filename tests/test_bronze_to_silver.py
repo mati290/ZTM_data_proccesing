@@ -118,7 +118,10 @@ class CompletenessTests(unittest.TestCase):
 
     def test_complete_when_all_cycles_have_both_sources(self):
         result = assess_completeness(
-            "2026-10-09", "07", self._client(["complete"] * 10)
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 10),
+            poll_interval_seconds=360,
         )
         self.assertEqual(result["status"], "complete")
 
@@ -134,6 +137,38 @@ class CompletenessTests(unittest.TestCase):
         client.get_paginator.return_value.paginate.return_value = [{}]
         result = assess_completeness("2026-10-09", "07", client)
         self.assertEqual(result["status"], "unknown")
+
+    def test_incomplete_when_hour_has_too_few_cycles(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 89),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["minimum_required_cycles"], 90)
+
+    def test_complete_when_hour_meets_minimum_cycle_count(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 90),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["status"], "complete")
+
+    def test_incomplete_when_complete_cycle_ratio_is_below_threshold(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 107 + ["partial"] * 13),
+            poll_interval_seconds=360,
+        )
+
+        self.assertEqual(result["status"], "incomplete")
 
 
 class BronzeToSilverSqlTests(unittest.TestCase):

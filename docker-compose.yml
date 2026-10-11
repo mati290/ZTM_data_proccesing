@@ -44,6 +44,7 @@
       AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
       AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY:?set AIRFLOW__CORE__FERNET_KEY in .env}"
       PYTHONPATH: /opt/airflow/src
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./bronze_to_silver.py:/opt/airflow/src/bronze_to_silver.py

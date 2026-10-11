@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -399,9 +400,30 @@ def is_before_first_bronze_hour(date_str: str, hour_str: str, s3_client=None) ->
 
 
 MIN_COMPLETE_CYCLE_RATIO = 0.9
+MIN_CYCLE_COVERAGE_RATIO = 0.75
 
 
-def assess_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
+def completeness_thresholds(
+    poll_interval_seconds: int | None = None,
+) -> tuple[int, int]:
+    """Return expected and minimum required ingestion cycles for one hour."""
+    if poll_interval_seconds is None:
+        poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+
+    if poll_interval_seconds <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
+
+    expected_cycles = math.ceil(3600 / poll_interval_seconds)
+    minimum_required_cycles = math.ceil(expected_cycles * MIN_CYCLE_COVERAGE_RATIO)
+    return expected_cycles, minimum_required_cycles
+
+
+def assess_completeness(
+    date_str: str,
+    hour_str: str,
+    s3_client=None,
+    poll_interval_seconds: int | None = None,
+) -> dict:
     """Summarize ingestion cycle manifests for an hour (bus + tram both fetched)."""
     s3_client = s3_client or _s3_client()
     prefix = f"_manifests/date={date_str}/hour={hour_str}/"
@@ -418,12 +440,15 @@ def assess_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
             complete += 1
 
     total = len(keys)
+    expected_cycles, minimum_required_cycles = completeness_thresholds(
+        poll_interval_seconds
+    )
     if total == 0:
         status = "unknown"
-    elif complete / total >= MIN_COMPLETE_CYCLE_RATIO:
-        status = "complete"
-    else:
+    elif total < minimum_required_cycles or complete / total < MIN_COMPLETE_CYCLE_RATIO:
         status = "incomplete"
+    else:
+        status = "complete"
     return {
         "date": date_str,
         "hour": hour_str,
@@ -432,6 +457,8 @@ def assess_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
         "complete_cycles": complete,
         "partial_cycles": total - complete,
         "min_complete_ratio": MIN_COMPLETE_CYCLE_RATIO,
+        "expected_cycles": expected_cycles,
+        "minimum_required_cycles": minimum_required_cycles,
     }
 
 
