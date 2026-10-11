@@ -195,8 +195,13 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
       quarantine output, and deterministic deduplication
 - [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
       GitHub Actions CI
-- [ ] **Next** – build Gold analytics (for example, hourly vehicle activity or
-      route-level aggregates); consider dbt when the models justify it
+- [x] **Stage 4 foundation** – [Gold data contract](docs/gold-data-contract.md)
+      defines grains, keys, metric definitions, publication conditions, and
+      incomplete/missing-data behavior
+- [ ] **Next** – implement Gold analytics against the
+      [data contract](docs/gold-data-contract.md), including expected-hour
+      quality records sourced from Airflow run metadata; consider dbt when the
+      models justify it
 - [ ] **Next** – add volume thresholds, external alerting, and integration
       coverage for a more reliable deployment
 - [ ] **Could** – deploy to AWS S3 and provision infrastructure with Terraform
