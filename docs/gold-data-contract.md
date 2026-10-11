@@ -1,4 +1,4 @@
-# Kontrakt danych Gold
+﻿# Kontrakt danych Gold
 
 ## Cel i reguły wspólne
 
@@ -129,21 +129,20 @@ przetwarzaniem danych.
 |---|---|
 | Ziarno | Jedna oczekiwana godzina UTC |
 | Klucz unikalności | `(date, hour)` |
-| Źródło | Status runu Airflow dla interwału, Silver, kwarantanna Silver, marker Silver oraz manifesty Bronze |
-| Warunek publikacji | Godzina jest oczekiwana według harmonogramu Airflow; wynik ma być publikowany także dla błędnego/skipped runu lub braku Silver |
+| Źródło | Silver, kwarantanna Silver, marker Silver oraz manifesty Bronze |
+| Warunek publikacji | Publikowany zawsze jako ostatni (rekord zatwierdzający godzinę), także gdy Silver jest brakujący lub pusty - wtedy zadanie następnie kończy się błędem |
 | Brak danych | Wygenerować rekord jakości z jawnym `silver_partition_status`; nie zastępować nieznanych liczników zerami |
 | Niekompletność | Zachować wszystkie dostępne liczniki, status kompletności i status runu. Nie nazywać takich metryk wiarygodną aktywnością sieci |
 
 | Kolumna | Definicja weryfikowalna w SQL |
 |---|---|
-| `date`, `hour` | `data_interval_start` runu Airflow przeliczony na partycję UTC |
-| `airflow_run_status` | Stan runu dla tej godziny, np. `success`, `failed`, `skipped`; źródłem jest metadana Airflow, nie Silver |
+| `date`, `hour` | Partycja UTC godziny (`data_interval_start` runu Airflow) |
 | `silver_partition_status` | `present` gdy `data.parquet` istnieje, `missing` w przeciwnym razie |
 | `data_completeness_status` | Status `_completeness.json`; `unknown` gdy pliku nie ma lub nie da się potwierdzić statusu |
 | `manifest_cycles` | Liczba manifestów Bronze znalezionych dla godziny |
 | `complete_manifest_cycles` | Liczba tych manifestów z `status = 'complete'` |
 | `complete_cycle_ratio` | `complete_manifest_cycles / manifest_cycles`; `NULL`, gdy `manifest_cycles = 0` |
-| `bronze_records` | Liczba rekordów Bronze dla godziny; `NULL`, jeśli odczyt lub źródło jest niedostępne, a nie `0` |
+| `records_processed` | `silver_position_events + quarantined_records`; `NULL`, gdy którykolwiek składnik jest nieznany |
 | `silver_position_events` | `COUNT(*)` z Silver; `NULL`, gdy partycja Silver nie istnieje |
 | `quarantined_records` | `COUNT(*)` z partycji kwarantanny; `NULL`, gdy plik kwarantanny nie istnieje lub jest niedostępny |
 | `quarantined_by_reason` | Liczności `GROUP BY rejection_reason` z kwarantanny; pusta lista tylko wtedy, gdy kwarantanna została odczytana i nie zawiera wierszy |
@@ -170,3 +169,20 @@ brak aktywności.
    `MAX` oraz `GROUP BY`; nie są ręcznie interpretowanymi ocenami.
 5. Wszystkie tabele Gold są idempotentnie odtwarzane dla klucza godzinowego.
    `pipeline_run_at` jest metadanymi wykonania i nie stanowi części klucza.
+
+
+## Implementacja (silver_to_gold.py)
+
+- Kolejność publikacji: `vehicle_activity_hourly`, `hourly_line_metrics`,
+  `hourly_network_metrics`, na końcu `hourly_data_quality`. Pliki są
+  najpierw zapisywane w `s3://gold/_staging/`, walidowane (schemat, liczba
+  wierszy), kopiowane do `<table>/date=D/hour=HH/data.parquet` i usuwane ze
+  stagingu. Obecność wiersza jakości oznacza zakończoną publikację godziny.
+- Idempotencja: ponowny run godziny nadpisuje te same klucze i daje te same
+  kolumny danych; `pipeline_run_at` jest metadaną runu i się zmienia.
+- Walidacje: schemat Silver przed agregacją, spójność krzyżowa tabel
+  (suma pojazdów, zdarzeń) oraz unikalność kluczy.
+- Godziny `incomplete`/`unknown` są publikowane z jawnym
+  `data_completeness_status`; konsument filtruje `complete`.
+- Zakres jakości nie obejmuje już statusu Airflow; luki w godzinach wykrywa
+  się orkiestracją (nieudany run) i osią oczekiwanych godzin na dashboardzie.

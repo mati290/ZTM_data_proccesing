@@ -46,7 +46,7 @@ def main():
         aws_secret_access_key=os.environ["MINIO_PASSWORD"],
     )
     existing = {b["Name"] for b in s3.list_buckets()["Buckets"]}
-    for bucket in ("bronze", "silver"):
+    for bucket in ("bronze", "silver", "gold"):
         if bucket not in existing:
             s3.create_bucket(Bucket=bucket)
 

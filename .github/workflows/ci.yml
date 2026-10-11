@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -28,10 +28,10 @@ jobs:
           pip install ruff==0.16.10
 
       - name: Check lint
-        run: ruff check ingest.py bronze_to_silver.py dags tests analysis
+        run: ruff check ingest.py bronze_to_silver.py silver_to_gold.py dags tests analysis
 
       - name: Check formatting
-        run: ruff format --check ingest.py bronze_to_silver.py dags tests analysis
+        run: ruff format --check ingest.py bronze_to_silver.py silver_to_gold.py dags tests analysis
 
       - name: Run tests
         run: python -B -m unittest discover -s tests -v
@@ -64,7 +64,7 @@ jobs:
           grep -q "bronze_to_silver_hourly" dags.txt
 
       - name: Verify the Airflow image includes transformation dependencies
-        run: docker compose run --rm --no-deps airflow python -c "import bronze_to_silver"
+        run: docker compose run --rm --no-deps airflow python -c "import bronze_to_silver, silver_to_gold"
 
       - name: End-to-end smoke test (MinIO -> Silver on production DuckDB)
         run: |

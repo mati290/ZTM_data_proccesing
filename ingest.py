@@ -102,7 +102,7 @@ def save_to_bronze(s3, records, vehicle_label):
     logger.info(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
 
 
-def ensure_bucket(s3, buckets=("bronze", "silver")):
+def ensure_bucket(s3, buckets=("bronze", "silver", "gold")):
     for bucket in buckets:
         _ensure_single_bucket(s3, bucket)
 

@@ -1,4 +1,4 @@
-# 🚋 Warsaw Transit Data Platform
+﻿# 🚋 Warsaw Transit Data Platform
 
 A data engineering project that continuously collects **real-time GPS positions
 of all Warsaw public transport vehicles** (ZTM buses and trams) from the
@@ -198,10 +198,11 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
 - [x] **Stage 4 foundation** – [Gold data contract](docs/gold-data-contract.md)
       defines grains, keys, metric definitions, publication conditions, and
       incomplete/missing-data behavior
-- [ ] **Next** – implement Gold analytics against the
-      [data contract](docs/gold-data-contract.md), including expected-hour
-      quality records sourced from Airflow run metadata; consider dbt when the
-      models justify it
+- [x] **Stage 4 build** – `silver_to_gold.py` builds four Gold tables
+      (atomic publish, schema validation, idempotent) and runs as a DAG task
+      after Silver
+- [ ] **Next** – Gold dashboard and expected-hour gap axis; consider dbt when
+      the models justify it
 - [ ] **Next** – add volume thresholds, external alerting, and integration
       coverage for a more reliable deployment
 - [ ] **Could** – deploy to AWS S3 and provision infrastructure with Terraform

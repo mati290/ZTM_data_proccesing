@@ -8,7 +8,7 @@ from airflow.timetables.interval import CronDataIntervalTimetable
 
 @dag(
     dag_id="bronze_to_silver_hourly",
-    description="Transforms one hour of ZTM bronze data into silver Parquet",
+    description="Transforms one hour of ZTM bronze data into silver Parquet and builds the gold layer",
     schedule=CronDataIntervalTimetable("0 * * * *", timezone="UTC"),
     start_date=pendulum.datetime(2026, 10, 10, tz="UTC"),
     catchup=True,

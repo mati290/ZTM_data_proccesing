@@ -1,4 +1,4 @@
-services:
+﻿services:
   minio:
     # The Chainguard public registry provides the free `latest` channel.
     # Pin this to a digest before using the stack outside local development.
@@ -47,6 +47,7 @@ services:
     volumes:
       - ./dags:/opt/airflow/dags
       - ./bronze_to_silver.py:/opt/airflow/src/bronze_to_silver.py
+      - ./silver_to_gold.py:/opt/airflow/src/silver_to_gold.py
       - airflow_metadata:/opt/airflow
     healthcheck:
       test:

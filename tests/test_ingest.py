@@ -278,9 +278,9 @@ class SaveToBronzeTests(unittest.TestCase):
         ensure_bucket(s3)
 
         s3.create_bucket.assert_has_calls(
-            [call(Bucket="bronze"), call(Bucket="silver")]
+            [call(Bucket="bronze"), call(Bucket="silver"), call(Bucket="gold")]
         )
-        self.assertEqual(s3.create_bucket.call_count, 2)
+        self.assertEqual(s3.create_bucket.call_count, 3)
 
     def test_ensure_bucket_does_not_hide_permission_error(self):
         s3 = Mock()
@@ -303,12 +303,13 @@ class SaveToBronzeTests(unittest.TestCase):
             BotoCoreError(error_msg="not ready"),
             None,
             None,
+            None,
         ]
 
         with patch("ingest.time.sleep") as sleep:
             ensure_bucket_with_retry(s3, max_attempts=3)
 
-        self.assertEqual(s3.head_bucket.call_count, 3)
+        self.assertEqual(s3.head_bucket.call_count, 4)
         sleep.assert_called_once_with(2)
 
 
