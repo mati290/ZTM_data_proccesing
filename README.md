@@ -78,8 +78,11 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
    started (an outage) **fails** the run after retries, so the gap is visible;
    once Bronze data is available again, clear the failed run in the UI to
    reprocess it. Hours before the first Bronze object are skipped. Catchup is
-   enabled from the DAG `start_date`. MinIO's
-   console is at http://localhost:9001.
+   enabled from the DAG `start_date`. The `silver_to_gold_hourly` DAG shares
+   the same schedule, waits (sensor) for the Silver task of the same hour, and
+   builds the four Gold tables; it fails on a schema mismatch or missing
+   Silver, retries, and logs published row counts and completeness status.
+   MinIO's console is at http://localhost:9001.
 
 To stop the services, run `docker compose down`. Bronze and Silver objects are
 kept in the `minio_data` Docker volume.
