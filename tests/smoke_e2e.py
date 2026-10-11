@@ -70,12 +70,55 @@ def main():
             Key=f"vehicle_positions/date={DATE}/hour={HOUR}/_completeness.json",
         )
         assert json.loads(marker["Body"].read())["status"] == "unknown"
+
+        import silver_to_gold
+
+        def gold_state():
+            out = {}
+            for table in silver_to_gold.GOLD_TABLES:
+                uri = f"s3://gold/{table}/date={DATE}/hour={HOUR}/data.parquet"
+                cols = [
+                    r[0]
+                    for r in con.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet('{uri}', hive_partitioning=false)"
+                    ).fetchall()
+                    if r[0] != "pipeline_run_at"
+                ]
+                sel = ", ".join(f'"{c}"' for c in cols)
+                out[table] = con.execute(
+                    f"SELECT {sel} FROM read_parquet('{uri}', hive_partitioning=false)"
+                    f" ORDER BY ALL"
+                ).fetchall()
+            return out
+
+        silver_to_gold.build_gold_hour(con, DATE, HOUR)
+        first = gold_state()
+        silver_to_gold.build_gold_hour(con, DATE, HOUR)
+        assert gold_state() == first, "Gold rebuild is not idempotent"
+        quality = con.execute(
+            "SELECT bronze_records, duplicate_records, safe_for_dashboard,"
+            " data_completeness_status FROM read_parquet("
+            f"'s3://gold/hourly_data_quality/date={DATE}/hour={HOUR}/data.parquet',"
+            " hive_partitioning=false)"
+        ).fetchone()
+        assert quality == (4, 1, False, "unknown"), quality
+        vehicles = first["vehicle_activity_hourly"]
+        assert len(vehicles) == 1, vehicles
     finally:
         con.close()
         for bucket, prefix in (
             ("bronze", f"vehicle_type=bus/date={DATE}/"),
             ("silver", f"vehicle_positions/date={DATE}/"),
             ("silver", f"quarantine/vehicle_positions/date={DATE}/"),
+            *(
+                ("gold", f"{table}/date={DATE}/")
+                for table in (
+                    "vehicle_activity_hourly",
+                    "hourly_line_metrics",
+                    "hourly_network_metrics",
+                    "hourly_data_quality",
+                )
+            ),
         ):
             listing = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
             for obj in listing.get("Contents", []):

@@ -58,6 +58,8 @@ godzina całej sieci. Podział na typ i linię należy do `hourly_line_metrics`.
 | `active_tram_vehicles` | Ten sam distinct count z filtrem `vehicle_type = 'tram'` |
 | `position_events` | `COUNT(*)` w Silver; liczba poprawnych zdeduplikowanych obserwacji, nie liczba surowych rekordów Bronze |
 | `active_lines` | `COUNT(DISTINCT (vehicle_type, TRIM(line)))` po wykluczeniu `line IS NULL` i pustych wartości |
+| `active_brigades` | `COUNT(DISTINCT (vehicle_type, line, brigade))` dla niepustych `line` i `brigade` (brygada ma sens tylko w obrębie linii) |
+| `silver_records` | `COUNT(*)` Silver tej godziny (jawny licznik źródła; równy `position_events`) |
 | `first_gps_time_utc` | `MIN(gps_time_utc)` w Silver |
 | `last_gps_time_utc` | `MAX(gps_time_utc)` w Silver |
 | `data_completeness_status` | Status z markera; `unknown`, gdy markeru brak |
@@ -72,7 +74,7 @@ godzina całej sieci. Podział na typ i linię należy do `hourly_line_metrics`.
 | Ziarno | Jedna godzina UTC × typ pojazdu × linia |
 | Klucz unikalności | `(date, hour, vehicle_type, line)` |
 | Źródło | Silver z partycji godziny; marker kompletności z tej partycji |
-| Warunek publikacji | Co najmniej jeden wiersz Silver z niepustym `line` dla tego klucza |
+| Warunek publikacji | Co najmniej jeden wiersz Silver dla tego klucza (pusta linia = `unknown`) |
 | Brak danych | Nie emitować sztucznego wiersza linii z zerami. Brak linii może oznaczać brak obserwacji lub nieznaną linię |
 | Niekompletność | Zachować status godziny dla każdego wiersza; nie porównywać niekompletnego/nieznanego wyniku bez oznaczenia |
 
@@ -80,9 +82,10 @@ godzina całej sieci. Podział na typ i linię należy do `hourly_line_metrics`.
 |---|---|
 | `date`, `hour` | Data i godzina UTC partycji Silver |
 | `vehicle_type` | Wartość `bus` albo `tram` ze Silver |
-| `line` | `TRIM(line)`; wiersze z `NULL` lub pustym tekstem nie należą do tej tabeli |
+| `line` | `TRIM(line)`; wiersze z `NULL`/pustą linią są liczone razem jako wartość `unknown`, więc `SUM(position_events)` równa się `position_events` sieci |
 | `active_vehicles` | `COUNT(DISTINCT vehicle_number)` w obrębie klucza; `vehicle_type` jest częścią klucza |
 | `position_events` | `COUNT(*)` w obrębie klucza |
+| `active_brigades` | `COUNT(DISTINCT brigade)` niepustych brygad w obrębie klucza (autobusy często nie mają brygady) |
 | `first_gps_time_utc` | `MIN(gps_time_utc)` w obrębie klucza |
 | `last_gps_time_utc` | `MAX(gps_time_utc)` w obrębie klucza |
 | `data_completeness_status` | Status markera całej godziny, wspólny dla wszystkich wierszy godziny |
@@ -116,9 +119,18 @@ większa niż `active_vehicles` w `hourly_network_metrics`.
 | `data_completeness_status` | Status markera godziny |
 | `pipeline_run_at` | Czas UTC wygenerowania wiersza Gold |
 
-`position_events` mierzy liczbę obserwacji, a nie czas pracy ani ciągłość
-kursowania. Z samych punktów GPS nie wylicza się czasu aktywności pojazdu bez
-osobnej, jawnej definicji i reguły interpolacji.
+Kolumny aktywności i położenia (pełna lista w `GOLD_SCHEMAS`):
+
+| Kolumna | Definicja weryfikowalna w SQL |
+|---|---|
+| `unique_lines` | `COUNT(DISTINCT line)` po wykluczeniu `NULL` |
+| `active_seconds` | `date_diff('second', MIN(gps_time_utc), MAX(gps_time_utc))` – obserwowany rozstęp czasu GPS w godzinie, nie czas pracy pojazdu |
+| `first_lat`, `first_lon` | `arg_min(lat/lon, gps_time_utc)` – pozycja najwcześniejszej obserwacji (jednoznaczna, bo `gps_time_utc` jest unikalny dla pojazdu) |
+| `last_lat`, `last_lon` | `arg_max(lat/lon, gps_time_utc)` |
+| `min_lat`, `max_lat`, `min_lon`, `max_lon` | `MIN`/`MAX` współrzędnych w godzinie |
+
+Przebyte kilometry nie są liczone: wymagają sortowania, filtrowania skoków GPS
+i osobnej definicji jakości.
 
 ## `hourly_data_quality`
 
@@ -142,10 +154,15 @@ przetwarzaniem danych.
 | `manifest_cycles` | Liczba manifestów Bronze znalezionych dla godziny |
 | `complete_manifest_cycles` | Liczba tych manifestów z `status = 'complete'` |
 | `complete_cycle_ratio` | `complete_manifest_cycles / manifest_cycles`; `NULL`, gdy `manifest_cycles = 0` |
-| `records_processed` | `silver_position_events + quarantined_records`; `NULL`, gdy którykolwiek składnik jest nieznany |
+| `partial_manifest_cycles` | `manifest_cycles - complete_manifest_cycles`; `NULL`, gdy liczba cykli jest nieznana |
+| `bronze_records` | `silver_position_events + quarantined_records` (zastępuje `records_processed`). Jest to dokładna liczba rekordów Bronze po odczycie, bo transformacja Bronze→Silver weryfikuje `przed - po = odrzucone`; `NULL`, gdy którykolwiek składnik jest nieznany |
 | `silver_position_events` | `COUNT(*)` z Silver; `NULL`, gdy partycja Silver nie istnieje |
 | `quarantined_records` | `COUNT(*)` z partycji kwarantanny; `NULL`, gdy plik kwarantanny nie istnieje lub jest niedostępny |
+| `rejection_pct` | `100 * quarantined_records / bronze_records` (skala 0–100); `NULL`, gdy `bronze_records` jest `NULL` lub 0. Zawiera odrzucenia rutynowe (ok. 40% to `stale_gps_time`), więc nie jest progiem jakości |
+| `duplicate_records` | Liczba wierszy kwarantanny z `rejection_reason = 'duplicate'`; `NULL`, gdy brak kwarantanny |
+| `integrity_rejection_pct` | Jak `rejection_pct`, ale bez przyczyn rutynowych (`duplicate`, `stale_gps_time`), tj. `invalid_coordinates`, `future_gps_time` itp. |
 | `quarantined_by_reason` | Liczności `GROUP BY rejection_reason` z kwarantanny; pusta lista tylko wtedy, gdy kwarantanna została odczytana i nie zawiera wierszy |
+| `safe_for_dashboard` | `TRUE` wtedy i tylko wtedy, gdy `data_completeness_status = 'complete'`, Silver ma co najmniej jeden wiersz, `bronze_records` jest znane i `integrity_rejection_pct <= 5`. Nigdy `NULL` (brak informacji = `FALSE`) |
 | `pipeline_run_at` | Czas UTC utworzenia wiersza jakości |
 
 Sama lista partycji Bronze, Silver i manifestów nie pozwala wykryć godziny,
@@ -157,8 +174,9 @@ brak aktywności.
 
 ## Reguły interpretacji dashboardu
 
-1. KPI wiarygodnej aktywności filtrują `data_completeness_status = 'complete'`.
-   Inny status można pokazać osobno, z widocznym oznaczeniem.
+1. Dashboard domyślnie pokazuje wyłącznie godziny z
+   `hourly_data_quality.safe_for_dashboard = TRUE`; pozostałe godziny
+   oznacza wizualnie (np. kolor/wzór), nie ukrywa ich bez śladu.
 2. Brak `hourly_network_metrics` nie jest zerem. Dashboard łączy oś oczekiwanych
    godzin z `hourly_data_quality` i pokazuje brakującą partycję jako lukę.
 3. Wykres liczby pojazdów opisuje liczbę unikalnych identyfikatorów

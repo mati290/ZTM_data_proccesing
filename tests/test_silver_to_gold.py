@@ -32,7 +32,7 @@ def make_silver(directory, extra_sql=None):
     return path
 
 
-def build_all(con, path, status="complete", cycles=(60, 60), silver_rows=None):
+def build_all(con, path, status="complete", cycles=(60, 60), reasons=("b", "a", "b")):
     rows = gold.load_silver_hour(con, path)
     gold.build_metric_tables(con, "2026-01-15", "12", status, RUN_AT)
     completeness = {
@@ -43,7 +43,8 @@ def build_all(con, path, status="complete", cycles=(60, 60), silver_rows=None):
     con.execute(
         "CREATE OR REPLACE TEMP TABLE quarantine_hour (rejection_reason VARCHAR)"
     )
-    con.execute("INSERT INTO quarantine_hour VALUES ('b'), ('a'), ('b')")
+    for reason in reasons:
+        con.execute("INSERT INTO quarantine_hour VALUES (?)", [reason])
     gold.build_quality_table(con, "2026-01-15", "12", completeness, rows, True, RUN_AT)
     return rows
 
@@ -79,8 +80,56 @@ class GoldAggregationTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             rows,
-            [("bus", "174", 1, 1), ("bus", "523", 1, 2), ("tram", "523", 1, 1)],
+            [
+                ("bus", "174", 1, 1),
+                ("bus", "523", 1, 2),
+                ("bus", "unknown", 1, 1),
+                ("tram", "523", 1, 1),
+                ("tram", "unknown", 1, 1),
+            ],
         )
+        total = self.con.execute(
+            "SELECT SUM(position_events) FROM hourly_line_metrics"
+        ).fetchone()[0]
+        self.assertEqual(total, 6)
+
+    def test_brigades_and_activity_span(self):
+        build_all(self.con, self.path)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT active_brigades, silver_records FROM hourly_network_metrics"
+            ).fetchone(),
+            (3, 6),
+        )
+        row = self.con.execute(
+            "SELECT unique_lines, active_seconds, first_lat, last_lon, "
+            "min_lat, max_lon FROM vehicle_activity_hourly "
+            "WHERE vehicle_type = 'bus' AND vehicle_number = '1000'"
+        ).fetchone()
+        self.assertEqual(row, (1, 60, 52.1, 21.0, 52.1, 21.0))
+
+    def test_quality_safe_for_dashboard_rules(self):
+        cases = [
+            ("complete", ["stale_gps_time"] * 3 + ["duplicate"], True),
+            ("complete", ["invalid_coordinates"] * 3, False),
+            ("incomplete", ["duplicate"], False),
+            ("unknown", [], False),
+        ]
+        for status, reasons, expected in cases:
+            with self.subTest(status=status, reasons=reasons):
+                build_all(self.con, self.path, status=status, reasons=reasons)
+                row = self.con.execute(
+                    "SELECT safe_for_dashboard, bronze_records, rejection_pct, "
+                    "duplicate_records, partial_manifest_cycles "
+                    "FROM hourly_data_quality"
+                ).fetchone()
+                self.assertIs(row[0], expected)
+                self.assertEqual(row[1], 6 + len(reasons))
+                self.assertAlmostEqual(
+                    row[2], 100.0 * len(reasons) / (6 + len(reasons))
+                )
+                self.assertEqual(row[3], reasons.count("duplicate"))
+                self.assertEqual(row[4], 0)
 
     def test_vehicle_activity_has_sorted_observed_lines(self):
         build_all(self.con, self.path)
@@ -96,10 +145,11 @@ class GoldAggregationTests(unittest.TestCase):
         build_all(self.con, self.path, cycles=(60, 57))
         row = self.con.execute(
             "SELECT silver_partition_status, manifest_cycles, "
-            "complete_manifest_cycles, complete_cycle_ratio, records_processed, "
-            "silver_position_events, quarantined_records, quarantined_by_reason "
-            "FROM hourly_data_quality"
+            "complete_manifest_cycles, complete_cycle_ratio, bronze_records, "
+            "silver_position_events, quarantined_records, quarantined_by_reason, "
+            "partial_manifest_cycles FROM hourly_data_quality"
         ).fetchone()
+        self.assertEqual(row[8], 3)
         self.assertEqual(row[:3], ("present", 60, 57))
         self.assertAlmostEqual(row[3], 0.95)
         self.assertEqual(row[4:7], (9, 6, 3))
