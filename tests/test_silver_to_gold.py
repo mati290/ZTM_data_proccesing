@@ -1,4 +1,6 @@
+import contextlib
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -350,6 +352,262 @@ class PublishTests(unittest.TestCase):
         for table in gold.GOLD_TABLES:
             self.assertTrue(uris["staging"][table].endswith(".parquet.pending"))
             self.assertIn("/_staging/", uris["staging"][table])
+
+
+class LocalPipelineTestCase(unittest.TestCase):
+    """Runs build_gold_hour end to end against a local directory instead of S3."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name.replace("\\", "/")
+        self.silver = make_silver(self.tmp.name)
+        self.quarantine = f"{self.root}/quarantine.parquet"
+        self.con = duckdb.connect()
+        self.con.execute("SET TimeZone='UTC'")
+        self.addCleanup(self.con.close)
+        self.status = "complete"
+
+    def write_quarantine(self, reasons):
+        values = ", ".join(f"('{r}')" for r in reasons)
+        tmp = duckdb.connect()
+        tmp.execute(
+            f"COPY (SELECT * FROM (VALUES {values}) t(rejection_reason)) "
+            f"TO '{self.quarantine}' (FORMAT parquet)"
+        )
+        tmp.close()
+
+    def local_uris(self, date_str, hour_str):
+        partition = f"date={date_str}/hour={hour_str}"
+        return {
+            "silver": self.silver,
+            "quarantine": self.quarantine,
+            "gold": {
+                t: f"{self.root}/gold/{t}/{partition}/data.parquet"
+                for t in gold.GOLD_TABLES
+            },
+            "staging": {
+                t: f"{self.root}/staging/{t}.parquet.pending" for t in gold.GOLD_TABLES
+            },
+        }
+
+    @staticmethod
+    def fake_copy(src, dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+
+    @staticmethod
+    def fake_delete(uri):
+        if os.path.exists(uri):
+            os.remove(uri)
+
+    def build(self, run_at=RUN_AT, validate=None):
+        os.makedirs(f"{self.root}/staging", exist_ok=True)
+        marker = {"status": self.status, "cycles": 60, "complete_cycles": 60}
+        patches = [
+            patch("silver_to_gold.read_completeness_marker", return_value=marker),
+            patch("silver_to_gold.s3_object_exists", side_effect=os.path.exists),
+            patch("silver_to_gold.partition_uris", side_effect=self.local_uris),
+            patch("silver_to_gold.copy_s3_object", side_effect=self.fake_copy),
+            patch("silver_to_gold.delete_s3_object", side_effect=self.fake_delete),
+        ]
+        if validate is not None:
+            patches.append(patch("silver_to_gold.validate_gold_tables", validate))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            return gold.build_gold_hour(self.con, "2026-01-15", "12", run_at)
+
+    def published(self):
+        return sorted(
+            os.path.relpath(os.path.join(d, f), self.root)
+            for d, _, files in os.walk(f"{self.root}/gold")
+            for f in files
+        )
+
+    def read_gold(self, table, exclude=("pipeline_run_at",)):
+        uri = f"{self.root}/gold/{table}/date=2026-01-15/hour=12/data.parquet"
+        cols = [
+            r[0]
+            for r in self.con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{uri}', hive_partitioning=false)"
+            ).fetchall()
+            if r[0] not in exclude
+        ]
+        sel = ", ".join(f'"{c}"' for c in cols)
+        return self.con.execute(
+            f"SELECT {sel} FROM read_parquet('{uri}', hive_partitioning=false) "
+            "ORDER BY ALL"
+        ).fetchall()
+
+
+class GoldProcessTests(LocalPipelineTestCase):
+    def test_all_tables_are_published_once(self):
+        self.write_quarantine(["duplicate", "stale_gps_time"])
+        result = self.build()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(len(self.published()), len(gold.GOLD_TABLES))
+        self.assertEqual(os.listdir(f"{self.root}/staging"), [])
+
+    def test_rerun_is_idempotent_and_creates_no_duplicates(self):
+        self.write_quarantine(["duplicate", "stale_gps_time"])
+        self.build()
+        first = {t: self.read_gold(t) for t in gold.GOLD_TABLES}
+        files = self.published()
+        later = RUN_AT.replace(minute=45)
+        self.build(run_at=later)
+        self.assertEqual(self.published(), files)
+        for table in gold.GOLD_TABLES:
+            self.assertEqual(self.read_gold(table), first[table], table)
+            self.assertEqual(len(first[table]) > 0, True)
+        self.assertEqual(len(first["hourly_network_metrics"]), 1)
+        self.assertEqual(len(first["hourly_data_quality"]), 1)
+
+    def test_rerun_with_changed_silver_replaces_not_appends(self):
+        self.build()
+        self.silver = make_silver(
+            self.tmp.name, SILVER_SQL.replace("('tram', '2000'", "('tram', '2001'")
+        )
+        self.build()
+        trams = self.con.execute(
+            "SELECT vehicle_number FROM read_parquet('"
+            f"{self.root}/gold/vehicle_activity_hourly/date=2026-01-15/hour=12/"
+            "data.parquet', hive_partitioning=false) "
+            "WHERE vehicle_type = 'tram' ORDER BY 1"
+        ).fetchall()
+        self.assertEqual(trams, [("1000",), ("2001",)])
+
+    def test_incomplete_status_is_never_published_as_complete(self):
+        self.status = "incomplete"
+        self.write_quarantine(["duplicate"])
+        with self.assertLogs("silver_to_gold", level="WARNING"):
+            result = self.build()
+        self.assertEqual(result["status"], "incomplete")
+        for table in ("hourly_network_metrics", "hourly_data_quality"):
+            statuses = {
+                r[0]
+                for r in self.con.execute(
+                    "SELECT data_completeness_status FROM read_parquet('"
+                    f"{self.root}/gold/{table}/date=2026-01-15/hour=12/data.parquet',"
+                    " hive_partitioning=false)"
+                ).fetchall()
+            }
+            self.assertEqual(statuses, {"incomplete"}, table)
+        safe = self.con.execute(
+            "SELECT safe_for_dashboard FROM read_parquet('"
+            f"{self.root}/gold/hourly_data_quality/date=2026-01-15/hour=12/"
+            "data.parquet', hive_partitioning=false)"
+        ).fetchone()[0]
+        self.assertIs(safe, False)
+
+    def test_quarantined_duplicates_do_not_inflate_silver_metrics(self):
+        self.write_quarantine(["duplicate"] * 5)
+        self.build()
+        totals = self.con.execute(
+            "SELECT SUM(active_vehicles), SUM(position_events), SUM(silver_records) "
+            "FROM read_parquet('"
+            f"{self.root}/gold/hourly_network_metrics/date=2026-01-15/hour=12/"
+            "data.parquet', hive_partitioning=false)"
+        ).fetchone()
+        self.assertEqual(totals, (5, 6, 6))
+        quality = self.con.execute(
+            "SELECT bronze_records, silver_position_events, duplicate_records "
+            "FROM read_parquet('"
+            f"{self.root}/gold/hourly_data_quality/date=2026-01-15/hour=12/"
+            "data.parquet', hive_partitioning=false)"
+        ).fetchone()
+        self.assertEqual(quality, (11, 6, 5))
+
+    def test_validation_failure_publishes_nothing(self):
+        def boom(con, tables):
+            raise ValueError("Gold consistency checks failed: forced")
+
+        with self.assertRaisesRegex(ValueError, "forced"):
+            self.build(validate=boom)
+        self.assertEqual(self.published(), [])
+
+    def test_failed_staging_validation_publishes_nothing_and_cleans_up(self):
+        calls = []
+
+        def fail_on_third(con, table, uri, expected):
+            calls.append(table)
+            if len(calls) == 3:
+                raise ValueError("staged file is corrupt")
+
+        with (
+            patch("silver_to_gold.validate_staged_file", side_effect=fail_on_third),
+            self.assertRaisesRegex(ValueError, "corrupt"),
+        ):
+            self.build()
+        self.assertEqual(self.published(), [])
+        self.assertEqual(os.listdir(f"{self.root}/staging"), [])
+
+    def test_failure_on_rerun_keeps_previous_publication(self):
+        self.build()
+        before = {t: self.read_gold(t) for t in gold.GOLD_TABLES}
+
+        def boom(con, tables):
+            raise ValueError("forced")
+
+        with self.assertRaises(ValueError):
+            self.build(validate=boom)
+        for table in gold.GOLD_TABLES:
+            self.assertEqual(self.read_gold(table), before[table], table)
+
+
+class GoldSilverContractTests(LocalPipelineTestCase):
+    def assert_rejected_without_publication(self, sql):
+        self.silver = make_silver(self.tmp.name, sql)
+        with self.assertRaises(ValueError):
+            self.build()
+        self.assertEqual(self.published(), [])
+
+    def test_missing_column_is_rejected(self):
+        self.assert_rejected_without_publication(
+            "CREATE TABLE src AS SELECT vehicle_type, vehicle_number, line, "
+            "brigade, lat, lon, gps_time_utc FROM (VALUES "
+            "('bus', '1', '1', '1', 52.1e0, 21.0e0, "
+            "TIMESTAMPTZ '2026-01-15 12:01:00+00')) "
+            "t(vehicle_type, vehicle_number, line, brigade, lat, lon, gps_time_utc)"
+        )
+
+    def test_wrong_column_type_is_rejected(self):
+        self.assert_rejected_without_publication(
+            "CREATE TABLE src AS SELECT 'bus' AS vehicle_type, '1' AS vehicle_number, "
+            "'1' AS line, '1' AS brigade, 'north' AS lat, 21.0e0 AS lon, "
+            "TIMESTAMPTZ '2026-01-15 12:01:00+00' AS gps_time_utc, "
+            "TIMESTAMPTZ '2026-01-15 12:01:10+00' AS ingested_at"
+        )
+
+    def test_unexpected_vehicle_type_is_rejected(self):
+        self.assert_rejected_without_publication(
+            SILVER_SQL.replace("('tram', '2000'", "('metro', '2000'")
+        )
+
+    def test_null_coordinates_are_rejected(self):
+        self.assert_rejected_without_publication(
+            SILVER_SQL.replace(
+                "'b1', 52.1e0, 21.0e0, TIMESTAMPTZ '2026-01-15 12:05",
+                "'b1', NULL, 21.0e0, TIMESTAMPTZ '2026-01-15 12:05",
+            )
+        )
+
+    def test_duplicate_observations_are_rejected(self):
+        self.assert_rejected_without_publication(
+            SILVER_SQL.replace("'2026-01-15 12:02:00+00'", "'2026-01-15 12:01:00+00'")
+        )
+
+    def test_empty_line_is_kept_as_unknown_not_dropped(self):
+        self.build()
+        lines = dict(
+            self.con.execute(
+                "SELECT line, SUM(position_events) FROM read_parquet('"
+                f"{self.root}/gold/hourly_line_metrics/date=2026-01-15/hour=12/"
+                "data.parquet', hive_partitioning=false) GROUP BY line"
+            ).fetchall()
+        )
+        self.assertEqual(lines["unknown"], 2)
+        self.assertEqual(sum(lines.values()), 6)
 
 
 if __name__ == "__main__":
