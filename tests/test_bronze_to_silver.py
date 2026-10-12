@@ -353,7 +353,6 @@ class TransformHourTests(unittest.TestCase):
             "s3://silver/vehicle_positions/date=2026-10-09/hour=07",
         )
 
-
     def test_marker_is_invalidated_before_any_published_object_copy(self):
         connection = self._happy_path_connection()
         events = []
