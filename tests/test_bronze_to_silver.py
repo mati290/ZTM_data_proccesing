@@ -368,7 +368,9 @@ class TransformHourTests(unittest.TestCase):
             ),
             patch(
                 "bronze_to_silver.assess_completeness",
-                side_effect=lambda *args: events.append(("assess", args)) or self.completeness,
+                side_effect=lambda *args: (
+                    events.append(("assess", args)) or self.completeness
+                ),
             ),
             patch(
                 "bronze_to_silver.write_completeness_marker",
