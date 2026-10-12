@@ -3,9 +3,10 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, call
 
 import duckdb
 from botocore.exceptions import ClientError
@@ -244,6 +245,7 @@ class TransformHourTests(unittest.TestCase):
         self.write_marker_mock = patch(
             "bronze_to_silver.write_completeness_marker"
         ).start()
+        patch("bronze_to_silver.silver_hour_lock", return_value=nullcontext()).start()
         self.addCleanup(patch.stopall)
 
     @staticmethod
@@ -256,6 +258,36 @@ class TransformHourTests(unittest.TestCase):
             (1,),
         ]
         return connection
+
+
+    def test_silver_lock_uses_conditional_create_and_releases_owned_lock(self):
+        client = Mock()
+        client.get_object.return_value = {
+            "Body": Mock(read=Mock(return_value=b'{"token": "silver-token"}'))
+        }
+        with patch("bronze_to_silver.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = "silver-token"
+            with silver_hour_lock("2026-10-09", "07", client):
+                pass
+        self.assertEqual(client.put_object.call_args.kwargs["IfNoneMatch"], "*")
+        client.delete_object.assert_called_once_with(
+            Bucket="silver",
+            Key="_locks/vehicle_positions/date=2026-10-09/hour=07/writer.json",
+        )
+
+    def test_silver_lock_collision_fails_closed(self):
+        client = Mock()
+        client.put_object.side_effect = ClientError(
+            {
+                "Error": {"Code": "PreconditionFailed"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            "PutObject",
+        )
+        with self.assertRaises(SilverHourLockedError):
+            with silver_hour_lock("2026-10-09", "07", client):
+                self.fail("must not enter while another writer owns the hour")
+        client.delete_object.assert_not_called()
 
     def test_fails_when_bronze_partition_has_no_files(self):
         connection = Mock()
