@@ -274,7 +274,7 @@ class TransformHourTests(unittest.TestCase):
         self.assertEqual(client.put_object.call_args.kwargs["IfNoneMatch"], "*")
         client.delete_object.assert_called_once_with(
             Bucket="silver",
-            Key="_locks/vehicle_positions/date=2026-10-09/hour=07/writer.json",
+            Key="_locks/pipeline/date=2026-10-09/hour=07/writer.json",
             IfMatch='"silver-etag"',
         )
 
