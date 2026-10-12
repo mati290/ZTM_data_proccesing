@@ -392,12 +392,15 @@ class GoldHourLockTests(unittest.TestCase):
             "Body": Mock(read=Mock(return_value=b'{"token": "someone-else"}')),
             "ETag": '"other-etag"',
         }
+        uuid4_patch = patch("silver_to_gold.uuid.uuid4")
+        uuid4 = uuid4_patch.start()
+        uuid4.return_value.hex = "our-token"
+        self.addCleanup(uuid4_patch.stop)
         with (
-            patch("silver_to_gold.uuid.uuid4") as uuid4,
             self.assertRaisesRegex(RuntimeError, "ownership changed"),
             gold.gold_hour_lock("2026-10-09", "07", client),
         ):
-            uuid4.return_value.hex = "our-token"
+            pass
         client.delete_object.assert_not_called()
 
 
