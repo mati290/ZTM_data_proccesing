@@ -544,6 +544,10 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
                 "refusing to publish."
             )
 
+        # A marker certifies the current Silver + quarantine objects. Remove
+        # the previous marker before replacing either object, then write a fresh
+        # marker only after completeness assessment succeeds.
+        delete_s3_object(f"{silver_dir}/_completeness.json")
         copy_s3_object(rejected_temp_file, rejected_file)
         copy_s3_object(temp_file, output_file)
         completeness = assess_completeness(date_str, hour_str)
