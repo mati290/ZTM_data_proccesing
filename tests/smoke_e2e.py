@@ -53,15 +53,24 @@ def main():
     # Verify that the actual MinIO version honors conditional lock creation.
     import silver_to_gold
 
-    for lock_factory, lock_error in (
-        (bronze_to_silver.silver_hour_lock, bronze_to_silver.SilverHourLockedError),
-        (silver_to_gold.gold_hour_lock, silver_to_gold.GoldHourLockedError),
-    ):
-        with lock_factory(DATE, HOUR, s3_client=s3):
+    lock_cases = (
+        (
+            bronze_to_silver.silver_hour_lock,
+            silver_to_gold.gold_hour_lock,
+            silver_to_gold.GoldHourLockedError,
+        ),
+        (
+            silver_to_gold.gold_hour_lock,
+            bronze_to_silver.silver_hour_lock,
+            bronze_to_silver.SilverHourLockedError,
+        ),
+    )
+    for first_writer, competing_writer, lock_error in lock_cases:
+        with first_writer(DATE, HOUR, s3_client=s3):
             try:
-                with lock_factory(DATE, HOUR, s3_client=s3):
+                with competing_writer(DATE, HOUR, s3_client=s3):
                     raise AssertionError(
-                        "second writer unexpectedly acquired the hour lock"
+                        "competing Silver/Gold writer unexpectedly acquired the hour lock"
                     )
             except lock_error:
                 pass
