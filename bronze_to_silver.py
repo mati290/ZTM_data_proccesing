@@ -60,7 +60,7 @@ def silver_hour_lock(date_str: str, hour_str: str, s3_client=None):
                 f"Silver lock ownership changed for {date_str} hour {hour_str}; "
                 "refusing to remove another writer's lock."
             )
-        client.delete_object(Bucket="silver", Key=key)
+        client.delete_object(Bucket="silver", Key=key, IfMatch=response["ETag"])
 
 
 EXPECTED_SILVER_COLUMNS = [
