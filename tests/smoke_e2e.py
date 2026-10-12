@@ -60,7 +60,9 @@ def main():
         with lock_factory(DATE, HOUR, s3_client=s3):
             try:
                 with lock_factory(DATE, HOUR, s3_client=s3):
-                    raise AssertionError("second writer unexpectedly acquired the hour lock")
+                    raise AssertionError(
+                        "second writer unexpectedly acquired the hour lock"
+                    )
             except lock_error:
                 pass
 
