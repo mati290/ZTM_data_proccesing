@@ -471,7 +471,10 @@ class LocalPipelineTestCase(unittest.TestCase):
             patch("silver_to_gold.read_completeness_marker", return_value=marker),
             patch("silver_to_gold.s3_object_exists", side_effect=os.path.exists),
             patch("silver_to_gold.partition_uris", side_effect=self.local_uris),
-            patch("silver_to_gold.gold_hour_lock", return_value=contextlib.nullcontext()),
+            patch(
+                "silver_to_gold.gold_hour_lock",
+                return_value=contextlib.nullcontext(),
+            ),
             patch("silver_to_gold.copy_s3_object", side_effect=self.fake_copy),
             patch("silver_to_gold.delete_s3_object", side_effect=self.fake_delete),
         ]
