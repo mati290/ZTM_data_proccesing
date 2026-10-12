@@ -72,12 +72,12 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
     raise RuntimeError(f"Failed to fetch positions for vehicle type {vehicle_type}")
 
 
-def save_to_bronze(s3, records, vehicle_label):
+def save_to_bronze(s3, records, vehicle_label, ingested_at=None):
     if not records:
         logger.warning(f"No records fetched for vehicle type {vehicle_label}")
         return
 
-    ingested_at = datetime.now(timezone.utc)
+    ingested_at = ingested_at or datetime.now(timezone.utc)
 
     file_name = (
         f"positions_{ingested_at.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.jsonl"
@@ -148,9 +148,11 @@ def _ensure_single_bucket(s3, bucket):
         s3.create_bucket(Bucket=bucket)
 
 
-def write_cycle_manifest(s3, bus_count, tram_count, failed_sources, empty_sources):
+def write_cycle_manifest(
+    s3, bus_count, tram_count, failed_sources, empty_sources, ingested_at=None
+):
     """Record whether a cycle fetched both sources, so Silver can flag partial hours."""
-    now = datetime.now(timezone.utc)
+    now = ingested_at or datetime.now(timezone.utc)
     complete = bus_count > 0 and tram_count > 0
     manifest = {
         "ingested_at": now.isoformat(),
@@ -198,6 +200,10 @@ def run_once(api_key, s3):
         if not records and label not in failed_sources:
             empty_sources.append(label)
 
+    # Use one timestamp for both source files and their manifest. Otherwise a
+    # cycle that crosses an hour boundary can mark an hour complete even though
+    # its bus and tram objects landed in different hourly partitions.
+    cycle_ingested_at = datetime.now(timezone.utc)
     total = len(buses) + len(trams)
 
     if not buses:
@@ -210,11 +216,18 @@ def run_once(api_key, s3):
     )
 
     if buses:
-        save_to_bronze(s3, buses, "bus")
+        save_to_bronze(s3, buses, "bus", ingested_at=cycle_ingested_at)
     if trams:
-        save_to_bronze(s3, trams, "tram")
+        save_to_bronze(s3, trams, "tram", ingested_at=cycle_ingested_at)
 
-    write_cycle_manifest(s3, len(buses), len(trams), failed_sources, empty_sources)
+    write_cycle_manifest(
+        s3,
+        len(buses),
+        len(trams),
+        failed_sources,
+        empty_sources,
+        ingested_at=cycle_ingested_at,
+    )
 
     return {
         "buses": len(buses),
