@@ -45,12 +45,23 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
     if bronze_latest is None:
         return False
 
+    manifest_latest = _max_last_modified(
+        s3_client,
+        "bronze",
+        f"_manifests/date={date_str}/hour={hour_str}/",
+    )
     silver_latest = _max_last_modified(
         s3_client,
         "silver",
         f"vehicle_positions/date={date_str}/hour={hour_str}/data.parquet",
     )
-    return silver_latest is None or bronze_latest > silver_latest
+    source_latest = max(
+        (modified for modified in (bronze_latest, manifest_latest) if modified is not None),
+        default=None,
+    )
+    return silver_latest is None or (
+        source_latest is not None and source_latest > silver_latest
+    )
 
 
 def find_stale_hours(
