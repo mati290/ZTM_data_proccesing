@@ -42,9 +42,6 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
         )
         if modified is not None and (bronze_latest is None or modified > bronze_latest):
             bronze_latest = modified
-    if bronze_latest is None:
-        return False
-
     manifest_latest = _max_last_modified(
         s3_client,
         "bronze",
@@ -59,8 +56,8 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
         (modified for modified in (bronze_latest, manifest_latest) if modified is not None),
         default=None,
     )
-    return silver_latest is None or (
-        source_latest is not None and source_latest > silver_latest
+    return source_latest is not None and (
+        silver_latest is None or source_latest > silver_latest
     )
 
 
