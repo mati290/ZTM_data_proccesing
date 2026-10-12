@@ -4,8 +4,11 @@ Contract: docs/gold-data-contract.md
 """
 
 import argparse
+import json
 import logging
+import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import duckdb
@@ -22,6 +25,62 @@ from bronze_to_silver import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GoldHourLockedError(RuntimeError):
+    """Raised when another process is publishing this Gold hour."""
+
+
+def _gold_s3_client():
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
+        aws_access_key_id=os.getenv("MINIO_USER"),
+        aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
+    )
+
+
+@contextmanager
+def gold_hour_lock(date_str: str, hour_str: str, s3_client=None):
+    """Acquire a fail-closed, per-hour S3 lock using conditional object creation.
+
+    The lock deliberately has no automatic lease expiry: stealing an expired lock
+    without a compare-and-swap primitive can allow two writers. If a worker dies,
+    an operator must verify it is stopped before removing the lock object.
+    """
+    client = s3_client or _gold_s3_client()
+    key = f"_locks/gold/date={date_str}/hour={hour_str}/writer.json"
+    token = uuid.uuid4().hex
+    try:
+        client.put_object(
+            Bucket="gold",
+            Key=key,
+            Body=json.dumps({"token": token}).encode("utf-8"),
+            IfNoneMatch="*",
+        )
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = exc.response.get("Error", {}).get("Code")
+        if status in (409, 412) or code in ("PreconditionFailed", "ConditionalRequestConflict"):
+            raise GoldHourLockedError(
+                f"Gold hour {date_str} {hour_str} is already being published; "
+                "retry after the active writer finishes."
+            ) from exc
+        raise
+
+    try:
+        yield
+    finally:
+        response = client.get_object(Bucket="gold", Key=key)
+        current = json.loads(response["Body"].read())
+        if current.get("token") != token:
+            raise RuntimeError(
+                f"Gold lock ownership changed for {date_str} hour {hour_str}; "
+                "refusing to remove another writer's lock."
+            )
+        client.delete_object(Bucket="gold", Key=key)
 
 COMPLETENESS_STATUSES = ("complete", "incomplete", "unknown")
 VEHICLE_TYPES = ("bus", "tram")
@@ -575,8 +634,8 @@ def publish_tables(con, tables, uris: dict) -> dict:
     return row_counts
 
 
-def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dict:
-    """Build and publish all Gold tables for one UTC hour; safe to re-run."""
+def _build_gold_hour_unlocked(con, date_str, hour_str, run_at=None, s3_client=None) -> dict:
+    """Build and publish all Gold tables while holding the per-hour lock."""
     date_str, hour_str = validate_partition(date_str, hour_str)
     run_at = (run_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     uris = partition_uris(date_str, hour_str)
@@ -600,6 +659,12 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     )
 
     if not silver_rows:
+        # Invalidate the old commit record before deleting stale metrics. A gap
+        # must never leave a previous hour's vehicle/line/network rows visible.
+        delete_s3_object(uris["gold"]["hourly_data_quality"])
+        for table in GOLD_TABLES:
+            if table != "hourly_data_quality":
+                delete_s3_object(uris["gold"][table])
         # Still record the gap so dashboards can tell "no data" from "no activity".
         publish_tables(con, ("hourly_data_quality",), uris)
         if silver_present:
@@ -639,6 +704,13 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
         row_counts,
     )
     return {"status": completeness["status"], "rows": row_counts}
+
+
+def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dict:
+    """Serialize all writers for one UTC hour, including late-data corrections."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    with gold_hour_lock(date_str, hour_str):
+        return _build_gold_hour_unlocked(con, date_str, hour_str, run_at, s3_client)
 
 
 def main():
