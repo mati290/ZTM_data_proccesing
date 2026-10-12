@@ -50,6 +50,20 @@ def main():
         if bucket not in existing:
             s3.create_bucket(Bucket=bucket)
 
+    # Verify that the actual MinIO version honors conditional lock creation.
+    import silver_to_gold
+
+    for lock_factory, lock_error in (
+        (bronze_to_silver.silver_hour_lock, bronze_to_silver.SilverHourLockedError),
+        (silver_to_gold.gold_hour_lock, silver_to_gold.GoldHourLockedError),
+    ):
+        with lock_factory(DATE, HOUR, s3_client=s3):
+            try:
+                with lock_factory(DATE, HOUR, s3_client=s3):
+                    raise AssertionError("second writer unexpectedly acquired the hour lock")
+            except lock_error:
+                pass
+
     key = f"vehicle_type=bus/date={DATE}/hour={HOUR}/smoke.jsonl"
     body = "\n".join(json.dumps(r) for r in build_records())
     s3.put_object(Bucket="bronze", Key=key, Body=body.encode())
@@ -107,6 +121,8 @@ def main():
     finally:
         con.close()
         for bucket, prefix in (
+            ("silver", f"_locks/vehicle_positions/date={DATE}/hour={HOUR}/"),
+            ("gold", f"_locks/gold/date={DATE}/hour={HOUR}/"),
             ("bronze", f"vehicle_type=bus/date={DATE}/"),
             ("silver", f"vehicle_positions/date={DATE}/"),
             ("silver", f"quarantine/vehicle_positions/date={DATE}/"),
