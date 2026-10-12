@@ -50,6 +50,13 @@ def manifest(hour, when):
     )
 
 
+def gold_commit(hour, when):
+    return (
+        ("gold", f"hourly_data_quality/date=2026-01-15/hour={hour}/data.parquet"),
+        when,
+    )
+
+
 class StaleHourTests(unittest.TestCase):
     def stale(self, *items, window=3):
         return late_data.find_stale_hours(NOW, window, FakeS3(dict(items)))
@@ -58,18 +65,39 @@ class StaleHourTests(unittest.TestCase):
         result = self.stale(
             bronze("12", T0 + timedelta(minutes=40)),
             silver("12", T0 + timedelta(minutes=35)),
+            gold_commit("12", T0 + timedelta(minutes=36)),
         )
         self.assertEqual(result, [("2026-01-15", "12")])
 
-    def test_silver_newer_than_bronze_is_not_stale(self):
-        result = self.stale(bronze("12", T0), silver("12", T0 + timedelta(minutes=35)))
+    def test_silver_newer_than_bronze_and_gold_commit_is_not_stale(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=35)),
+            gold_commit("12", T0 + timedelta(minutes=36)),
+        )
         self.assertEqual(result, [])
+
+    def test_missing_gold_commit_triggers_reprocessing_even_when_silver_is_current(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=35)),
+        )
+        self.assertEqual(result, [("2026-01-15", "12")])
+
+    def test_gold_commit_older_than_silver_triggers_reprocessing(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=40)),
+            gold_commit("12", T0 + timedelta(minutes=35)),
+        )
+        self.assertEqual(result, [("2026-01-15", "12")])
 
     def test_manifest_written_after_silver_triggers_reprocessing(self):
         result = self.stale(
             bronze("12", T0),
             silver("12", T0 + timedelta(minutes=35)),
             manifest("12", T0 + timedelta(minutes=40)),
+            gold_commit("12", T0 + timedelta(minutes=36)),
         )
         self.assertEqual(result, [("2026-01-15", "12")])
 
@@ -78,6 +106,7 @@ class StaleHourTests(unittest.TestCase):
             bronze("12", T0),
             silver("12", T0 + timedelta(minutes=40)),
             manifest("12", T0 + timedelta(minutes=35)),
+            gold_commit("12", T0 + timedelta(minutes=41)),
         )
         self.assertEqual(result, [])
 
