@@ -77,7 +77,9 @@ class StaleHourTests(unittest.TestCase):
         )
         self.assertEqual(result, [])
 
-    def test_missing_gold_commit_triggers_reprocessing_even_when_silver_is_current(self):
+    def test_missing_gold_commit_triggers_reprocessing_even_when_silver_is_current(
+        self,
+    ):
         result = self.stale(
             bronze("12", T0),
             silver("12", T0 + timedelta(minutes=35)),
