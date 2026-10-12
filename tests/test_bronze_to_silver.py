@@ -6,7 +6,7 @@ import unittest
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch, call
+from unittest.mock import call, Mock, patch
 
 import duckdb
 from botocore.exceptions import ClientError
@@ -288,9 +288,11 @@ class TransformHourTests(unittest.TestCase):
             },
             "PutObject",
         )
-        with self.assertRaises(SilverHourLockedError):
-            with silver_hour_lock("2026-10-09", "07", client):
-                self.fail("must not enter while another writer owns the hour")
+        with (
+            self.assertRaises(SilverHourLockedError),
+            silver_hour_lock("2026-10-09", "07", client),
+        ):
+            self.fail("must not enter while another writer owns the hour")
         client.delete_object.assert_not_called()
 
     def test_fails_when_bronze_partition_has_no_files(self):
