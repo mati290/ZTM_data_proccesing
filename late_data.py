@@ -52,13 +52,22 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
         "silver",
         f"vehicle_positions/date={date_str}/hour={hour_str}/data.parquet",
     )
+    gold_commit_latest = _max_last_modified(
+        s3_client,
+        "gold",
+        f"hourly_data_quality/date={date_str}/hour={hour_str}/data.parquet",
+    )
     source_latest = max(
         (modified for modified in (bronze_latest, manifest_latest) if modified is not None),
         default=None,
     )
-    return source_latest is not None and (
-        silver_latest is None or source_latest > silver_latest
-    )
+    if source_latest is None:
+        return False
+    if silver_latest is None or source_latest > silver_latest:
+        return True
+    # Recover a failed/incomplete Gold publication even when Silver is already
+    # current: the quality table is the commit record for the Gold hour.
+    return gold_commit_latest is None or silver_latest > gold_commit_latest
 
 
 def find_stale_hours(
