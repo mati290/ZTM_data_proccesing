@@ -30,7 +30,7 @@ class SilverHourLockedError(RuntimeError):
 def silver_hour_lock(date_str: str, hour_str: str, s3_client=None):
     """Fail-closed lock preventing overlapping Silver publication for one hour."""
     client = s3_client or _s3_client()
-    key = f"_locks/vehicle_positions/date={date_str}/hour={hour_str}/writer.json"
+    key = f"_locks/pipeline/date={date_str}/hour={hour_str}/writer.json"
     token = uuid.uuid4().hex
     try:
         client.put_object(
