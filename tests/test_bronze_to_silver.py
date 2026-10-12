@@ -6,7 +6,7 @@ import unittest
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import call, Mock, patch
+from unittest.mock import Mock, call, patch
 
 import duckdb
 from botocore.exceptions import ClientError
