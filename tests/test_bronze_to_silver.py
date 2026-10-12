@@ -379,9 +379,10 @@ class TransformHourTests(unittest.TestCase):
         ):
             transform_hour(connection, "2026-10-09", "7")
 
-        marker_delete = events.index(
-            ("delete", "s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json")
+        marker_key = (
+            "s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json"
         )
+        marker_delete = events.index(("delete", marker_key))
         first_copy = next(i for i, event in enumerate(events) if event[0] == "copy")
         assess = next(i for i, event in enumerate(events) if event[0] == "assess")
         marker_write = next(i for i, event in enumerate(events) if event[0] == "marker")
