@@ -80,7 +80,7 @@ def gold_hour_lock(date_str: str, hour_str: str, s3_client=None):
                 f"Gold lock ownership changed for {date_str} hour {hour_str}; "
                 "refusing to remove another writer's lock."
             )
-        client.delete_object(Bucket="gold", Key=key)
+        client.delete_object(Bucket="gold", Key=key, IfMatch=response["ETag"])
 
 COMPLETENESS_STATUSES = ("complete", "incomplete", "unknown")
 VEHICLE_TYPES = ("bus", "tram")
