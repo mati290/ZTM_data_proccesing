@@ -12,8 +12,8 @@ from airflow.timetables.interval import CronDataIntervalTimetable
     description="Builds the hourly Gold tables from the Silver partition of the same hour",
     # Same timetable as bronze_to_silver_hourly, so both DAGs share logical dates.
     schedule=CronDataIntervalTimetable("0 * * * *", timezone="UTC"),
-    start_date=pendulum.datetime(2026, 10, 10, tz="UTC"),
-    catchup=True,
+    start_date=pendulum.datetime(2026, 10, 12, tz="UTC"),
+    catchup=False,
     max_active_runs=1,
     default_args={"retries": 3, "retry_delay": timedelta(minutes=5)},
     tags=["ztm", "silver-to-gold"],
@@ -33,7 +33,7 @@ def silver_to_gold_hourly():
         retries=0,
     )
 
-    @task
+    @task(pool="ztm_silver_gold_writer")
     def build_gold():
         import bronze_to_silver
         import silver_to_gold

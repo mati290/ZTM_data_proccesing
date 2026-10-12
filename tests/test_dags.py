@@ -36,6 +36,11 @@ class DagDefinitionTests(unittest.TestCase):
         self.assertEqual(str(gold.timetable.summary), str(silver.timetable.summary))
         self.assertEqual(gold.max_active_runs, 1)
 
+    def test_hourly_dags_do_not_catch_up(self):
+        for dag_id in ("bronze_to_silver_hourly", "silver_to_gold_hourly"):
+            with self.subTest(dag_id=dag_id):
+                self.assertFalse(self.bag.get_dag(dag_id).catchup)
+
     def test_late_data_dag_is_single_run_with_retries(self):
         dag = self.bag.get_dag("reprocess_late_data_hourly")
         self.assertIsNotNone(dag)
@@ -43,6 +48,18 @@ class DagDefinitionTests(unittest.TestCase):
         self.assertFalse(dag.catchup)
         self.assertGreaterEqual(dag.default_args["retries"], 1)
         self.assertIn("reprocess", dag.task_ids)
+
+    def test_all_partition_writers_share_one_pool(self):
+        expected_pool = "ztm_silver_gold_writer"
+        writers = (
+            ("bronze_to_silver_hourly", "transform_bronze_to_silver"),
+            ("silver_to_gold_hourly", "build_gold"),
+            ("reprocess_late_data_hourly", "reprocess"),
+        )
+
+        for dag_id, task_id in writers:
+            task = self.bag.get_dag(dag_id).get_task(task_id)
+            self.assertEqual(task.pool, expected_pool)
 
 
 if __name__ == "__main__":
