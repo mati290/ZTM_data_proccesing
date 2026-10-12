@@ -362,10 +362,10 @@ class GoldHourLockTests(unittest.TestCase):
 
         client.put_object.assert_called_once()
         self.assertEqual(client.put_object.call_args.kwargs["IfNoneMatch"], "*")
-        self.assertEqual(client.put_object.call_args.kwargs["Bucket"], "gold")
+        self.assertEqual(client.put_object.call_args.kwargs["Bucket"], "silver")
         client.delete_object.assert_called_once_with(
-            Bucket="gold",
-            Key="_locks/gold/date=2026-10-09/hour=07/writer.json",
+            Bucket="silver",
+            Key="_locks/pipeline/date=2026-10-09/hour=07/writer.json",
             IfMatch='"gold-etag"',
         )
 
