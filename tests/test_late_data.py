@@ -43,6 +43,13 @@ def silver(hour, when):
     )
 
 
+def manifest(hour, when):
+    return (
+        ("bronze", f"_manifests/date=2026-01-15/hour={hour}/cycle.json"),
+        when,
+    )
+
+
 class StaleHourTests(unittest.TestCase):
     def stale(self, *items, window=3):
         return late_data.find_stale_hours(NOW, window, FakeS3(dict(items)))
@@ -56,6 +63,22 @@ class StaleHourTests(unittest.TestCase):
 
     def test_silver_newer_than_bronze_is_not_stale(self):
         result = self.stale(bronze("12", T0), silver("12", T0 + timedelta(minutes=35)))
+        self.assertEqual(result, [])
+
+    def test_manifest_written_after_silver_triggers_reprocessing(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=35)),
+            manifest("12", T0 + timedelta(minutes=40)),
+        )
+        self.assertEqual(result, [("2026-01-15", "12")])
+
+    def test_manifest_older_than_silver_does_not_trigger_reprocessing(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=40)),
+            manifest("12", T0 + timedelta(minutes=35)),
+        )
         self.assertEqual(result, [])
 
     def test_missing_silver_with_bronze_is_stale_gap_repair(self):
