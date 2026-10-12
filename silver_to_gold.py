@@ -638,7 +638,9 @@ def publish_tables(con, tables, uris: dict) -> dict:
     return row_counts
 
 
-def _build_gold_hour_unlocked(con, date_str, hour_str, run_at=None, s3_client=None) -> dict:
+def _build_gold_hour_unlocked(
+    con, date_str, hour_str, run_at=None, s3_client=None
+) -> dict:
     """Build and publish all Gold tables while holding the per-hour lock."""
     date_str, hour_str = validate_partition(date_str, hour_str)
     run_at = (run_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
