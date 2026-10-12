@@ -554,6 +554,12 @@ def publish_tables(con, tables, uris: dict) -> dict:
                 f"TO '{staging[table]}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
             )
             validate_staged_file(con, table, staging[table], row_counts[table])
+        # Invalidate the previous commit record before replacing any table.
+        # If a later copy fails, consumers must not mistake a mixed generation
+        # of Gold objects for a complete publication.
+        if len(tables) > 1 and "hourly_data_quality" in tables:
+            delete_s3_object(uris["gold"]["hourly_data_quality"])
+
         for table in tables:
             copy_s3_object(staging[table], uris["gold"][table])
     finally:
