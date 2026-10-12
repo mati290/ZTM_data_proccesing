@@ -348,7 +348,6 @@ class BuildGoldHourTests(unittest.TestCase):
             gold.build_gold_hour(self.con, "bad", "12")
 
 
-
 class GoldHourLockTests(unittest.TestCase):
     def test_lock_uses_conditional_create_and_releases_owned_lock(self):
         client = Mock()
