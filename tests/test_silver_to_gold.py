@@ -296,6 +296,7 @@ class BuildGoldHourTests(unittest.TestCase):
             ),
             patch("silver_to_gold.partition_uris", side_effect=fake_uris),
             patch("silver_to_gold.gold_hour_lock", return_value=contextlib.nullcontext()),
+            patch("silver_to_gold.delete_s3_object"),
             patch(
                 "silver_to_gold.publish_tables",
                 side_effect=lambda con, tables, uris: {t: 1 for t in tables},
