@@ -2,8 +2,10 @@ import argparse
 import json
 import logging
 import os
+import os
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -19,6 +21,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 load_dotenv()
+
+
+class SilverHourLockedError(RuntimeError):
+    """Raised when another process is publishing this Silver hour."""
+
+
+@contextmanager
+def silver_hour_lock(date_str: str, hour_str: str, s3_client=None):
+    """Fail-closed lock preventing overlapping Silver publication for one hour."""
+    client = s3_client or _s3_client()
+    key = f"_locks/vehicle_positions/date={date_str}/hour={hour_str}/writer.json"
+    token = uuid.uuid4().hex
+    try:
+        client.put_object(
+            Bucket="silver",
+            Key=key,
+            Body=json.dumps({"token": token}).encode("utf-8"),
+            IfNoneMatch="*",
+        )
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = exc.response.get("Error", {}).get("Code")
+        if status in (409, 412) or code in ("PreconditionFailed", "ConditionalRequestConflict"):
+            raise SilverHourLockedError(
+                f"Silver hour {date_str} {hour_str} is already being published; "
+                "retry after the active writer finishes."
+            ) from exc
+        raise
+
+    try:
+        yield
+    finally:
+        response = client.get_object(Bucket="silver", Key=key)
+        current = json.loads(response["Body"].read())
+        if current.get("token") != token:
+            raise RuntimeError(
+                f"Silver lock ownership changed for {date_str} hour {hour_str}; "
+                "refusing to remove another writer's lock."
+            )
+        client.delete_object(Bucket="silver", Key=key)
+
 
 EXPECTED_SILVER_COLUMNS = [
     "vehicle_type",
@@ -544,24 +587,27 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
                 "refusing to publish."
             )
 
-        # A marker certifies the current Silver + quarantine objects. Remove
-        # the previous marker before replacing either object, then write a fresh
-        # marker only after completeness assessment succeeds.
-        delete_s3_object(f"{silver_dir}/_completeness.json")
-        copy_s3_object(rejected_temp_file, rejected_file)
-        copy_s3_object(temp_file, output_file)
-        completeness = assess_completeness(date_str, hour_str)
-        write_completeness_marker(completeness, silver_dir)
-        if completeness["status"] != "complete":
-            logger.warning(
-                "%s hour %s Silver completeness is %s: %s/%s ingestion cycles had "
-                "both bus and tram data; business metrics may be understated.",
-                date_str,
-                hour_str,
-                completeness["status"],
-                completeness["complete_cycles"],
-                completeness["cycles"],
-            )
+        # Serialize the commit phase so concurrent regular/late-data runs cannot
+        # interleave quarantine, Silver and completeness-marker writes.
+        with silver_hour_lock(date_str, hour_str):
+            # A marker certifies the current Silver + quarantine objects. Remove
+            # the previous marker before replacing either object, then write a fresh
+            # marker only after completeness assessment succeeds.
+            delete_s3_object(f"{silver_dir}/_completeness.json")
+            copy_s3_object(rejected_temp_file, rejected_file)
+            copy_s3_object(temp_file, output_file)
+            completeness = assess_completeness(date_str, hour_str)
+            write_completeness_marker(completeness, silver_dir)
+            if completeness["status"] != "complete":
+                logger.warning(
+                    "%s hour %s Silver completeness is %s: %s/%s ingestion cycles had "
+                    "both bus and tram data; business metrics may be understated.",
+                    date_str,
+                    hour_str,
+                    completeness["status"],
+                    completeness["complete_cycles"],
+                    completeness["cycles"],
+                )
     finally:
         for temp_path in (temp_file, rejected_temp_file):
             try:
