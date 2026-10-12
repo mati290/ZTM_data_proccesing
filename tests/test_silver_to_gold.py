@@ -367,6 +367,8 @@ class LocalPipelineTestCase(unittest.TestCase):
         self.con.execute("SET TimeZone='UTC'")
         self.addCleanup(self.con.close)
         self.status = "complete"
+        self.copy_calls = 0
+        self.fail_copy_on = None
 
     def write_quarantine(self, reasons):
         values = ", ".join(f"('{r}')" for r in reasons)
@@ -391,8 +393,10 @@ class LocalPipelineTestCase(unittest.TestCase):
             },
         }
 
-    @staticmethod
-    def fake_copy(src, dst):
+    def fake_copy(self, src, dst):
+        self.copy_calls += 1
+        if self.fail_copy_on == self.copy_calls:
+            raise OSError("forced Gold object copy failure")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(src, dst)
 
@@ -575,6 +579,25 @@ class GoldProcessTests(LocalPipelineTestCase):
             self.build(validate=boom)
         for table in gold.GOLD_TABLES:
             self.assertEqual(self.read_gold(table), before[table], table)
+
+    def test_copy_failure_during_rerun_removes_commit_marker(self):
+        self.build()
+        quality_path = (
+            f"{self.root}/gold/hourly_data_quality/date=2026-01-15/hour=12/data.parquet"
+        )
+        self.assertTrue(os.path.exists(quality_path))
+
+        self.silver = make_silver(
+            self.tmp.name, SILVER_SQL.replace("('tram', '2000'", "('tram', '2001'")
+        )
+        self.copy_calls = 0
+        self.fail_copy_on = 2
+        with self.assertRaisesRegex(OSError, "forced Gold object copy failure"):
+            self.build()
+
+        # The data files may now span generations, but consumers can detect that
+        # the hour is not committed because its quality marker is absent.
+        self.assertFalse(os.path.exists(quality_path))
 
 
 class GoldSilverContractTests(LocalPipelineTestCase):
