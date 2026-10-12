@@ -85,6 +85,7 @@ def gold_hour_lock(date_str: str, hour_str: str, s3_client=None):
             )
         client.delete_object(Bucket="gold", Key=key, IfMatch=response["ETag"])
 
+
 COMPLETENESS_STATUSES = ("complete", "incomplete", "unknown")
 VEHICLE_TYPES = ("bus", "tram")
 
