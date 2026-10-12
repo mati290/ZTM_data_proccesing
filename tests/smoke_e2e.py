@@ -123,8 +123,7 @@ def main():
     finally:
         con.close()
         for bucket, prefix in (
-            ("silver", f"_locks/vehicle_positions/date={DATE}/hour={HOUR}/"),
-            ("gold", f"_locks/gold/date={DATE}/hour={HOUR}/"),
+            ("silver", f"_locks/pipeline/date={DATE}/hour={HOUR}/"),
             ("bronze", f"vehicle_type=bus/date={DATE}/"),
             ("silver", f"vehicle_positions/date={DATE}/"),
             ("silver", f"quarantine/vehicle_positions/date={DATE}/"),
