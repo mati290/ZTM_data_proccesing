@@ -2,7 +2,6 @@ import argparse
 import json
 import logging
 import os
-import os
 import time
 import uuid
 from contextlib import contextmanager
