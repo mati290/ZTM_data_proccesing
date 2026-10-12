@@ -303,12 +303,76 @@ class TransformHourTests(unittest.TestCase):
             "s3://silver/quarantine/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
         )
         delete_mock.assert_any_call(source)
-        self.assertEqual(delete_mock.call_count, 2)
+        self.assertEqual(delete_mock.call_count, 3)
+        self.assertIn(
+            call("s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json"),
+            delete_mock.call_args_list,
+        )
+        self.assertLess(
+            [c.args[1] for c in copy_mock.call_args_list].index(
+                "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet"
+            ),
+            3,
+        )
         self.assess_mock.assert_called_once_with("2026-10-09", "07")
         self.write_marker_mock.assert_called_once_with(
             self.completeness,
             "s3://silver/vehicle_positions/date=2026-10-09/hour=07",
         )
+
+
+    def test_marker_is_invalidated_before_any_published_object_copy(self):
+        connection = self._happy_path_connection()
+        events = []
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch(
+                "bronze_to_silver.delete_s3_object",
+                side_effect=lambda uri: events.append(("delete", uri)),
+            ),
+            patch(
+                "bronze_to_silver.copy_s3_object",
+                side_effect=lambda src, dst: events.append(("copy", dst)),
+            ),
+            patch(
+                "bronze_to_silver.assess_completeness",
+                side_effect=lambda *args: events.append(("assess", args)) or self.completeness,
+            ),
+            patch(
+                "bronze_to_silver.write_completeness_marker",
+                side_effect=lambda *args: events.append(("marker", args)),
+            ),
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+
+        marker_delete = events.index(
+            ("delete", "s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json")
+        )
+        first_copy = next(i for i, event in enumerate(events) if event[0] == "copy")
+        assess = next(i for i, event in enumerate(events) if event[0] == "assess")
+        marker_write = next(i for i, event in enumerate(events) if event[0] == "marker")
+        self.assertLess(marker_delete, first_copy)
+        self.assertLess(first_copy, assess)
+        self.assertLess(assess, marker_write)
+
+    def test_assessment_failure_leaves_previous_marker_invalidated(self):
+        connection = self._happy_path_connection()
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.copy_s3_object"),
+            patch("bronze_to_silver.delete_s3_object") as delete_mock,
+            patch(
+                "bronze_to_silver.assess_completeness",
+                side_effect=RuntimeError("manifest listing failed"),
+            ),
+            patch("bronze_to_silver.write_completeness_marker") as marker_mock,
+            self.assertRaisesRegex(RuntimeError, "manifest listing failed"),
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+        delete_mock.assert_any_call(
+            "s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json"
+        )
+        marker_mock.assert_not_called()
 
     def test_warns_and_still_publishes_when_hour_is_incomplete(self):
         self.assess_mock.return_value = {
