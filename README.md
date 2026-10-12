@@ -183,6 +183,12 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
   `is_hour_complete(date, hour)` (in `bronze_to_silver.py`) is true; a missing
   marker is treated as `unknown`, i.e. not complete. Incomplete hours should be
   excluded or flagged in the UI.
+- Publication concurrency: Silver and Gold use per-hour conditional S3 lock
+  objects, so regular and late-data runs cannot interleave writes for the same
+  hour. A lock is intentionally fail-closed (no automatic lease stealing). If a
+  worker is terminated while holding a lock, first verify that no writer is still
+  running, then remove the corresponding `_locks/...` object from MinIO before
+  retrying. Do not delete a lock to "unstick" a still-running task.
 - Late data: closed hours of the last 24 h are recomputed by the
   `reprocess_late_data_hourly` DAG (`late_data.py`) when Bronze objects are
   newer than the Silver partition, which also repairs gaps. Partitions are
