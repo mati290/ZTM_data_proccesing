@@ -169,7 +169,11 @@ def write_cycle_manifest(s3, bus_count, tram_count, failed_sources, empty_source
             Bucket="bronze", Key=key, Body=json.dumps(manifest).encode("utf-8")
         )
     except (BotoCoreError, ClientError) as error:
-        logger.warning("Could not write cycle manifest: %s", _safe_error_summary(error))
+        logger.error(
+            "Could not write cycle manifest: %s",
+            _safe_error_summary(error),
+        )
+        raise
 
 
 def run_once(api_key, s3):

@@ -1,4 +1,4 @@
-import json
+﻿import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, call, patch
@@ -174,6 +174,33 @@ class SaveToBronzeTests(unittest.TestCase):
         manifest = json.loads(manifest_call.kwargs["Body"])
         self.assertEqual(manifest["status"], "partial")
         self.assertEqual(manifest["failed_sources"], ["tram"])
+
+
+    def test_run_once_raises_when_cycle_manifest_write_fails(self):
+        s3 = Mock()
+        s3.put_object.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InternalError",
+                    "Message": "manifest write failed",
+                }
+            },
+            "PutObject",
+        )
+
+        with (
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[
+                    [{"VehicleNumber": "1"}],
+                    [{"VehicleNumber": "2"}],
+                ],
+            ),
+            patch("ingest.save_to_bronze"),
+            self.assertRaises(ClientError),
+        ):
+            run_once("test-key", s3)
+
 
     def test_run_once_manifest_marks_complete_cycle(self):
         s3 = Mock()
