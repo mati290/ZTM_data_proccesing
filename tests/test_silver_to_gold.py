@@ -351,7 +351,8 @@ class GoldHourLockTests(unittest.TestCase):
     def test_lock_uses_conditional_create_and_releases_owned_lock(self):
         client = Mock()
         client.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=b'{"token": "same-token"}'))
+            "Body": Mock(read=Mock(return_value=b'{"token": "same-token"}')),
+            "ETag": '"gold-etag"',
         }
         with patch("silver_to_gold.uuid.uuid4") as uuid4:
             uuid4.return_value.hex = "same-token"
@@ -364,6 +365,7 @@ class GoldHourLockTests(unittest.TestCase):
         client.delete_object.assert_called_once_with(
             Bucket="gold",
             Key="_locks/gold/date=2026-10-09/hour=07/writer.json",
+            IfMatch='"gold-etag"',
         )
 
     def test_lock_collision_fails_closed_without_deleting_existing_lock(self):
@@ -384,7 +386,8 @@ class GoldHourLockTests(unittest.TestCase):
     def test_lock_refuses_to_release_when_ownership_changed(self):
         client = Mock()
         client.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=b'{"token": "someone-else"}'))
+            "Body": Mock(read=Mock(return_value=b'{"token": "someone-else"}')),
+            "ETag": '"other-etag"',
         }
         with patch("silver_to_gold.uuid.uuid4") as uuid4:
             uuid4.return_value.hex = "our-token"
