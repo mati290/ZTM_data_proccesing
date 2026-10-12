@@ -168,7 +168,7 @@ class SaveToBronzeTests(unittest.TestCase):
                 "empty_sources": [],
             },
         )
-        save_mock.assert_called_once_with(s3, bus_records, "bus")
+        save_mock.assert_called_once_with(s3, bus_records, "bus", ingested_at=unittest.mock.ANY)
         manifest_call = s3.put_object.call_args
         self.assertTrue(manifest_call.kwargs["Key"].startswith("_manifests/"))
         manifest = json.loads(manifest_call.kwargs["Body"])
@@ -188,6 +188,28 @@ class SaveToBronzeTests(unittest.TestCase):
 
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
         self.assertEqual(manifest["status"], "complete")
+
+    def test_run_once_uses_one_hour_partition_for_cycle_data_and_manifest(self):
+        s3 = Mock()
+        cycle_time = datetime(2026, 10, 12, 13, 0, tzinfo=timezone.utc)
+        with (
+            patch("ingest.datetime") as mocked_datetime,
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]],
+            ),
+            patch("ingest.save_to_bronze") as save_mock,
+        ):
+            mocked_datetime.now.return_value = cycle_time
+            run_once("test-key", s3)
+
+        self.assertEqual(save_mock.call_count, 2)
+        for call_args in save_mock.call_args_list:
+            self.assertEqual(call_args.kwargs["ingested_at"], cycle_time)
+        manifest_call = s3.put_object.call_args.kwargs
+        self.assertIn("_manifests/date=2026-10-12/hour=13/", manifest_call["Key"])
+        manifest = json.loads(manifest_call["Body"])
+        self.assertEqual(manifest["ingested_at"], cycle_time.isoformat())
 
     def test_main_alerts_after_consecutive_degraded_cycles(self):
         degraded = {
