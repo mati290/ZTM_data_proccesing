@@ -265,7 +265,8 @@ class TransformHourTests(unittest.TestCase):
     def test_silver_lock_uses_conditional_create_and_releases_owned_lock(self):
         client = Mock()
         client.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=b'{"token": "silver-token"}'))
+            "Body": Mock(read=Mock(return_value=b'{"token": "silver-token"}')),
+            "ETag": '"silver-etag"',
         }
         with patch("bronze_to_silver.uuid.uuid4") as uuid4:
             uuid4.return_value.hex = "silver-token"
@@ -275,6 +276,7 @@ class TransformHourTests(unittest.TestCase):
         client.delete_object.assert_called_once_with(
             Bucket="silver",
             Key="_locks/vehicle_positions/date=2026-10-09/hour=07/writer.json",
+            IfMatch='"silver-etag"',
         )
 
     def test_silver_lock_collision_fails_closed(self):
