@@ -261,7 +261,6 @@ class TransformHourTests(unittest.TestCase):
         ]
         return connection
 
-
     def test_silver_lock_uses_conditional_create_and_releases_owned_lock(self):
         client = Mock()
         client.get_object.return_value = {
