@@ -4,7 +4,9 @@ import shutil
 import tempfile
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from botocore.exceptions import ClientError
 
 import duckdb
 
@@ -293,6 +295,7 @@ class BuildGoldHourTests(unittest.TestCase):
                 side_effect=lambda uri: silver and "quarantine" not in uri,
             ),
             patch("silver_to_gold.partition_uris", side_effect=fake_uris),
+            patch("silver_to_gold.gold_hour_lock", return_value=contextlib.nullcontext()),
             patch(
                 "silver_to_gold.publish_tables",
                 side_effect=lambda con, tables, uris: {t: 1 for t in tables},
@@ -340,6 +343,54 @@ class BuildGoldHourTests(unittest.TestCase):
     def test_invalid_partition_is_rejected(self):
         with self.assertRaises(ValueError):
             gold.build_gold_hour(self.con, "bad", "12")
+
+
+
+class GoldHourLockTests(unittest.TestCase):
+    def test_lock_uses_conditional_create_and_releases_owned_lock(self):
+        client = Mock()
+        client.get_object.return_value = {
+            "Body": Mock(read=Mock(return_value=b'{"token": "same-token"}'))
+        }
+        with patch("silver_to_gold.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = "same-token"
+            with gold.gold_hour_lock("2026-10-09", "07", client):
+                pass
+
+        client.put_object.assert_called_once()
+        self.assertEqual(client.put_object.call_args.kwargs["IfNoneMatch"], "*")
+        self.assertEqual(client.put_object.call_args.kwargs["Bucket"], "gold")
+        client.delete_object.assert_called_once_with(
+            Bucket="gold",
+            Key="_locks/gold/date=2026-10-09/hour=07/writer.json",
+        )
+
+    def test_lock_collision_fails_closed_without_deleting_existing_lock(self):
+        client = Mock()
+        client.put_object.side_effect = ClientError(
+            {
+                "Error": {"Code": "PreconditionFailed"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            "PutObject",
+        )
+        with self.assertRaises(gold.GoldHourLockedError):
+            with gold.gold_hour_lock("2026-10-09", "07", client):
+                self.fail("must not enter while another writer owns the hour")
+        client.delete_object.assert_not_called()
+        client.get_object.assert_not_called()
+
+    def test_lock_refuses_to_release_when_ownership_changed(self):
+        client = Mock()
+        client.get_object.return_value = {
+            "Body": Mock(read=Mock(return_value=b'{"token": "someone-else"}'))
+        }
+        with patch("silver_to_gold.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = "our-token"
+            with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+                with gold.gold_hour_lock("2026-10-09", "07", client):
+                    pass
+        client.delete_object.assert_not_called()
 
 
 class PublishTests(unittest.TestCase):
@@ -412,6 +463,7 @@ class LocalPipelineTestCase(unittest.TestCase):
             patch("silver_to_gold.read_completeness_marker", return_value=marker),
             patch("silver_to_gold.s3_object_exists", side_effect=os.path.exists),
             patch("silver_to_gold.partition_uris", side_effect=self.local_uris),
+            patch("silver_to_gold.gold_hour_lock", return_value=contextlib.nullcontext()),
             patch("silver_to_gold.copy_s3_object", side_effect=self.fake_copy),
             patch("silver_to_gold.delete_s3_object", side_effect=self.fake_delete),
         ]
