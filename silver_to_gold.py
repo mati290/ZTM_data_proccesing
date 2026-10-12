@@ -63,7 +63,10 @@ def gold_hour_lock(date_str: str, hour_str: str, s3_client=None):
     except ClientError as exc:
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         code = exc.response.get("Error", {}).get("Code")
-        if status in (409, 412) or code in ("PreconditionFailed", "ConditionalRequestConflict"):
+        if status in (409, 412) or code in (
+            "PreconditionFailed",
+            "ConditionalRequestConflict",
+        ):
             raise GoldHourLockedError(
                 f"Gold hour {date_str} {hour_str} is already being published; "
                 "retry after the active writer finishes."
