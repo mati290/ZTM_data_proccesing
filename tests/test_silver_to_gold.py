@@ -294,7 +294,10 @@ class BuildGoldHourTests(unittest.TestCase):
                 side_effect=lambda uri: silver and "quarantine" not in uri,
             ),
             patch("silver_to_gold.partition_uris", side_effect=fake_uris),
-            patch("silver_to_gold.gold_hour_lock", return_value=contextlib.nullcontext()),
+            patch(
+                "silver_to_gold.gold_hour_lock",
+                return_value=contextlib.nullcontext(),
+            ),
             patch("silver_to_gold.delete_s3_object"),
             patch(
                 "silver_to_gold.publish_tables",
