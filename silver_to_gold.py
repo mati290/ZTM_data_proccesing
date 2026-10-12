@@ -4,6 +4,7 @@ Contract: docs/gold-data-contract.md
 """
 
 import argparse
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,8 @@ import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 
 from bronze_to_silver import (
+    _parse_s3_uri,
+    _s3_client,
     copy_s3_object,
     delete_s3_object,
     get_connection,
@@ -29,8 +32,9 @@ VEHICLE_TYPES = ("bus", "tram")
 TSTZ = "TIMESTAMP WITH TIME ZONE"
 REASON_LIST = "STRUCT(reason VARCHAR, records BIGINT)[]"
 
-# Publication order matters: the quality row is written last and acts as the
-# commit record for the hour (see docs/gold-data-contract.md).
+# GOLD_TABLES defines the complete set of tables in a Gold publication.
+# The commit manifest is written only after all tables are staged, validated,
+# and copied to versioned paths (see docs/gold-data-contract.md).
 GOLD_TABLES = (
     "vehicle_activity_hourly",
     "hourly_line_metrics",
@@ -138,23 +142,49 @@ class SilverDataMissingError(FileNotFoundError):
     """Raised when the Silver partition for the hour does not exist."""
 
 
+
 def partition_uris(date_str: str, hour_str: str) -> dict:
     partition = f"date={date_str}/hour={hour_str}"
-    token = uuid.uuid4().hex
+    publication_id = uuid.uuid4().hex
+
     return {
         "silver": f"s3://silver/vehicle_positions/{partition}/data.parquet",
         "quarantine": (
             f"s3://silver/quarantine/vehicle_positions/{partition}/data.parquet"
         ),
         "gold": {
-            table: f"s3://gold/{table}/{partition}/data.parquet"
+            table: (
+                f"s3://gold/_versions/{partition}/{publication_id}/"
+                f"{table}/data.parquet"
+            )
             for table in GOLD_TABLES
         },
         "staging": {
-            table: f"s3://gold/_staging/{partition}/{table}_{token}.parquet.pending"
+            table: (
+                f"s3://gold/_staging/{partition}/{publication_id}/"
+                f"{table}.parquet.pending"
+            )
             for table in GOLD_TABLES
         },
+        "publication_id": publication_id,
+        "partition": partition,
+        "manifest_uri": publication_manifest_uri(date_str, hour_str),
     }
+
+def publication_manifest_uri(date_str: str, hour_str: str) -> str:
+    partition = f"date={date_str}/hour={hour_str}"
+    return f"s3://gold/_commits/{partition}/manifest.json"
+
+
+def write_publication_manifest(manifest_uri: str, manifest: dict) -> None:
+    """Atomically replace the single S3 commit manifest."""
+    bucket, key = _parse_s3_uri(manifest_uri)
+    _s3_client().put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
 
 
 def _non_negative_int(marker: dict, field: str):
@@ -540,22 +570,43 @@ def validate_staged_file(con, table: str, staged_uri: str, expected_rows: int):
 
 
 def publish_tables(con, tables, uris: dict) -> dict:
-    """Stage, validate and then atomically publish each table (one object each)."""
+    """Stage and validate all files before committing a complete Gold publication."""
     staging = uris["staging"]
     row_counts = {}
+
     try:
+        # 1. Write every table to staging and validate it before publishing.
         for table in tables:
             order = ", ".join(GOLD_KEYS[table])
-            row_counts[table] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
-                0
-            ]
+            row_counts[table] = con.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+
             con.execute(
                 f"COPY (SELECT * FROM {table} ORDER BY {order}) "
                 f"TO '{staging[table]}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
             )
             validate_staged_file(con, table, staging[table], row_counts[table])
+
+        # 2. Copy validated files to unique, versioned destinations.
         for table in tables:
             copy_s3_object(staging[table], uris["gold"][table])
+
+        # 3. Commit only a complete publication.
+        if tuple(tables) == GOLD_TABLES:
+            manifest = {
+                "publication_id": uris["publication_id"],
+                "partition": uris["partition"],
+                "tables": {
+                    table: {
+                        "uri": uris["gold"][table],
+                        "rows": row_counts[table],
+                    }
+                    for table in tables
+                },
+            }
+            write_publication_manifest(uris["manifest_uri"], manifest)
+
     finally:
         for table in tables:
             try:
@@ -566,6 +617,7 @@ def publish_tables(con, tables, uris: dict) -> dict:
                     staging[table],
                     exc,
                 )
+
     return row_counts
 
 

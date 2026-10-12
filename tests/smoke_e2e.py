@@ -72,22 +72,32 @@ def main():
         assert json.loads(marker["Body"].read())["status"] == "unknown"
 
         import silver_to_gold
+        manifest_key = (
+            f"_commits/date={DATE}/hour={HOUR}/manifest.json"
+        )
 
         def gold_state():
+            manifest_obj = s3.get_object(
+                Bucket="gold",
+                Key=manifest_key,
+            )
+            manifest = json.loads(manifest_obj["Body"].read())
+
             out = {}
             for table in silver_to_gold.GOLD_TABLES:
-                uri = f"s3://gold/{table}/date={DATE}/hour={HOUR}/data.parquet"
+                uri = manifest["tables"][table]["uri"]
                 cols = [
                     r[0]
                     for r in con.execute(
-                        f"DESCRIBE SELECT * FROM read_parquet('{uri}', hive_partitioning=false)"
+                        f"DESCRIBE SELECT * FROM read_parquet("
+                        f"'{uri}', hive_partitioning=false)"
                     ).fetchall()
                     if r[0] != "pipeline_run_at"
                 ]
                 sel = ", ".join(f'"{c}"' for c in cols)
                 out[table] = con.execute(
-                    f"SELECT {sel} FROM read_parquet('{uri}', hive_partitioning=false)"
-                    f" ORDER BY ALL"
+                    f"SELECT {sel} FROM read_parquet("
+                    f"'{uri}', hive_partitioning=false) ORDER BY ALL"
                 ).fetchall()
             return out
 
@@ -95,12 +105,18 @@ def main():
         first = gold_state()
         silver_to_gold.build_gold_hour(con, DATE, HOUR)
         assert gold_state() == first, "Gold rebuild is not idempotent"
+        manifest_obj = s3.get_object(
+            Bucket="gold",
+            Key=manifest_key,
+        )
+        manifest = json.loads(manifest_obj["Body"].read())
+        quality_path = manifest["tables"]["hourly_data_quality"]["uri"]
+
         quality = con.execute(
             "SELECT bronze_records, duplicate_records, safe_for_dashboard,"
             " data_completeness_status FROM read_parquet("
-            f"'s3://gold/hourly_data_quality/date={DATE}/hour={HOUR}/data.parquet',"
-            " hive_partitioning=false)"
-        ).fetchone()
+            f"'{quality_path}', hive_partitioning=false)"
+            ).fetchone()
         assert quality == (4, 1, False, "unknown"), quality
         vehicles = first["vehicle_activity_hourly"]
         assert len(vehicles) == 1, vehicles
@@ -110,21 +126,21 @@ def main():
             ("bronze", f"vehicle_type=bus/date={DATE}/"),
             ("silver", f"vehicle_positions/date={DATE}/"),
             ("silver", f"quarantine/vehicle_positions/date={DATE}/"),
-            *(
-                ("gold", f"{table}/date={DATE}/")
-                for table in (
-                    "vehicle_activity_hourly",
-                    "hourly_line_metrics",
-                    "hourly_network_metrics",
-                    "hourly_data_quality",
-                )
-            ),
+            ("gold", f"_versions/date={DATE}/hour={HOUR}/"),
+            ("gold", f"_staging/date={DATE}/hour={HOUR}/"),
+            ("gold", f"_commits/date={DATE}/hour={HOUR}/"),
         ):
-            listing = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-            for obj in listing.get("Contents", []):
-                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
+                Bucket=bucket,
+                Prefix=prefix,
+            ):
+                for obj in page.get("Contents", []):
+                    s3.delete_object(
+                        Bucket=bucket,
+                        Key=obj["Key"],
+                    )
     print("SMOKE OK")
-
 
 if __name__ == "__main__":
     main()
