@@ -168,7 +168,9 @@ class SaveToBronzeTests(unittest.TestCase):
                 "empty_sources": [],
             },
         )
-        save_mock.assert_called_once_with(s3, bus_records, "bus", ingested_at=unittest.mock.ANY)
+        save_mock.assert_called_once_with(
+            s3, bus_records, "bus", ingested_at=unittest.mock.ANY
+        )
         manifest_call = s3.put_object.call_args
         self.assertTrue(manifest_call.kwargs["Key"].startswith("_manifests/"))
         manifest = json.loads(manifest_call.kwargs["Body"])
