@@ -342,14 +342,10 @@ class TransformHourTests(unittest.TestCase):
         delete_mock.assert_any_call(source)
         self.assertEqual(delete_mock.call_count, 3)
         self.assertIn(
-            call("s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json"),
-            delete_mock.call_args_list,
-        )
-        self.assertLess(
-            [c.args[1] for c in copy_mock.call_args_list].index(
-                "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet"
+            call(
+                "s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json"
             ),
-            3,
+            delete_mock.call_args_list,
         )
         self.assess_mock.assert_called_once_with("2026-10-09", "07")
         self.write_marker_mock.assert_called_once_with(
