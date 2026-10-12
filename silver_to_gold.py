@@ -46,16 +46,16 @@ def _gold_s3_client():
 def gold_hour_lock(date_str: str, hour_str: str, s3_client=None):
     """Acquire a fail-closed, per-hour S3 lock using conditional object creation.
 
-    The lock deliberately has no automatic lease expiry: stealing an expired lock
-    without a compare-and-swap primitive can allow two writers. If a worker dies,
-    an operator must verify it is stopped before removing the lock object.
+    Silver and Gold share this lock namespace, so a Silver commit cannot interleave
+    with a Gold build. The lock deliberately has no automatic lease expiry: if a
+    worker dies, verify it is stopped before removing the lock object.
     """
     client = s3_client or _gold_s3_client()
-    key = f"_locks/gold/date={date_str}/hour={hour_str}/writer.json"
+    key = f"_locks/pipeline/date={date_str}/hour={hour_str}/writer.json"
     token = uuid.uuid4().hex
     try:
         client.put_object(
-            Bucket="gold",
+            Bucket="silver",
             Key=key,
             Body=json.dumps({"token": token}).encode("utf-8"),
             IfNoneMatch="*",
@@ -76,14 +76,14 @@ def gold_hour_lock(date_str: str, hour_str: str, s3_client=None):
     try:
         yield
     finally:
-        response = client.get_object(Bucket="gold", Key=key)
+        response = client.get_object(Bucket="silver", Key=key)
         current = json.loads(response["Body"].read())
         if current.get("token") != token:
             raise RuntimeError(
                 f"Gold lock ownership changed for {date_str} hour {hour_str}; "
                 "refusing to remove another writer's lock."
             )
-        client.delete_object(Bucket="gold", Key=key, IfMatch=response["ETag"])
+        client.delete_object(Bucket="silver", Key=key, IfMatch=response["ETag"])
 
 
 COMPLETENESS_STATUSES = ("complete", "incomplete", "unknown")
