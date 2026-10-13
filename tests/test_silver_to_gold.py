@@ -295,6 +295,7 @@ class BuildGoldHourTests(unittest.TestCase):
 
         with (
             patch("silver_to_gold.read_completeness_marker", return_value=marker),
+            patch("silver_to_gold.write_diagnostic_manifest"),
             patch(
                 "silver_to_gold.s3_object_exists",
                 side_effect=lambda uri: silver and "quarantine" not in uri,

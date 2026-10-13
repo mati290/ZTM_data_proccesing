@@ -1,4 +1,3 @@
-
 import logging
 import os
 import sys
@@ -44,14 +43,12 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
         if age_seconds > max_age_seconds:
             return (
                 False,
-                f"Latest Bronze manifest is stale: age={age_seconds:.0f}s "
-                f"limit={max_age_seconds}s",
+                f"Latest Bronze manifest is stale: age={age_seconds:.0f}s limit={max_age_seconds}s",
             )
 
         return (
             True,
-            f"Latest Bronze manifest is fresh: age={age_seconds:.0f}s "
-            f"limit={max_age_seconds}s",
+            f"Latest Bronze manifest is fresh: age={age_seconds:.0f}s limit={max_age_seconds}s",
         )
     except (BotoCoreError, ClientError, KeyError, TypeError, ValueError) as error:
         logger.error("Ingestion health check failed: %s", type(error).__name__)
@@ -85,7 +82,7 @@ def main():
     )
 
     healthy, message = check_ingestion_health(s3, max_age_seconds)
-    print(f'{"HEALTHY" if healthy else "UNHEALTHY"}: {message}')
+    print(f"{'HEALTHY' if healthy else 'UNHEALTHY'}: {message}")
     return 0 if healthy else 1
 
 
