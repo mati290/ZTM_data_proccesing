@@ -175,8 +175,24 @@ def publication_manifest_uri(date_str: str, hour_str: str) -> str:
     return f"s3://gold/_commits/{partition}/manifest.json"
 
 
+def diagnostic_manifest_uri(date_str: str, hour_str: str) -> str:
+    partition = f"date={date_str}/hour={hour_str}"
+    return f"s3://gold/_diagnostics/{partition}/manifest.json"
+
+
 def write_publication_manifest(manifest_uri: str, manifest: dict) -> None:
     """Atomically replace the single S3 commit manifest."""
+    bucket, key = _parse_s3_uri(manifest_uri)
+    _s3_client().put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def write_diagnostic_manifest(manifest_uri: str, manifest: dict) -> None:
+    """Write a diagnostic manifest without replacing the full Gold commit."""
     bucket, key = _parse_s3_uri(manifest_uri)
     _s3_client().put_object(
         Bucket=bucket,
@@ -645,8 +661,25 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     )
 
     if not silver_rows:
-        # Still record the gap so dashboards can tell "no data" from "no activity".
-        publish_tables(con, ("hourly_data_quality",), uris)
+        # Publish diagnostics separately; never replace the full Gold commit.
+        diagnostic_tables = ("hourly_data_quality",)
+        row_counts = publish_tables(con, diagnostic_tables, uris)
+        diagnostic_manifest = {
+            "publication_id": uris["publication_id"],
+            "partition": uris["partition"],
+            "status": "silver_empty" if silver_present else "silver_missing",
+            "tables": {
+                table: {
+                    "uri": uris["gold"][table],
+                    "rows": row_counts[table],
+                }
+                for table in diagnostic_tables
+            },
+        }
+        write_diagnostic_manifest(
+            diagnostic_manifest_uri(date_str, hour_str),
+            diagnostic_manifest,
+        )
         if silver_present:
             raise ValueError(
                 f"Silver partition is empty for {date_str} hour {hour_str}"

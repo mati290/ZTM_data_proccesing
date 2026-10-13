@@ -440,7 +440,8 @@ class LocalPipelineTestCase(unittest.TestCase):
 
         manifest_uri = f"{self.root}/gold/_commits/{partition}/manifest.json"
         os.makedirs(os.path.dirname(manifest_uri), exist_ok=True)
-
+        diagnostic_uri = f"{self.root}/gold/_diagnostics/{partition}/manifest.json"
+        os.makedirs(os.path.dirname(diagnostic_uri), exist_ok=True)
         return {
             "silver": self.silver,
             "quarantine": self.quarantine,
@@ -449,6 +450,7 @@ class LocalPipelineTestCase(unittest.TestCase):
             "publication_id": publication_id,
             "partition": partition,
             "manifest_uri": manifest_uri,
+            "diagnostic_manifest_uri": diagnostic_uri,
         }
 
     @staticmethod
@@ -469,6 +471,21 @@ class LocalPipelineTestCase(unittest.TestCase):
                 patch(
                     "silver_to_gold.write_publication_manifest",
                     side_effect=manifest_fn or self.write_local_manifest,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "silver_to_gold.diagnostic_manifest_uri",
+                    side_effect=lambda date_str, hour_str: (
+                        f"{self.root}/gold/_diagnostics/"
+                        f"date={date_str}/hour={hour_str}/manifest.json"
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "silver_to_gold.write_diagnostic_manifest",
+                    side_effect=self.write_local_manifest,
                 )
             )
             stack.enter_context(
@@ -594,6 +611,49 @@ class GoldProcessTests(LocalPipelineTestCase):
 
         self.assertEqual(current_manifest, previous_manifest)
         self.assertEqual(set(current_manifest["tables"]), set(gold.GOLD_TABLES))
+
+        diagnostic_uri = (
+            f"{self.root}/gold/_diagnostics/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(diagnostic_uri, "r", encoding="utf-8") as file:
+            diagnostic_manifest = json.load(file)
+
+        self.assertEqual(diagnostic_manifest["status"], "silver_missing")
+        self.assertEqual(
+            set(diagnostic_manifest["tables"]),
+            {"hourly_data_quality"},
+        )
+
+    def test_empty_silver_writes_diagnostic_manifest(self):
+        self.build()
+
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            previous_manifest = json.load(file)
+
+        self.silver = make_silver(self.tmp.name, SILVER_SQL + " LIMIT 0")
+
+        with self.assertRaisesRegex(ValueError, "empty"):
+            self.build()
+
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            current_manifest = json.load(file)
+
+        self.assertEqual(current_manifest, previous_manifest)
+
+        diagnostic_uri = (
+            f"{self.root}/gold/_diagnostics/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(diagnostic_uri, "r", encoding="utf-8") as file:
+            diagnostic_manifest = json.load(file)
+
+        self.assertEqual(diagnostic_manifest["status"], "silver_empty")
+        self.assertEqual(
+            set(diagnostic_manifest["tables"]),
+            {"hourly_data_quality"},
+        )
 
     def test_hour_is_not_final_during_grace_period(self):
         self.build(run_at=datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
