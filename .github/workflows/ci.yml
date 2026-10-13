@@ -28,10 +28,10 @@ jobs:
           pip install ruff==0.16.10
 
       - name: Check lint
-        run: ruff check ingest.py bronze_to_silver.py silver_to_gold.py dags tests analysis
+        run: ruff check .
 
       - name: Check formatting
-        run: ruff format --check ingest.py bronze_to_silver.py silver_to_gold.py dags tests analysis
+        run: ruff format --check .
 
       - name: Run tests
         run: python -B -m unittest discover -s tests -v
@@ -62,6 +62,8 @@ jobs:
         run: |
           docker compose run --rm --no-deps airflow airflow dags list --local | tee dags.txt
           grep -q "bronze_to_silver_hourly" dags.txt
+          grep -q "silver_to_gold_hourly" dags.txt
+          grep -q "reprocess_late_data_hourly" dags.txt
 
       - name: Verify the Airflow image includes transformation dependencies
         run: docker compose run --rm --no-deps airflow python -c "import bronze_to_silver, silver_to_gold"
