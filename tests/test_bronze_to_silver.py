@@ -24,10 +24,12 @@ from bronze_to_silver import (
     main,
     parse_s3_endpoint,
     read_completeness_marker,
+    resolve_silver_artifacts,
     s3_object_exists,
     transform_hour,
     validate_partition,
     validate_silver_schema,
+    write_silver_active_manifest,
 )
 
 
@@ -39,6 +41,7 @@ class CompletenessTests(unittest.TestCase):
             {"Contents": [{"Key": key}]} if key else {} for key in first_keys
         ]
         return client
+
 
     @staticmethod
     def _marker_client(status=None, error_code=None):
@@ -53,6 +56,230 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
+
+    def test_write_silver_active_manifest_publishes_pointer(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        artifacts = {
+            "data": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/data.parquet"
+            ),
+            "quarantine": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/quarantine.parquet"
+            ),
+            "completeness": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/_completeness.json"
+            ),
+        }
+        client = Mock()
+
+        with patch("bronze_to_silver._s3_client", return_value=client):
+            write_silver_active_manifest(
+                "2026-10-09", "07", publication_id, artifacts
+            )
+
+        client.put_object.assert_called_once()
+        args = client.put_object.call_args.kwargs
+        self.assertEqual(args["Bucket"], "silver")
+        self.assertEqual(
+            args["Key"],
+            "vehicle_positions/date=2026-10-09/hour=07/_active.json",
+        )
+        manifest = json.loads(args["Body"])
+        self.assertEqual(manifest["status"], "published")
+        self.assertEqual(manifest["partition"], partition)
+        self.assertEqual(manifest["publication_id"], publication_id)
+        self.assertEqual(manifest["artifacts"], artifacts)
+
+    def test_write_silver_active_manifest_rejects_invalid_artifact(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        artifacts = {
+            "data": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/data.parquet"
+            ),
+            "quarantine": (
+                f"s3://silver/_versions/{partition}/"
+                f"{'b' * 32}/quarantine.parquet"
+            ),
+            "completeness": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/_completeness.json"
+            ),
+        }
+        client = Mock()
+
+        with (
+            patch("bronze_to_silver._s3_client", return_value=client),
+            self.assertRaises(ValueError),
+        ):
+            write_silver_active_manifest(
+                "2026-10-09", "07", publication_id, artifacts
+            )
+
+        client.put_object.assert_not_called()
+
+
+    def test_write_silver_active_manifest_rejects_extra_path(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        artifacts = {
+            "data": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/nested/data.parquet"
+            ),
+            "quarantine": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/quarantine.parquet"
+            ),
+            "completeness": (
+                f"s3://silver/_versions/{partition}/"
+                f"{publication_id}/_completeness.json"
+            ),
+        }
+        client = Mock()
+
+        with (
+            patch("bronze_to_silver._s3_client", return_value=client),
+            self.assertRaises(ValueError),
+        ):
+            write_silver_active_manifest(
+                "2026-10-09", "07", publication_id, artifacts
+            )
+
+        client.put_object.assert_not_called()
+
+
+
+    def test_active_silver_manifest_resolves_all_artifacts(self):
+        manifest = {
+            "publication_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "partition": "date=2026-10-09/hour=07",
+            "status": "published",
+            "artifacts": {
+                "data": (
+                    "s3://silver/_versions/date=2026-10-09/hour=07/"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data.parquet"
+                ),
+                "quarantine": (
+                    "s3://silver/_versions/date=2026-10-09/hour=07/"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/quarantine.parquet"
+                ),
+                "completeness": (
+                    "s3://silver/_versions/date=2026-10-09/hour=07/"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_completeness.json"
+                ),
+            },
+        }
+
+        client = Mock()
+        body = Mock()
+        body.read.return_value = json.dumps(manifest).encode("utf-8")
+        client.get_object.return_value = {"Body": body}
+
+        result = resolve_silver_artifacts("2026-10-09", "07", client)
+
+        self.assertEqual(result, manifest["artifacts"])
+        client.get_object.assert_called_once_with(
+            Bucket="silver",
+            Key="vehicle_positions/date=2026-10-09/hour=07/_active.json",
+        )
+
+
+    def test_read_completeness_marker_uses_active_manifest(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        manifest = {
+            "publication_id": publication_id,
+            "partition": partition,
+            "status": "published",
+            "artifacts": {
+                "data": (
+                    f"s3://silver/_versions/{partition}/"
+                    f"{publication_id}/data.parquet"
+                ),
+                "quarantine": (
+                    f"s3://silver/_versions/{partition}/"
+                    f"{publication_id}/quarantine.parquet"
+                ),
+                "completeness": (
+                    f"s3://silver/_versions/{partition}/{publication_id}/_completeness.json"
+                ),
+            },
+        }
+        client = Mock()
+        manifest_body = Mock()
+        manifest_body.read.return_value = json.dumps(manifest).encode("utf-8")
+        marker_body = Mock()
+        marker_body.read.return_value = json.dumps(
+            {"status": "complete", "cycles": 10, "complete_cycles": 10}
+        ).encode("utf-8")
+        client.get_object.side_effect = [
+            {"Body": manifest_body},
+            {"Body": marker_body},
+        ]
+
+        result = read_completeness_marker("2026-10-09", "07", client)
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(client.get_object.call_count, 2)
+        self.assertEqual(
+            client.get_object.call_args_list[1].kwargs,
+            {
+                "Bucket": "silver",
+                "Key": (
+                    f"_versions/{partition}/{publication_id}/_completeness.json"
+                ),
+            },
+        )
+
+
+    def test_missing_active_manifest_uses_legacy_paths(self):
+        client = Mock()
+        client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+
+        result = resolve_silver_artifacts("2026-10-09", "07", client)
+
+        self.assertEqual(
+            result,
+            {
+                "data": (
+                    "s3://silver/vehicle_positions/date=2026-10-09/"
+                    "hour=07/data.parquet"
+                ),
+                "quarantine": (
+                    "s3://silver/quarantine/vehicle_positions/"
+                    "date=2026-10-09/hour=07/data.parquet"
+                ),
+                "completeness": (
+                    "s3://silver/vehicle_positions/date=2026-10-09/"
+                    "hour=07/_completeness.json"
+                ),
+            },
+        )
+
+    def test_invalid_active_manifest_does_not_fall_back(self):
+        manifest = {
+            "publication_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "partition": "date=2026-10-08/hour=07",
+            "status": "published",
+            "artifacts": {},
+        }
+        client = Mock()
+        body = Mock()
+        body.read.return_value = json.dumps(manifest).encode("utf-8")
+        client.get_object.return_value = {"Body": body}
+
+        with self.assertRaises(ValueError):
+            resolve_silver_artifacts("2026-10-09", "07", client)
+
+
     def test_is_hour_complete_only_for_complete(self):
         for status, expected in (
             ("complete", True),
@@ -60,7 +287,18 @@ class CompletenessTests(unittest.TestCase):
             ("unknown", False),
         ):
             client = self._marker_client(status)
-            self.assertIs(is_hour_complete("2026-10-09", "07", client), expected)
+            with patch(
+                "bronze_to_silver.resolve_silver_artifacts",
+                return_value={
+                    "completeness": (
+                        "s3://silver/vehicle_positions/date=2026-10-09/"
+                        "hour=07/_completeness.json"
+                    )
+                },
+            ):
+                self.assertIs(
+                    is_hour_complete("2026-10-09", "07", client), expected
+                )
 
     def test_missing_marker_is_unknown_not_complete(self):
         client = self._marker_client(error_code="NoSuchKey")
@@ -169,6 +407,66 @@ class CompletenessTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "incomplete")
+
+
+    def test_active_manifest_rejects_artifact_from_another_version(self):
+        manifest = {
+            "publication_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "partition": "date=2026-10-09/hour=07",
+            "status": "published",
+            "artifacts": {
+                "data": (
+                    "s3://silver/_versions/date=2026-10-09/hour=07/"
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/data.parquet"
+                ),
+                "quarantine": (
+                    "s3://silver/_versions/date=2026-10-09/hour=07/"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/quarantine.parquet"
+                ),
+                "completeness": (
+                    "s3://silver/_versions/date=2026-10-09/hour=07/"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_completeness.json"
+                ),
+            },
+        }
+        client = Mock()
+        body = Mock()
+        body.read.return_value = json.dumps(manifest).encode("utf-8")
+        client.get_object.return_value = {"Body": body}
+
+        with self.assertRaises(ValueError):
+            resolve_silver_artifacts("2026-10-09", "07", client)
+
+
+    def test_active_manifest_rejects_artifact_with_extra_path(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        manifest = {
+            "publication_id": publication_id,
+            "partition": partition,
+            "status": "published",
+            "artifacts": {
+                "data": (
+                    f"s3://silver/_versions/{partition}/{publication_id}/"
+                    "nested/data.parquet"
+                ),
+                "quarantine": (
+                    f"s3://silver/_versions/{partition}/{publication_id}/"
+                    "quarantine.parquet"
+                ),
+                "completeness": (
+                    f"s3://silver/_versions/{partition}/{publication_id}/"
+                    "_completeness.json"
+                ),
+            },
+        }
+        client = Mock()
+        body = Mock()
+        body.read.return_value = json.dumps(manifest).encode("utf-8")
+        client.get_object.return_value = {"Body": body}
+
+        with self.assertRaises(ValueError):
+            resolve_silver_artifacts("2026-10-09", "07", client)
 
 
 class BronzeToSilverSqlTests(unittest.TestCase):
@@ -311,6 +609,7 @@ class TransformHourTests(unittest.TestCase):
         with self.assertRaises(duckdb.IOException):
             transform_hour(connection, "2026-10-09", "7")
 
+
     def test_publishes_validated_temp_file_with_server_side_copy(self):
         connection = self._happy_path_connection()
 
@@ -318,6 +617,7 @@ class TransformHourTests(unittest.TestCase):
             patch("bronze_to_silver.validate_silver_schema"),
             patch("bronze_to_silver.copy_s3_object") as copy_mock,
             patch("bronze_to_silver.delete_s3_object") as delete_mock,
+            patch("bronze_to_silver.write_silver_active_manifest") as manifest_mock,
         ):
             transform_hour(connection, "2026-10-09", "7")
 
@@ -327,23 +627,51 @@ class TransformHourTests(unittest.TestCase):
             if call.args[0].startswith("COPY ")
         ]
         self.assertEqual(len(copy_statements), 2)
-        source, destination = copy_mock.call_args.args
-        self.assertTrue(source.endswith(".parquet.pending"))
-        self.assertEqual(
-            destination,
-            "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
+
+        rejected_source, rejected_destination = copy_mock.call_args_list[0].args
+        data_source, data_destination = copy_mock.call_args_list[1].args
+
+        self.assertTrue(rejected_source.endswith(".parquet.pending"))
+        self.assertTrue(data_source.endswith(".parquet.pending"))
+
+        version_prefix = "s3://silver/_versions/date=2026-10-09/hour=07/"
+        self.assertTrue(rejected_destination.startswith(version_prefix))
+        self.assertTrue(rejected_destination.endswith("/quarantine.parquet"))
+        self.assertTrue(data_destination.startswith(version_prefix))
+        self.assertTrue(data_destination.endswith("/data.parquet"))
+
+        publication_id = data_destination[len(version_prefix):].split("/")[0]
+        self.assertEqual(len(publication_id), 32)
+        self.assertTrue(
+            all(char in "0123456789abcdef" for char in publication_id)
         )
         self.assertEqual(
-            copy_mock.call_args_list[0].args[1],
-            "s3://silver/quarantine/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
+            rejected_destination,
+            f"{version_prefix}{publication_id}/quarantine.parquet",
         )
-        delete_mock.assert_any_call(source)
+
+        delete_mock.assert_any_call(data_source)
+        delete_mock.assert_any_call(rejected_source)
         self.assertEqual(delete_mock.call_count, 2)
+
         self.assess_mock.assert_called_once_with("2026-10-09", "07")
         self.write_marker_mock.assert_called_once_with(
             self.completeness,
-            "s3://silver/vehicle_positions/date=2026-10-09/hour=07",
+            f"{version_prefix}{publication_id}",
         )
+        manifest_mock.assert_called_once_with(
+            "2026-10-09",
+            "07",
+            publication_id,
+            {
+                "data": data_destination,
+                "quarantine": rejected_destination,
+                "completeness": (
+                    f"{version_prefix}{publication_id}/_completeness.json"
+                ),
+            },
+        )
+
 
     def test_warns_and_still_publishes_when_hour_is_incomplete(self):
         self.assess_mock.return_value = {
@@ -365,6 +693,7 @@ class TransformHourTests(unittest.TestCase):
         self.write_marker_mock.assert_called_once()
         self.assertTrue(any("incomplete" in line for line in logs.output))
 
+
     def test_publishes_rejected_rows_to_quarantine(self):
         connection = Mock()
         connection.execute.return_value.fetchone.side_effect = [
@@ -378,17 +707,71 @@ class TransformHourTests(unittest.TestCase):
             patch("bronze_to_silver.validate_silver_schema"),
             patch("bronze_to_silver.copy_s3_object") as copy_mock,
             patch("bronze_to_silver.delete_s3_object"),
+            patch("bronze_to_silver.write_silver_active_manifest") as manifest_mock,
         ):
             transform_hour(connection, "2026-10-09", "7")
 
         destinations = [call.args[1] for call in copy_mock.call_args_list]
-        self.assertEqual(
-            destinations,
-            [
-                "s3://silver/quarantine/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
-                "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
-            ],
+        self.assertEqual(len(destinations), 2)
+
+        version_prefix = "s3://silver/_versions/date=2026-10-09/hour=07/"
+        rejected_destination, data_destination = destinations
+
+        self.assertTrue(rejected_destination.startswith(version_prefix))
+        self.assertTrue(rejected_destination.endswith("/quarantine.parquet"))
+        self.assertTrue(data_destination.startswith(version_prefix))
+        self.assertTrue(data_destination.endswith("/data.parquet"))
+
+        publication_id = data_destination[len(version_prefix):].split("/")[0]
+        self.assertEqual(len(publication_id), 32)
+        self.assertTrue(
+            all(char in "0123456789abcdef" for char in publication_id)
         )
+        self.assertEqual(
+            rejected_destination,
+            f"{version_prefix}{publication_id}/quarantine.parquet",
+        )
+        manifest_mock.assert_called_once()
+
+
+
+    def test_second_publish_copy_failure_propagates_after_first_copy(self):
+        connection = self._happy_path_connection()
+        copy_calls = []
+
+        def fail_on_second_copy(source, destination):
+            copy_calls.append((source, destination))
+            if len(copy_calls) == 2:
+                raise RuntimeError("forced second publish failure")
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch(
+                "bronze_to_silver.copy_s3_object",
+                side_effect=fail_on_second_copy,
+            ),
+            patch("bronze_to_silver.delete_s3_object"),
+            patch("bronze_to_silver.write_silver_active_manifest") as manifest_mock,
+            self.assertRaisesRegex(
+                RuntimeError, "forced second publish failure"
+            ),
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+
+        self.assertEqual(len(copy_calls), 2)
+
+        version_prefix = "s3://silver/_versions/date=2026-10-09/hour=07/"
+        rejected_destination = copy_calls[0][1]
+        data_destination = copy_calls[1][1]
+
+        self.assertTrue(rejected_destination.startswith(version_prefix))
+        self.assertTrue(rejected_destination.endswith("/quarantine.parquet"))
+        self.assertTrue(data_destination.startswith(version_prefix))
+        self.assertTrue(data_destination.endswith("/data.parquet"))
+
+        manifest_mock.assert_not_called()
+        self.write_marker_mock.assert_not_called()
+
 
     def test_overwrite_false_refuses_to_replace_existing_output(self):
         connection = self._happy_path_connection()

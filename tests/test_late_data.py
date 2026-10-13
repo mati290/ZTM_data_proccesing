@@ -1,6 +1,9 @@
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
+
+from botocore.exceptions import ClientError
 
 import late_data
 
@@ -8,8 +11,9 @@ NOW = datetime(2026, 1, 15, 13, 40, tzinfo=timezone.utc)
 T0 = datetime(2026, 1, 15, 12, 30, tzinfo=timezone.utc)
 
 
+
 class FakeS3:
-    """Maps (bucket, prefix) -> list of LastModified for objects under that prefix."""
+    """In-memory S3 fake supporting object listing and manifest reads."""
 
     def __init__(self, objects):
         self.objects = objects
@@ -27,6 +31,39 @@ class FakeS3:
                 yield {"Contents": items} if items else {}
 
         return Paginator()
+
+
+    def list_objects_v2(self, Bucket, Prefix):
+        items = [
+            {"Key": key, "LastModified": modified}
+            for (bucket, key), modified in self.objects.items()
+            if bucket == Bucket and key.startswith(Prefix)
+        ]
+        return {"Contents": items} if items else {}
+
+
+    def get_object(self, Bucket, Key):
+        value = self.objects.get((Bucket, Key))
+        if value is None:
+            error = ClientError(
+                {
+                    "Error": {"Code": "NoSuchKey", "Message": "Not found"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "GetObject",
+            )
+            raise error
+
+        if isinstance(value, bytes):
+            body = value
+        elif isinstance(value, str):
+            body = value.encode("utf-8")
+        elif isinstance(value, dict):
+            body = json.dumps(value).encode("utf-8")
+        else:
+            raise TypeError(f"Unsupported fake S3 object value: {type(value)}")
+
+        return {"Body": Mock(read=Mock(return_value=body))}
 
 
 def bronze(hour, when, label="bus"):
@@ -143,6 +180,63 @@ class StaleHourTests(unittest.TestCase):
 
         result = self.stale(*objects.items())
         self.assertEqual(result, [("2026-01-15", "12")])
+
+
+    def test_manifest_storage_error_is_propagated(self):
+        objects = dict([bronze("12", T0)])
+        s3 = FakeS3(objects)
+
+        error = ClientError(
+            {
+                "Error": {
+                    "Code": "InternalError",
+                    "Message": "Storage unavailable",
+                },
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            "GetObject",
+        )
+
+        with patch(
+            "late_data.resolve_silver_artifacts",
+            side_effect=error,
+        ), self.assertRaises(ClientError):
+            late_data.is_hour_stale("2026-01-15", "12", s3)
+
+
+    def test_active_manifest_artifacts_are_checked(self):
+        publication_id = "a" * 32
+        partition = "date=2026-01-15/hour=12"
+        version_prefix = (
+            f"_versions/{partition}/{publication_id}/"
+        )
+        manifest = {
+            "publication_id": publication_id,
+            "partition": partition,
+            "status": "published",
+            "artifacts": {
+                "data": f"s3://silver/{version_prefix}data.parquet",
+                "quarantine": (
+                    f"s3://silver/{version_prefix}quarantine.parquet"
+                ),
+                "completeness": (
+                    f"s3://silver/{version_prefix}_completeness.json"
+                ),
+            },
+        }
+        objects: dict[tuple[str, str], datetime | dict] = dict([bronze("12", T0)])
+        manifest_key = "vehicle_positions/date=2026-01-15/hour=12/_active.json"
+        objects[("silver", manifest_key)] = manifest
+        objects[("silver", f"{version_prefix}data.parquet")] = T0
+        objects[("silver", f"{version_prefix}quarantine.parquet")] = T0
+        objects[("silver", f"{version_prefix}_completeness.json")] = T0
+
+        result = late_data.is_hour_stale(
+            "2026-01-15", "12", FakeS3(objects)
+        )
+
+        self.assertFalse(result)
+
 
 
 class ReprocessTests(unittest.TestCase):

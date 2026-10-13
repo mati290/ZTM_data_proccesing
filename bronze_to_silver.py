@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import logging
 import math
@@ -42,7 +42,6 @@ EXPECTED_SILVER_TYPES = {
 
 class BronzeDataMissingError(FileNotFoundError):
     """Raised when an hourly Bronze partition contains no files."""
-
 
 BASE_CTES = """
 WITH source AS (
@@ -128,7 +127,6 @@ deduplicated AS (
     WHERE row_num = 1
 )
 """
-
 TRANSFORM_SQL = BASE_CTES + "SELECT * FROM deduplicated"
 
 REJECTED_SQL = (
@@ -341,6 +339,140 @@ def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     return parsed_uri.netloc, parsed_uri.path.lstrip("/")
 
 
+def resolve_silver_artifacts(
+    date_str: str, hour_str: str, s3_client=None
+) -> dict[str, str]:
+    """Resolve active Silver artifacts, falling back to legacy paths."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    s3_client = s3_client or _s3_client()
+    partition = f"date={date_str}/hour={hour_str}"
+    manifest_key = f"vehicle_positions/{partition}/_active.json"
+
+    try:
+        response = s3_client.get_object(
+            Bucket="silver",
+            Key=manifest_key,
+        )
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        status = exc.response.get("ResponseMetadata", {}).get(
+            "HTTPStatusCode"
+        )
+        if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
+            return {
+                "data": f"s3://silver/vehicle_positions/{partition}/data.parquet",
+                "quarantine": (
+                    f"s3://silver/quarantine/vehicle_positions/"
+                    f"{partition}/data.parquet"
+                ),
+                "completeness": (
+                    f"s3://silver/vehicle_positions/{partition}/"
+                    "_completeness.json"
+                ),
+            }
+        raise
+
+    try:
+        manifest = json.loads(response["Body"].read().decode("utf-8"))
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Active Silver manifest is not valid JSON") from exc
+
+    if not isinstance(manifest, dict):
+        raise TypeError("Active Silver manifest must be a JSON object")
+    if manifest.get("status") != "published":
+        raise ValueError("Active Silver manifest has invalid status")
+    if manifest.get("partition") != partition:
+        raise ValueError("Active Silver manifest references another partition")
+
+    publication_id = manifest.get("publication_id")
+    artifacts = manifest.get("artifacts")
+    if (
+        not isinstance(publication_id, str)
+        or len(publication_id) != 32
+        or any(char not in "0123456789abcdef" for char in publication_id)
+        or not isinstance(artifacts, dict)
+    ):
+        raise ValueError("Active Silver manifest is missing publication metadata")
+
+
+    expected_artifacts = {
+        "data": (
+            f"s3://silver/_versions/{partition}/"
+            f"{publication_id}/data.parquet"
+        ),
+        "quarantine": (
+            f"s3://silver/_versions/{partition}/"
+            f"{publication_id}/quarantine.parquet"
+        ),
+        "completeness": (
+            f"s3://silver/_versions/{partition}/"
+            f"{publication_id}/_completeness.json"
+        ),
+    }
+
+    resolved = {}
+    for name, expected_uri in expected_artifacts.items():
+        uri = artifacts.get(name)
+        if uri != expected_uri:
+            raise ValueError(
+                f"Active Silver manifest has invalid {name} artifact URI"
+            )
+        resolved[name] = uri
+
+    return resolved
+
+
+
+def write_silver_active_manifest(
+    date_str: str,
+    hour_str: str,
+    publication_id: str,
+    artifacts: dict[str, str],
+) -> None:
+    """Publish a prepared Silver version by replacing its active manifest."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    partition = f"date={date_str}/hour={hour_str}"
+
+    if (
+        not isinstance(publication_id, str)
+        or len(publication_id) != 32
+        or any(char not in "0123456789abcdef" for char in publication_id)
+    ):
+        raise ValueError("Invalid Silver publication ID")
+
+    expected_artifacts = {
+        "data": (
+            f"s3://silver/_versions/{partition}/"
+            f"{publication_id}/data.parquet"
+        ),
+        "quarantine": (
+            f"s3://silver/_versions/{partition}/"
+            f"{publication_id}/quarantine.parquet"
+        ),
+        "completeness": (
+            f"s3://silver/_versions/{partition}/"
+            f"{publication_id}/_completeness.json"
+        ),
+    }
+
+    for name, expected_uri in expected_artifacts.items():
+        if artifacts.get(name) != expected_uri:
+            raise ValueError(f"Invalid Silver {name} artifact URI")
+
+    manifest = {
+        "publication_id": publication_id,
+        "partition": partition,
+        "status": "published",
+        "artifacts": artifacts,
+    }
+    _s3_client().put_object(
+        Bucket="silver",
+        Key=f"vehicle_positions/{partition}/_active.json",
+        Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
 def _s3_client():
     return boto3.client(
         "s3",
@@ -469,18 +601,26 @@ def write_completeness_marker(completeness: dict, silver_dir: str) -> None:
     )
 
 
+
 def read_completeness_marker(date_str: str, hour_str: str, s3_client=None) -> dict:
-    """Return the hour's marker, or status 'unknown' when it is missing."""
+    """Read the active completeness marker, with legacy-path fallback."""
     date_str, hour_str = validate_partition(date_str, hour_str)
     s3_client = s3_client or _s3_client()
-    key = f"vehicle_positions/date={date_str}/hour={hour_str}/_completeness.json"
+
+    artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client)
+    bucket, key = _parse_s3_uri(artifacts["completeness"])
+
     try:
-        body = s3_client.get_object(Bucket="silver", Key=key)["Body"].read()
+        body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+        error_code = exc.response.get("Error", {}).get("Code")
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
             return {"status": "unknown"}
         raise
+
     return json.loads(body)
+
 
 
 def is_hour_complete(date_str: str, hour_str: str, s3_client=None) -> bool:
@@ -499,18 +639,32 @@ def validate_output_quality(
         )
 
 
+
 def transform_hour(con, date_str, hour_str, overwrite=True):
     date_str, hour_str = validate_partition(date_str, hour_str)
-    bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
-    silver_dir = f"s3://silver/vehicle_positions/date={date_str}/hour={hour_str}"
-    output_file = f"{silver_dir}/data.parquet"
-    temp_file = f"{silver_dir}/_staging/{uuid.uuid4()}.parquet.pending"
-    rejected_file = f"s3://silver/quarantine/vehicle_positions/date={date_str}/hour={hour_str}/data.parquet"
-    rejected_temp_file = (
-        f"{silver_dir}/_staging/{uuid.uuid4()}.rejected.parquet.pending"
+    partition = f"date={date_str}/hour={hour_str}"
+    bronze_path = (
+        f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
     )
 
-    # glob() does not accept bound parameters in duckdb 1.2.x; the path comes from a validated partition
+    publication_id = uuid.uuid4().hex
+    version_dir = f"s3://silver/_versions/{partition}/{publication_id}"
+    staging_dir = f"s3://silver/_staging/{partition}/{publication_id}"
+
+    temp_file = f"{staging_dir}/data.parquet.pending"
+    rejected_temp_file = f"{staging_dir}/quarantine.parquet.pending"
+
+    output_file = f"{version_dir}/data.parquet"
+    rejected_file = f"{version_dir}/quarantine.parquet"
+
+    artifacts = {
+        "data": output_file,
+        "quarantine": rejected_file,
+        "completeness": f"{version_dir}/_completeness.json",
+    }
+
+    # glob() does not accept bound parameters in DuckDB 1.2.x.
+    # The partition values are validated before building this path.
     bronze_file = con.execute(
         f"SELECT file FROM glob('{bronze_path}') LIMIT 1"
     ).fetchone()
@@ -539,10 +693,22 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
     rejected_sql = REJECTED_SQL.format(bronze_path=bronze_path)
     rejected_count = before - after
-    if not overwrite and (
-        s3_object_exists(output_file) or s3_object_exists(rejected_file)
-    ):
-        raise FileExistsError(f"Silver output already exists: {output_file}")
+
+    if not overwrite:
+        active_artifacts = resolve_silver_artifacts(
+            date_str, hour_str
+        )
+        if any(
+            s3_object_exists(path)
+            for path in (
+                active_artifacts["data"],
+                active_artifacts["quarantine"],
+            )
+        ):
+            raise FileExistsError(
+                f"Silver output already exists: {active_artifacts['data']}"
+            )
+
     try:
         con.execute(
             f"COPY ({rejected_sql}) TO '{rejected_temp_file}' "
@@ -553,14 +719,17 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         ).fetchone()[0]
         if rejected_output_count != rejected_count:
             raise ValueError(
-                f"Rejected-record validation failed for {date_str} hour {hour_str}: "
-                f"temporary output has {rejected_output_count} rows, expected "
-                f"{rejected_count}; refusing to publish."
+                f"Rejected-record validation failed for {date_str} hour "
+                f"{hour_str}: temporary output has {rejected_output_count} "
+                f"rows, expected {rejected_count}; refusing to publish."
             )
+
         con.execute(
-            f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
+            f"COPY ({sql}) TO '{temp_file}' "
+            "(FORMAT parquet, OVERWRITE_OR_IGNORE true)"
         )
         validate_silver_schema(con, temp_file)
+
         row_count = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{temp_file}')"
         ).fetchone()[0]
@@ -571,14 +740,26 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
                 "refusing to publish."
             )
 
+        completeness = assess_completeness(date_str, hour_str)
+
+        # Prepare the complete new version before switching the active pointer.
         copy_s3_object(rejected_temp_file, rejected_file)
         copy_s3_object(temp_file, output_file)
-        completeness = assess_completeness(date_str, hour_str)
-        write_completeness_marker(completeness, silver_dir)
+        write_completeness_marker(completeness, version_dir)
+
+        # This is the publication point: readers now resolve the new version.
+        write_silver_active_manifest(
+            date_str,
+            hour_str,
+            publication_id,
+            artifacts,
+        )
+
         if completeness["status"] != "complete":
             logger.warning(
-                "%s hour %s Silver completeness is %s: %s/%s ingestion cycles had "
-                "both bus and tram data; business metrics may be understated.",
+                "%s hour %s Silver completeness is %s: %s/%s ingestion "
+                "cycles had both bus and tram data; business metrics may "
+                "be understated.",
                 date_str,
                 hour_str,
                 completeness["status"],
@@ -591,7 +772,9 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
                 delete_s3_object(temp_path)
             except (BotoCoreError, ClientError) as exc:
                 logger.warning(
-                    "Could not remove temporary Silver object %s: %s", temp_path, exc
+                    "Could not remove temporary Silver object %s: %s",
+                    temp_path,
+                    exc,
                 )
 
     rejected_coordinates = before - after_coordinates
@@ -616,6 +799,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"silver={after}, "
         f"dropped={dropped_pct:.1%} -> {output_file}"
     )
+
 
 
 def main():
