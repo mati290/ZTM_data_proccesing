@@ -43,6 +43,26 @@ def silver(hour, when):
     )
 
 
+def silver_completeness(hour, when):
+    return (
+        (
+            "silver",
+            f"vehicle_positions/date=2026-01-15/hour={hour}/_completeness.json",
+        ),
+        when,
+    )
+
+
+def silver_quarantine(hour, when):
+    return (
+        (
+            "silver",
+            f"quarantine/vehicle_positions/date=2026-01-15/hour={hour}/data.parquet",
+        ),
+        when,
+    )
+
+
 class StaleHourTests(unittest.TestCase):
     def stale(self, *items, window=3):
         return late_data.find_stale_hours(NOW, window, FakeS3(dict(items)))
@@ -55,7 +75,12 @@ class StaleHourTests(unittest.TestCase):
         self.assertEqual(result, [("2026-01-15", "12")])
 
     def test_silver_newer_than_bronze_is_not_stale(self):
-        result = self.stale(bronze("12", T0), silver("12", T0 + timedelta(minutes=35)))
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=35)),
+            silver_completeness("12", T0 + timedelta(minutes=35)),
+            silver_quarantine("12", T0 + timedelta(minutes=35)),
+        )
         self.assertEqual(result, [])
 
     def test_missing_silver_with_bronze_is_stale_gap_repair(self):
@@ -84,6 +109,40 @@ class StaleHourTests(unittest.TestCase):
 
     def test_hours_outside_window_are_frozen(self):
         self.assertEqual(self.stale(bronze("08", T0), window=3), [])
+
+    def test_missing_completeness_marker_is_stale(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=35)),
+            silver_quarantine("12", T0 + timedelta(minutes=35)),
+        )
+        self.assertEqual(result, [("2026-01-15", "12")])
+
+    def test_missing_quarantine_file_is_stale(self):
+        result = self.stale(
+            bronze("12", T0),
+            silver("12", T0 + timedelta(minutes=35)),
+            silver_completeness("12", T0 + timedelta(minutes=35)),
+        )
+        self.assertEqual(result, [("2026-01-15", "12")])
+
+    def test_similarly_named_silver_object_does_not_count(self):
+        objects = dict(
+            [
+                bronze("12", T0),
+                silver_completeness("12", T0 + timedelta(minutes=35)),
+                silver_quarantine("12", T0 + timedelta(minutes=35)),
+            ]
+        )
+        objects[
+            (
+                "silver",
+                "vehicle_positions/date=2026-01-15/hour=12/data.parquet.backup",
+            )
+        ] = T0 + timedelta(minutes=35)
+
+        result = self.stale(*objects.items())
+        self.assertEqual(result, [("2026-01-15", "12")])
 
 
 class ReprocessTests(unittest.TestCase):

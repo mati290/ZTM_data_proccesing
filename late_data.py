@@ -45,10 +45,27 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
     if bronze_latest is None:
         return False
 
+    silver_prefix = f"vehicle_positions/date={date_str}/hour={hour_str}/"
+    required_silver_objects = (
+        f"{silver_prefix}data.parquet",
+        f"{silver_prefix}_completeness.json",
+        f"quarantine/{silver_prefix}data.parquet",
+    )
+
+    for key in required_silver_objects:
+        found = False
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket="silver", Prefix=key):
+            if any(obj.get("Key") == key for obj in page.get("Contents", [])):
+                found = True
+                break
+        if not found:
+            return True
+
     silver_latest = _max_last_modified(
         s3_client,
         "silver",
-        f"vehicle_positions/date={date_str}/hour={hour_str}/data.parquet",
+        f"{silver_prefix}data.parquet",
     )
     return silver_latest is None or bronze_latest > silver_latest
 
