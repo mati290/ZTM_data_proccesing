@@ -2,7 +2,7 @@
   minio:
     # The Chainguard public registry provides the free `latest` channel.
     # Pin this to a digest before using the stack outside local development.
-    image: cgr.dev/chainguard/minio:latest
+    image: cgr.dev/chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_USER:?set MINIO_USER in .env}
