@@ -15,7 +15,7 @@ from airflow.sdk import dag, task
     tags=["ztm", "late-data"],
 )
 def reprocess_late_data_hourly():
-    @task
+    @task(pool="ztm_silver_gold_writer")
     def reprocess():
         import late_data
 
