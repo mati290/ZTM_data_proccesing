@@ -216,6 +216,41 @@ class SaveToBronzeTests(unittest.TestCase):
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
         self.assertEqual(manifest["status"], "complete")
 
+
+    def test_main_configures_s3_timeouts_and_retries(self):
+        s3_client = Mock()
+        with (
+            patch.dict(
+                "os.environ",
+                {"ZTM_API_KEY": "test-key", "POLL_INTERVAL_SECONDS": "1"},
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=s3_client) as client_mock,
+            patch("ingest.ensure_bucket_with_retry"),
+            patch(
+                "ingest.run_once",
+                return_value={
+                    "buses": 1,
+                    "trams": 1,
+                    "total": 2,
+                    "failed_sources": [],
+                    "empty_sources": [],
+                },
+            ),
+            patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        config = client_mock.call_args.kwargs["config"]
+        self.assertEqual(config.connect_timeout, 5)
+        self.assertEqual(config.read_timeout, 15)
+        self.assertEqual(
+            config.retries,
+            {"mode": "standard", "max_attempts": 3},
+        )
+
+
     def test_main_alerts_after_consecutive_degraded_cycles(self):
         degraded = {
             "buses": 1,

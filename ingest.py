@@ -6,6 +6,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from botocore.config import Config
 import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
@@ -240,12 +241,22 @@ def main():
     if not api_key:
         raise ValueError("API key not found. Please set ZTM_API_KEY in your .env file.")
 
+
     s3 = boto3.client(
         "s3",
         endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
         aws_access_key_id=os.getenv("MINIO_USER"),
         aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
+        config=Config(
+            connect_timeout=5,
+            read_timeout=15,
+            retries={
+                "mode": "standard",
+                "max_attempts": 3,
+            },
+        ),
     )
+
 
     ensure_bucket_with_retry(s3)
 
