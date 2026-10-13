@@ -574,6 +574,27 @@ class GoldProcessTests(LocalPipelineTestCase):
         self.assertEqual(len(first["hourly_network_metrics"]), 1)
         self.assertEqual(len(first["hourly_data_quality"]), 1)
 
+    def test_missing_silver_keeps_previous_full_manifest(self):
+        self.build()
+
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            previous_manifest = json.load(file)
+
+        # Simulate a missing Silver partition on the next attempt.
+        self.silver = os.path.join(self.tmp.name, "missing-silver.parquet")
+
+        with self.assertRaises(gold.SilverDataMissingError):
+            self.build()
+
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            current_manifest = json.load(file)
+
+        self.assertEqual(current_manifest, previous_manifest)
+        self.assertEqual(set(current_manifest["tables"]), set(gold.GOLD_TABLES))
+
     def test_hour_is_not_final_during_grace_period(self):
         self.build(run_at=datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
         quality = self.read_gold("hourly_data_quality")
