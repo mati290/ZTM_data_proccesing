@@ -6,9 +6,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from botocore.config import Config
 import boto3
 import requests
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
@@ -241,7 +241,6 @@ def main():
     if not api_key:
         raise ValueError("API key not found. Please set ZTM_API_KEY in your .env file.")
 
-
     s3 = boto3.client(
         "s3",
         endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
@@ -256,7 +255,6 @@ def main():
             },
         ),
     )
-
 
     ensure_bucket_with_retry(s3)
 
@@ -280,7 +278,7 @@ def main():
                 result["buses"],
                 result["trams"],
                 result["total"],
-)
+            )
         except (
             requests.RequestException,
             ZTMApiError,

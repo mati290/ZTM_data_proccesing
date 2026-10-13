@@ -469,7 +469,7 @@ class LocalPipelineTestCase(unittest.TestCase):
                 patch(
                     "silver_to_gold.write_publication_manifest",
                     side_effect=manifest_fn or self.write_local_manifest,
-                    )
+                )
             )
             stack.enter_context(
                 patch("silver_to_gold.read_completeness_marker", return_value=marker)
@@ -697,17 +697,16 @@ class GoldProcessTests(LocalPipelineTestCase):
             self.build(validate=boom)
         for table in gold.GOLD_TABLES:
             self.assertEqual(self.read_gold(table), before[table], table)
+
     def test_failed_manifest_write_keeps_previous_publication(self):
         self.build()
 
         before = {
-            table: self.read_gold(table, exclude=())
-            for table in gold.GOLD_TABLES
+            table: self.read_gold(table, exclude=()) for table in gold.GOLD_TABLES
         }
 
         manifest_uri = (
-            f"{self.root}/gold/_commits/"
-            "date=2026-01-15/hour=12/manifest.json"
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
         )
         with open(manifest_uri, "r", encoding="utf-8") as file:
             previous_manifest = json.load(file)
@@ -717,9 +716,7 @@ class GoldProcessTests(LocalPipelineTestCase):
 
         next_run_at = RUN_AT + timedelta(seconds=1)
 
-        with self.assertRaisesRegex(
-            RuntimeError, "forced manifest write failure"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "forced manifest write failure"):
             self.build(
                 run_at=next_run_at,
                 manifest_fn=fail_manifest,
@@ -730,10 +727,7 @@ class GoldProcessTests(LocalPipelineTestCase):
 
         self.assertEqual(current_manifest, previous_manifest)
 
-        after = {
-            table: self.read_gold(table, exclude=())
-            for table in gold.GOLD_TABLES
-        }
+        after = {table: self.read_gold(table, exclude=()) for table in gold.GOLD_TABLES}
         self.assertEqual(after, before)
 
     def test_failed_publish_copy_keeps_previous_publication(self):

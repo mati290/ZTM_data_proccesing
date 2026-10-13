@@ -142,7 +142,6 @@ class SilverDataMissingError(FileNotFoundError):
     """Raised when the Silver partition for the hour does not exist."""
 
 
-
 def partition_uris(date_str: str, hour_str: str) -> dict:
     partition = f"date={date_str}/hour={hour_str}"
     publication_id = uuid.uuid4().hex
@@ -154,8 +153,7 @@ def partition_uris(date_str: str, hour_str: str) -> dict:
         ),
         "gold": {
             table: (
-                f"s3://gold/_versions/{partition}/{publication_id}/"
-                f"{table}/data.parquet"
+                f"s3://gold/_versions/{partition}/{publication_id}/{table}/data.parquet"
             )
             for table in GOLD_TABLES
         },
@@ -170,6 +168,7 @@ def partition_uris(date_str: str, hour_str: str) -> dict:
         "partition": partition,
         "manifest_uri": publication_manifest_uri(date_str, hour_str),
     }
+
 
 def publication_manifest_uri(date_str: str, hour_str: str) -> str:
     partition = f"date={date_str}/hour={hour_str}"
@@ -578,9 +577,9 @@ def publish_tables(con, tables, uris: dict) -> dict:
         # 1. Write every table to staging and validate it before publishing.
         for table in tables:
             order = ", ".join(GOLD_KEYS[table])
-            row_counts[table] = con.execute(
-                f"SELECT COUNT(*) FROM {table}"
-            ).fetchone()[0]
+            row_counts[table] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
+                0
+            ]
 
             con.execute(
                 f"COPY (SELECT * FROM {table} ORDER BY {order}) "

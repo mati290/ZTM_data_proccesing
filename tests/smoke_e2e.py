@@ -15,7 +15,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import bronze_to_silver
 
-
 DATE = "2020-01-15"
 HOUR = "12"
 
@@ -61,8 +60,7 @@ def assert_test_partition_empty(s3, date_str, hour_str):
         )
         if response.get("Contents"):
             raise FileExistsError(
-                f"Smoke-test partition is not empty: "
-                f"s3://{bucket}/{prefix}"
+                f"Smoke-test partition is not empty: s3://{bucket}/{prefix}"
             )
 
 
@@ -91,9 +89,8 @@ def main():
         bronze_to_silver.transform_hour(con, DATE, HOUR)
 
         import silver_to_gold
-        manifest_key = (
-            f"_commits/date={DATE}/hour={HOUR}/manifest.json"
-        )
+
+        manifest_key = f"_commits/date={DATE}/hour={HOUR}/manifest.json"
 
         def gold_state():
             manifest_obj = s3.get_object(
@@ -135,7 +132,7 @@ def main():
             "SELECT bronze_records, duplicate_records, safe_for_dashboard,"
             " data_completeness_status FROM read_parquet("
             f"'{quality_path}', hive_partitioning=false)"
-            ).fetchone()
+        ).fetchone()
         assert quality == (4, 1, False, "unknown"), quality
         vehicles = first["vehicle_activity_hourly"]
         assert len(vehicles) == 1, vehicles

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, call, patch
@@ -175,7 +175,6 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "partial")
         self.assertEqual(manifest["failed_sources"], ["tram"])
 
-
     def test_run_once_raises_when_cycle_manifest_write_fails(self):
         s3 = Mock()
         s3.put_object.side_effect = ClientError(
@@ -201,7 +200,6 @@ class SaveToBronzeTests(unittest.TestCase):
         ):
             run_once("test-key", s3)
 
-
     def test_run_once_manifest_marks_complete_cycle(self):
         s3 = Mock()
         with (
@@ -215,7 +213,6 @@ class SaveToBronzeTests(unittest.TestCase):
 
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
         self.assertEqual(manifest["status"], "complete")
-
 
     def test_main_configures_s3_timeouts_and_retries(self):
         s3_client = Mock()
@@ -249,7 +246,6 @@ class SaveToBronzeTests(unittest.TestCase):
             config.retries,
             {"mode": "standard", "max_attempts": 3},
         )
-
 
     def test_main_alerts_after_consecutive_degraded_cycles(self):
         degraded = {
