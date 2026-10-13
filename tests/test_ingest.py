@@ -374,6 +374,36 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(s3.head_bucket.call_count, 4)
         sleep.assert_called_once_with(2)
 
+    def test_main_logs_completed_ingestion_cycle(self):
+        result = {
+            "buses": 12,
+            "trams": 34,
+            "total": 46,
+            "failed_sources": [],
+            "empty_sources": [],
+        }
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"ZTM_API_KEY": "test-key", "POLL_INTERVAL_SECONDS": "1"},
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=Mock()),
+            patch("ingest.ensure_bucket_with_retry"),
+            patch("ingest.run_once", return_value=result),
+            patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
+            self.assertLogs("ingest", level="INFO") as captured,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        logs = "\n".join(captured.output)
+        self.assertIn("Ingestion cycle finished: status=complete", logs)
+        self.assertIn("buses=12", logs)
+        self.assertIn("trams=34", logs)
+        self.assertIn("total=46", logs)
+
 
 if __name__ == "__main__":
     unittest.main()

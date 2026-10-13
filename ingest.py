@@ -274,6 +274,13 @@ def main():
         try:
             result = run_once(api_key, s3)
             degraded = bool(result["failed_sources"] or result["empty_sources"])
+            logger.info(
+                "Ingestion cycle finished: status=%s buses=%s trams=%s total=%s",
+                "degraded" if degraded else "complete",
+                result["buses"],
+                result["trams"],
+                result["total"],
+)
         except (
             requests.RequestException,
             ZTMApiError,
