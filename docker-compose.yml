@@ -26,7 +26,12 @@
     depends_on:
       - minio
     restart: unless-stopped
-
+    healthcheck:
+      test: ["CMD", "python", "check_ingestion_health.py"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
   airflow:
     build:
       context: .
