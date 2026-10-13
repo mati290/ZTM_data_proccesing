@@ -75,6 +75,13 @@ class StaleHourTests(unittest.TestCase):
     def test_current_open_hour_is_never_recomputed(self):
         self.assertEqual(self.stale(bronze("13", T0)), [])
 
+    def test_oldest_hour_inside_window_is_included(self):
+        result = self.stale(
+            bronze("10", T0),
+            window=3,
+        )
+        self.assertEqual(result, [("2026-01-15", "10")])
+
     def test_hours_outside_window_are_frozen(self):
         self.assertEqual(self.stale(bronze("08", T0), window=3), [])
 
