@@ -11,7 +11,6 @@ NOW = datetime(2026, 1, 15, 13, 40, tzinfo=timezone.utc)
 T0 = datetime(2026, 1, 15, 12, 30, tzinfo=timezone.utc)
 
 
-
 class FakeS3:
     """In-memory S3 fake supporting object listing and manifest reads."""
 
@@ -32,7 +31,6 @@ class FakeS3:
 
         return Paginator()
 
-
     def list_objects_v2(self, Bucket, Prefix):
         items = [
             {"Key": key, "LastModified": modified}
@@ -40,7 +38,6 @@ class FakeS3:
             if bucket == Bucket and key.startswith(Prefix)
         ]
         return {"Contents": items} if items else {}
-
 
     def get_object(self, Bucket, Key):
         value = self.objects.get((Bucket, Key))
@@ -181,7 +178,6 @@ class StaleHourTests(unittest.TestCase):
         result = self.stale(*objects.items())
         self.assertEqual(result, [("2026-01-15", "12")])
 
-
     def test_manifest_storage_error_is_propagated(self):
         objects = dict([bronze("12", T0)])
         s3 = FakeS3(objects)
@@ -197,31 +193,27 @@ class StaleHourTests(unittest.TestCase):
             "GetObject",
         )
 
-        with patch(
-            "late_data.resolve_silver_artifacts",
-            side_effect=error,
-        ), self.assertRaises(ClientError):
+        with (
+            patch(
+                "late_data.resolve_silver_artifacts",
+                side_effect=error,
+            ),
+            self.assertRaises(ClientError),
+        ):
             late_data.is_hour_stale("2026-01-15", "12", s3)
-
 
     def test_active_manifest_artifacts_are_checked(self):
         publication_id = "a" * 32
         partition = "date=2026-01-15/hour=12"
-        version_prefix = (
-            f"_versions/{partition}/{publication_id}/"
-        )
+        version_prefix = f"_versions/{partition}/{publication_id}/"
         manifest = {
             "publication_id": publication_id,
             "partition": partition,
             "status": "published",
             "artifacts": {
                 "data": f"s3://silver/{version_prefix}data.parquet",
-                "quarantine": (
-                    f"s3://silver/{version_prefix}quarantine.parquet"
-                ),
-                "completeness": (
-                    f"s3://silver/{version_prefix}_completeness.json"
-                ),
+                "quarantine": (f"s3://silver/{version_prefix}quarantine.parquet"),
+                "completeness": (f"s3://silver/{version_prefix}_completeness.json"),
             },
         }
         objects: dict[tuple[str, str], datetime | dict] = dict([bronze("12", T0)])
@@ -231,12 +223,9 @@ class StaleHourTests(unittest.TestCase):
         objects[("silver", f"{version_prefix}quarantine.parquet")] = T0
         objects[("silver", f"{version_prefix}_completeness.json")] = T0
 
-        result = late_data.is_hour_stale(
-            "2026-01-15", "12", FakeS3(objects)
-        )
+        result = late_data.is_hour_stale("2026-01-15", "12", FakeS3(objects))
 
         self.assertFalse(result)
-
 
 
 class ReprocessTests(unittest.TestCase):

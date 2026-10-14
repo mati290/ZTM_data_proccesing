@@ -42,7 +42,6 @@ class CompletenessTests(unittest.TestCase):
         ]
         return client
 
-
     @staticmethod
     def _marker_client(status=None, error_code=None):
         client = Mock()
@@ -56,30 +55,24 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
-
     def test_write_silver_active_manifest_publishes_pointer(self):
         publication_id = "a" * 32
         partition = "date=2026-10-09/hour=07"
         artifacts = {
             "data": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/data.parquet"
+                f"s3://silver/_versions/{partition}/{publication_id}/data.parquet"
             ),
             "quarantine": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/quarantine.parquet"
+                f"s3://silver/_versions/{partition}/{publication_id}/quarantine.parquet"
             ),
             "completeness": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/_completeness.json"
+                f"s3://silver/_versions/{partition}/{publication_id}/_completeness.json"
             ),
         }
         client = Mock()
 
         with patch("bronze_to_silver._s3_client", return_value=client):
-            write_silver_active_manifest(
-                "2026-10-09", "07", publication_id, artifacts
-            )
+            write_silver_active_manifest("2026-10-09", "07", publication_id, artifacts)
 
         client.put_object.assert_called_once()
         args = client.put_object.call_args.kwargs
@@ -99,16 +92,13 @@ class CompletenessTests(unittest.TestCase):
         partition = "date=2026-10-09/hour=07"
         artifacts = {
             "data": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/data.parquet"
+                f"s3://silver/_versions/{partition}/{publication_id}/data.parquet"
             ),
             "quarantine": (
-                f"s3://silver/_versions/{partition}/"
-                f"{'b' * 32}/quarantine.parquet"
+                f"s3://silver/_versions/{partition}/{'b' * 32}/quarantine.parquet"
             ),
             "completeness": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/_completeness.json"
+                f"s3://silver/_versions/{partition}/{publication_id}/_completeness.json"
             ),
         }
         client = Mock()
@@ -117,12 +107,9 @@ class CompletenessTests(unittest.TestCase):
             patch("bronze_to_silver._s3_client", return_value=client),
             self.assertRaises(ValueError),
         ):
-            write_silver_active_manifest(
-                "2026-10-09", "07", publication_id, artifacts
-            )
+            write_silver_active_manifest("2026-10-09", "07", publication_id, artifacts)
 
         client.put_object.assert_not_called()
-
 
     def test_write_silver_active_manifest_rejects_extra_path(self):
         publication_id = "a" * 32
@@ -133,12 +120,10 @@ class CompletenessTests(unittest.TestCase):
                 f"{publication_id}/nested/data.parquet"
             ),
             "quarantine": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/quarantine.parquet"
+                f"s3://silver/_versions/{partition}/{publication_id}/quarantine.parquet"
             ),
             "completeness": (
-                f"s3://silver/_versions/{partition}/"
-                f"{publication_id}/_completeness.json"
+                f"s3://silver/_versions/{partition}/{publication_id}/_completeness.json"
             ),
         }
         client = Mock()
@@ -147,13 +132,9 @@ class CompletenessTests(unittest.TestCase):
             patch("bronze_to_silver._s3_client", return_value=client),
             self.assertRaises(ValueError),
         ):
-            write_silver_active_manifest(
-                "2026-10-09", "07", publication_id, artifacts
-            )
+            write_silver_active_manifest("2026-10-09", "07", publication_id, artifacts)
 
         client.put_object.assert_not_called()
-
-
 
     def test_active_silver_manifest_resolves_all_artifacts(self):
         manifest = {
@@ -189,7 +170,6 @@ class CompletenessTests(unittest.TestCase):
             Key="vehicle_positions/date=2026-10-09/hour=07/_active.json",
         )
 
-
     def test_read_completeness_marker_uses_active_manifest(self):
         publication_id = "a" * 32
         partition = "date=2026-10-09/hour=07"
@@ -199,8 +179,7 @@ class CompletenessTests(unittest.TestCase):
             "status": "published",
             "artifacts": {
                 "data": (
-                    f"s3://silver/_versions/{partition}/"
-                    f"{publication_id}/data.parquet"
+                    f"s3://silver/_versions/{partition}/{publication_id}/data.parquet"
                 ),
                 "quarantine": (
                     f"s3://silver/_versions/{partition}/"
@@ -231,12 +210,9 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.call_args_list[1].kwargs,
             {
                 "Bucket": "silver",
-                "Key": (
-                    f"_versions/{partition}/{publication_id}/_completeness.json"
-                ),
+                "Key": (f"_versions/{partition}/{publication_id}/_completeness.json"),
             },
         )
-
 
     def test_missing_active_manifest_uses_legacy_paths(self):
         client = Mock()
@@ -250,8 +226,7 @@ class CompletenessTests(unittest.TestCase):
             result,
             {
                 "data": (
-                    "s3://silver/vehicle_positions/date=2026-10-09/"
-                    "hour=07/data.parquet"
+                    "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet"
                 ),
                 "quarantine": (
                     "s3://silver/quarantine/vehicle_positions/"
@@ -279,7 +254,6 @@ class CompletenessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_silver_artifacts("2026-10-09", "07", client)
 
-
     def test_is_hour_complete_only_for_complete(self):
         for status, expected in (
             ("complete", True),
@@ -296,9 +270,7 @@ class CompletenessTests(unittest.TestCase):
                     )
                 },
             ):
-                self.assertIs(
-                    is_hour_complete("2026-10-09", "07", client), expected
-                )
+                self.assertIs(is_hour_complete("2026-10-09", "07", client), expected)
 
     def test_missing_marker_is_unknown_not_complete(self):
         client = self._marker_client(error_code="NoSuchKey")
@@ -408,7 +380,6 @@ class CompletenessTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "incomplete")
 
-
     def test_active_manifest_rejects_artifact_from_another_version(self):
         manifest = {
             "publication_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -436,7 +407,6 @@ class CompletenessTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             resolve_silver_artifacts("2026-10-09", "07", client)
-
 
     def test_active_manifest_rejects_artifact_with_extra_path(self):
         publication_id = "a" * 32
@@ -609,7 +579,6 @@ class TransformHourTests(unittest.TestCase):
         with self.assertRaises(duckdb.IOException):
             transform_hour(connection, "2026-10-09", "7")
 
-
     def test_publishes_validated_temp_file_with_server_side_copy(self):
         connection = self._happy_path_connection()
 
@@ -640,11 +609,9 @@ class TransformHourTests(unittest.TestCase):
         self.assertTrue(data_destination.startswith(version_prefix))
         self.assertTrue(data_destination.endswith("/data.parquet"))
 
-        publication_id = data_destination[len(version_prefix):].split("/")[0]
+        publication_id = data_destination[len(version_prefix) :].split("/")[0]
         self.assertEqual(len(publication_id), 32)
-        self.assertTrue(
-            all(char in "0123456789abcdef" for char in publication_id)
-        )
+        self.assertTrue(all(char in "0123456789abcdef" for char in publication_id))
         self.assertEqual(
             rejected_destination,
             f"{version_prefix}{publication_id}/quarantine.parquet",
@@ -672,7 +639,6 @@ class TransformHourTests(unittest.TestCase):
             },
         )
 
-
     def test_warns_and_still_publishes_when_hour_is_incomplete(self):
         self.assess_mock.return_value = {
             "status": "incomplete",
@@ -692,7 +658,6 @@ class TransformHourTests(unittest.TestCase):
         self.assertEqual(copy_mock.call_count, 2)
         self.write_marker_mock.assert_called_once()
         self.assertTrue(any("incomplete" in line for line in logs.output))
-
 
     def test_publishes_rejected_rows_to_quarantine(self):
         connection = Mock()
@@ -722,18 +687,14 @@ class TransformHourTests(unittest.TestCase):
         self.assertTrue(data_destination.startswith(version_prefix))
         self.assertTrue(data_destination.endswith("/data.parquet"))
 
-        publication_id = data_destination[len(version_prefix):].split("/")[0]
+        publication_id = data_destination[len(version_prefix) :].split("/")[0]
         self.assertEqual(len(publication_id), 32)
-        self.assertTrue(
-            all(char in "0123456789abcdef" for char in publication_id)
-        )
+        self.assertTrue(all(char in "0123456789abcdef" for char in publication_id))
         self.assertEqual(
             rejected_destination,
             f"{version_prefix}{publication_id}/quarantine.parquet",
         )
         manifest_mock.assert_called_once()
-
-
 
     def test_second_publish_copy_failure_propagates_after_first_copy(self):
         connection = self._happy_path_connection()
@@ -752,9 +713,7 @@ class TransformHourTests(unittest.TestCase):
             ),
             patch("bronze_to_silver.delete_s3_object"),
             patch("bronze_to_silver.write_silver_active_manifest") as manifest_mock,
-            self.assertRaisesRegex(
-                RuntimeError, "forced second publish failure"
-            ),
+            self.assertRaisesRegex(RuntimeError, "forced second publish failure"),
         ):
             transform_hour(connection, "2026-10-09", "7")
 
@@ -771,7 +730,6 @@ class TransformHourTests(unittest.TestCase):
 
         manifest_mock.assert_not_called()
         self.write_marker_mock.assert_not_called()
-
 
     def test_overwrite_false_refuses_to_replace_existing_output(self):
         connection = self._happy_path_connection()

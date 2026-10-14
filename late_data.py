@@ -38,7 +38,6 @@ def _max_last_modified(s3_client, bucket, prefix):
     return latest
 
 
-
 def is_hour_stale(date_str, hour_str, s3_client) -> bool:
     date_str, hour_str = validate_partition(date_str, hour_str)
 
@@ -49,23 +48,17 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
             "bronze",
             f"vehicle_type={label}/date={date_str}/hour={hour_str}/",
         )
-        if modified is not None and (
-            bronze_latest is None or modified > bronze_latest
-        ):
+        if modified is not None and (bronze_latest is None or modified > bronze_latest):
             bronze_latest = modified
 
     if bronze_latest is None:
         return False
 
     try:
-        artifacts = resolve_silver_artifacts(
-            date_str, hour_str, s3_client=s3_client
-        )
+        artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
-        status = exc.response.get("ResponseMetadata", {}).get(
-            "HTTPStatusCode"
-        )
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
             return True
         raise
@@ -85,10 +78,7 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
             Bucket=bucket,
             Prefix=key,
         )
-        if not any(
-            obj.get("Key") == key
-            for obj in response.get("Contents", [])
-        ):
+        if not any(obj.get("Key") == key for obj in response.get("Contents", [])):
             return True
 
     data_bucket, data_key = _parse_s3_uri(artifacts["data"])
@@ -99,7 +89,6 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
     )
 
     return silver_latest is None or bronze_latest > silver_latest
-
 
 
 def find_stale_hours(

@@ -143,7 +143,6 @@ class SilverDataMissingError(FileNotFoundError):
     """Raised when the Silver partition for the hour does not exist."""
 
 
-
 def partition_uris(date_str: str, hour_str: str) -> dict:
     date_str, hour_str = validate_partition(date_str, hour_str)
     partition = f"date={date_str}/hour={hour_str}"
@@ -156,8 +155,7 @@ def partition_uris(date_str: str, hour_str: str) -> dict:
         "quarantine": silver_artifacts["quarantine"],
         "gold": {
             table: (
-                f"s3://gold/_versions/{partition}/{publication_id}/"
-                f"{table}/data.parquet"
+                f"s3://gold/_versions/{partition}/{publication_id}/{table}/data.parquet"
             )
             for table in GOLD_TABLES
         },
@@ -172,7 +170,6 @@ def partition_uris(date_str: str, hour_str: str) -> dict:
         "partition": partition,
         "manifest_uri": publication_manifest_uri(date_str, hour_str),
     }
-
 
 
 def publication_manifest_uri(date_str: str, hour_str: str) -> str:

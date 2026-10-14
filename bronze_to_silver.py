@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import logging
 import math
@@ -42,6 +42,7 @@ EXPECTED_SILVER_TYPES = {
 
 class BronzeDataMissingError(FileNotFoundError):
     """Raised when an hourly Bronze partition contains no files."""
+
 
 BASE_CTES = """
 WITH source AS (
@@ -355,19 +356,15 @@ def resolve_silver_artifacts(
         )
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
-        status = exc.response.get("ResponseMetadata", {}).get(
-            "HTTPStatusCode"
-        )
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
             return {
                 "data": f"s3://silver/vehicle_positions/{partition}/data.parquet",
                 "quarantine": (
-                    f"s3://silver/quarantine/vehicle_positions/"
-                    f"{partition}/data.parquet"
+                    f"s3://silver/quarantine/vehicle_positions/{partition}/data.parquet"
                 ),
                 "completeness": (
-                    f"s3://silver/vehicle_positions/{partition}/"
-                    "_completeness.json"
+                    f"s3://silver/vehicle_positions/{partition}/_completeness.json"
                 ),
             }
         raise
@@ -394,19 +391,13 @@ def resolve_silver_artifacts(
     ):
         raise ValueError("Active Silver manifest is missing publication metadata")
 
-
     expected_artifacts = {
-        "data": (
-            f"s3://silver/_versions/{partition}/"
-            f"{publication_id}/data.parquet"
-        ),
+        "data": (f"s3://silver/_versions/{partition}/{publication_id}/data.parquet"),
         "quarantine": (
-            f"s3://silver/_versions/{partition}/"
-            f"{publication_id}/quarantine.parquet"
+            f"s3://silver/_versions/{partition}/{publication_id}/quarantine.parquet"
         ),
         "completeness": (
-            f"s3://silver/_versions/{partition}/"
-            f"{publication_id}/_completeness.json"
+            f"s3://silver/_versions/{partition}/{publication_id}/_completeness.json"
         ),
     }
 
@@ -414,13 +405,10 @@ def resolve_silver_artifacts(
     for name, expected_uri in expected_artifacts.items():
         uri = artifacts.get(name)
         if uri != expected_uri:
-            raise ValueError(
-                f"Active Silver manifest has invalid {name} artifact URI"
-            )
+            raise ValueError(f"Active Silver manifest has invalid {name} artifact URI")
         resolved[name] = uri
 
     return resolved
-
 
 
 def write_silver_active_manifest(
@@ -441,17 +429,12 @@ def write_silver_active_manifest(
         raise ValueError("Invalid Silver publication ID")
 
     expected_artifacts = {
-        "data": (
-            f"s3://silver/_versions/{partition}/"
-            f"{publication_id}/data.parquet"
-        ),
+        "data": (f"s3://silver/_versions/{partition}/{publication_id}/data.parquet"),
         "quarantine": (
-            f"s3://silver/_versions/{partition}/"
-            f"{publication_id}/quarantine.parquet"
+            f"s3://silver/_versions/{partition}/{publication_id}/quarantine.parquet"
         ),
         "completeness": (
-            f"s3://silver/_versions/{partition}/"
-            f"{publication_id}/_completeness.json"
+            f"s3://silver/_versions/{partition}/{publication_id}/_completeness.json"
         ),
     }
 
@@ -601,7 +584,6 @@ def write_completeness_marker(completeness: dict, silver_dir: str) -> None:
     )
 
 
-
 def read_completeness_marker(date_str: str, hour_str: str, s3_client=None) -> dict:
     """Read the active completeness marker, with legacy-path fallback."""
     date_str, hour_str = validate_partition(date_str, hour_str)
@@ -622,7 +604,6 @@ def read_completeness_marker(date_str: str, hour_str: str, s3_client=None) -> di
     return json.loads(body)
 
 
-
 def is_hour_complete(date_str: str, hour_str: str, s3_client=None) -> bool:
     """Gold/dashboard consumers should only aggregate hours where this is True."""
     marker = read_completeness_marker(date_str, hour_str, s3_client)
@@ -639,13 +620,10 @@ def validate_output_quality(
         )
 
 
-
 def transform_hour(con, date_str, hour_str, overwrite=True):
     date_str, hour_str = validate_partition(date_str, hour_str)
     partition = f"date={date_str}/hour={hour_str}"
-    bronze_path = (
-        f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
-    )
+    bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
 
     publication_id = uuid.uuid4().hex
     version_dir = f"s3://silver/_versions/{partition}/{publication_id}"
@@ -695,9 +673,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     rejected_count = before - after
 
     if not overwrite:
-        active_artifacts = resolve_silver_artifacts(
-            date_str, hour_str
-        )
+        active_artifacts = resolve_silver_artifacts(date_str, hour_str)
         if any(
             s3_object_exists(path)
             for path in (
@@ -725,8 +701,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
             )
 
         con.execute(
-            f"COPY ({sql}) TO '{temp_file}' "
-            "(FORMAT parquet, OVERWRITE_OR_IGNORE true)"
+            f"COPY ({sql}) TO '{temp_file}' (FORMAT parquet, OVERWRITE_OR_IGNORE true)"
         )
         validate_silver_schema(con, temp_file)
 
@@ -799,7 +774,6 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
         f"silver={after}, "
         f"dropped={dropped_pct:.1%} -> {output_file}"
     )
-
 
 
 def main():
