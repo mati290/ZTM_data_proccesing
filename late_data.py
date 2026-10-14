@@ -15,6 +15,12 @@ from datetime import datetime, timedelta, timezone
 
 import bronze_to_silver
 import silver_to_gold
+from bronze_to_silver import (
+    ClientError,
+    _parse_s3_uri,
+    resolve_silver_artifacts,
+    validate_partition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,8 @@ def _max_last_modified(s3_client, bucket, prefix):
 
 
 def is_hour_stale(date_str, hour_str, s3_client) -> bool:
+    date_str, hour_str = validate_partition(date_str, hour_str)
+
     bronze_latest = None
     for label in VEHICLE_TYPES:
         modified = _max_last_modified(
@@ -42,14 +50,44 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
         )
         if modified is not None and (bronze_latest is None or modified > bronze_latest):
             bronze_latest = modified
+
     if bronze_latest is None:
         return False
 
+    try:
+        artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
+            return True
+        raise
+
+    required_artifacts = (
+        artifacts["data"],
+        artifacts["quarantine"],
+        artifacts["completeness"],
+    )
+
+    for uri in required_artifacts:
+        bucket, key = _parse_s3_uri(uri)
+        if bucket != "silver":
+            raise ValueError(f"Unexpected Silver artifact bucket: {bucket}")
+
+        response = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=key,
+        )
+        if not any(obj.get("Key") == key for obj in response.get("Contents", [])):
+            return True
+
+    data_bucket, data_key = _parse_s3_uri(artifacts["data"])
     silver_latest = _max_last_modified(
         s3_client,
-        "silver",
-        f"vehicle_positions/date={date_str}/hour={hour_str}/data.parquet",
+        data_bucket,
+        data_key,
     )
+
     return silver_latest is None or bronze_latest > silver_latest
 
 

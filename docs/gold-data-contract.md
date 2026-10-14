@@ -17,11 +17,13 @@ nie zostały zlane.
 `_completeness.json` z tej samej partycji Silver jest autorytatywnym źródłem
 `data_completeness_status`:
 
-- `complete` oznacza, że co najmniej 90% zapisanych manifestów ingestii dla
-  godziny ma status `complete` (API zwróciło niepuste dane dla obu typów);
-- `incomplete` oznacza, że istnieje co najmniej jeden manifest, ale udział
-  kompletnych cykli jest niższy niż 90%;
-- `unknown` oznacza brak manifestów albo brak markera.
+- `complete` oznacza jednocześnie:
+  - co najmniej 75% oczekiwanych cykli ingestu zostało zapisanych;
+  - co najmniej 90% zapisanych manifestów ma status `complete`;
+- `incomplete` oznacza, że zapisano co najmniej jeden manifest, ale:
+  - liczba zapisanych cykli jest mniejsza niż wymagane minimum; albo
+  - udział kompletnych cykli jest niższy niż 90%;
+- `unknown` oznacza brak manifestów albo brak markera
 
 `complete` nie gwarantuje, że każde wywołanie API zwróciło dane; to status
 według progu manifestów, a nie dowód pełnej obserwowalności. `unknown` nigdy
@@ -203,16 +205,12 @@ brak aktywności.
 
 ## Implementacja (silver_to_gold.py)
 
-- Kolejność publikacji: `vehicle_activity_hourly`, `hourly_line_metrics`,
-  `hourly_network_metrics`, na końcu `hourly_data_quality`. Pliki są
-  najpierw zapisywane w `s3://gold/_staging/`, walidowane (schemat, liczba
-  wierszy), kopiowane do `<table>/date=D/hour=HH/data.parquet` i usuwane ze
-  stagingu. Obecność wiersza jakości oznacza zakończoną publikację godziny.
-- Idempotencja: ponowny run godziny nadpisuje te same klucze i daje te same
-  kolumny danych; `pipeline_run_at` jest metadaną runu i się zmienia.
-- Walidacje: schemat Silver przed agregacją, spójność krzyżowa tabel
-  (suma pojazdów, zdarzeń) oraz unikalność kluczy.
-- Godziny `incomplete`/`unknown` są publikowane z jawnym
-  `data_completeness_status`; konsument filtruje `complete`.
-- Zakres jakości nie obejmuje już statusu Airflow; luki w godzinach wykrywa
-  się orkiestracją (nieudany run) i osią oczekiwanych godzin na dashboardzie.
+## Implementacja (`silver_to_gold.py`)
+
+- **Publikacja atomowa:** tabele `vehicle_activity_hourly`, `hourly_line_metrics`, `hourly_network_metrics` i `hourly_data_quality` są najpierw zapisywane w `s3://gold/_staging/`, a następnie walidowane pod kątem schematu i liczby wierszy. Po walidacji pliki trafiają do unikalnych, wersjonowanych ścieżek w `s3://gold/_versions/`. Dopiero po przygotowaniu wszystkich czterech tabel zapisywany jest manifest w `s3://gold/_commits/`, wskazujący URI opublikowanych plików i ich liczby wierszy. Konsument powinien odczytywać manifest i korzystać z URI, które wskazuje, zamiast zakładać stałe ścieżki plików.
+- **Granica publikacji:** manifest jest punktem zatwierdzenia pełnej publikacji Gold. Jeśli przygotowanie lub kopiowanie tabel zakończy się błędem przed zapisaniem manifestu, poprzednia publikacja pozostaje wskazywana przez dotychczasowy manifest. Zapis pojedynczego obiektu manifestu w S3 atomowo zastępuje jego poprzednią wersję.
+- **Publikacja diagnostyczna:** gdy Silver nie istnieje lub jest pusty, pipeline publikuje wyłącznie `hourly_data_quality` oraz osobny manifest diagnostyczny w `s3://gold/_diagnostics/date=YYYY-MM-DD/hour=HH/manifest.json`. Pole `status` przyjmuje wartość `silver_missing` dla brakującej partycji albo `silver_empty` dla istniejącej, lecz pustej partycji. Manifest diagnostyczny zawiera `publication_id`, `partition`, `status` oraz URI i liczbę wierszy tabeli `hourly_data_quality`. Nie jest to pełna publikacja Gold i manifest diagnostyczny nie zastępuje ani nie nadpisuje manifestu pełnej publikacji w `s3://gold/_commits/date=YYYY-MM-DD/hour=HH/manifest.json`. Konsumenci szukający diagnostyki powinni sprawdzać ścieżkę `_diagnostics/`; konsumenci pełnych danych Gold powinni korzystać wyłącznie z `_commits/`.
+- **Idempotencja:** ponowne przeliczenie godziny publikuje nową wersję plików i aktualizuje manifest. `pipeline_run_at` jest metadaną uruchomienia i może się zmieniać; pozostałe dane powinny być zgodne z wejściem i kontraktem.
+- **Walidacje:** schemat Silver przed agregacją, spójność krzyżowa tabel (suma pojazdów i zdarzeń) oraz unikalność kluczy.
+- **Kompletność:** godziny ze statusem `incomplete` lub `unknown` są publikowane z jawnym `data_completeness_status`. Konsument powinien uwzględniać ten status oraz `safe_for_dashboard` i `is_final`, zamiast traktować samą obecność danych jako gwarancję ich gotowości.
+- **Zakres jakości:** jakość nie obejmuje statusu Airflow. Luki w godzinach należy wykrywać na podstawie orkiestracji i oczekiwanej osi czasu na dashboardzie.

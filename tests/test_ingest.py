@@ -175,6 +175,31 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "partial")
         self.assertEqual(manifest["failed_sources"], ["tram"])
 
+    def test_run_once_raises_when_cycle_manifest_write_fails(self):
+        s3 = Mock()
+        s3.put_object.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "InternalError",
+                    "Message": "manifest write failed",
+                }
+            },
+            "PutObject",
+        )
+
+        with (
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[
+                    [{"VehicleNumber": "1"}],
+                    [{"VehicleNumber": "2"}],
+                ],
+            ),
+            patch("ingest.save_to_bronze"),
+            self.assertRaises(ClientError),
+        ):
+            run_once("test-key", s3)
+
     def test_run_once_manifest_marks_complete_cycle(self):
         s3 = Mock()
         with (
@@ -188,6 +213,39 @@ class SaveToBronzeTests(unittest.TestCase):
 
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
         self.assertEqual(manifest["status"], "complete")
+
+    def test_main_configures_s3_timeouts_and_retries(self):
+        s3_client = Mock()
+        with (
+            patch.dict(
+                "os.environ",
+                {"ZTM_API_KEY": "test-key", "POLL_INTERVAL_SECONDS": "1"},
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=s3_client) as client_mock,
+            patch("ingest.ensure_bucket_with_retry"),
+            patch(
+                "ingest.run_once",
+                return_value={
+                    "buses": 1,
+                    "trams": 1,
+                    "total": 2,
+                    "failed_sources": [],
+                    "empty_sources": [],
+                },
+            ),
+            patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        config = client_mock.call_args.kwargs["config"]
+        self.assertEqual(config.connect_timeout, 5)
+        self.assertEqual(config.read_timeout, 15)
+        self.assertEqual(
+            config.retries,
+            {"mode": "standard", "max_attempts": 3},
+        )
 
     def test_main_alerts_after_consecutive_degraded_cycles(self):
         degraded = {
@@ -311,6 +369,36 @@ class SaveToBronzeTests(unittest.TestCase):
 
         self.assertEqual(s3.head_bucket.call_count, 4)
         sleep.assert_called_once_with(2)
+
+    def test_main_logs_completed_ingestion_cycle(self):
+        result = {
+            "buses": 12,
+            "trams": 34,
+            "total": 46,
+            "failed_sources": [],
+            "empty_sources": [],
+        }
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"ZTM_API_KEY": "test-key", "POLL_INTERVAL_SECONDS": "1"},
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client", return_value=Mock()),
+            patch("ingest.ensure_bucket_with_retry"),
+            patch("ingest.run_once", return_value=result),
+            patch("ingest.time.sleep", side_effect=KeyboardInterrupt),
+            self.assertLogs("ingest", level="INFO") as captured,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+
+        logs = "\n".join(captured.output)
+        self.assertIn("Ingestion cycle finished: status=complete", logs)
+        self.assertIn("buses=12", logs)
+        self.assertIn("trams=34", logs)
+        self.assertIn("total=46", logs)
 
 
 if __name__ == "__main__":

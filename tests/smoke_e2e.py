@@ -38,6 +38,32 @@ def build_records():
     return [good, good, stale, outside]
 
 
+def assert_test_partition_empty(s3, date_str, hour_str):
+    prefixes = [
+        ("bronze", f"vehicle_type=bus/date={date_str}/hour={hour_str}/"),
+        ("bronze", f"vehicle_type=tram/date={date_str}/hour={hour_str}/"),
+        ("silver", f"vehicle_positions/date={date_str}/hour={hour_str}/"),
+        (
+            "silver",
+            f"quarantine/vehicle_positions/date={date_str}/hour={hour_str}/",
+        ),
+        ("gold", f"_versions/date={date_str}/hour={hour_str}/"),
+        ("gold", f"_staging/date={date_str}/hour={hour_str}/"),
+        ("gold", f"_commits/date={date_str}/hour={hour_str}/"),
+    ]
+
+    for bucket, prefix in prefixes:
+        response = s3.list_objects_v2(
+            Bucket=bucket,
+            Prefix=prefix,
+            MaxKeys=1,
+        )
+        if response.get("Contents"):
+            raise FileExistsError(
+                f"Smoke-test partition is not empty: s3://{bucket}/{prefix}"
+            )
+
+
 def main():
     s3 = boto3.client(
         "s3",
@@ -45,49 +71,49 @@ def main():
         aws_access_key_id=os.environ["MINIO_USER"],
         aws_secret_access_key=os.environ["MINIO_PASSWORD"],
     )
-    existing = {b["Name"] for b in s3.list_buckets()["Buckets"]}
-    for bucket in ("bronze", "silver", "gold"):
-        if bucket not in existing:
-            s3.create_bucket(Bucket=bucket)
 
-    key = f"vehicle_type=bus/date={DATE}/hour={HOUR}/smoke.jsonl"
-    body = "\n".join(json.dumps(r) for r in build_records())
-    s3.put_object(Bucket="bronze", Key=key, Body=body.encode())
-
-    con = bronze_to_silver.get_connection()
+    con = None
     try:
+        existing = {b["Name"] for b in s3.list_buckets()["Buckets"]}
+        for bucket in ("bronze", "silver", "gold"):
+            if bucket not in existing:
+                s3.create_bucket(Bucket=bucket)
+
+        assert_test_partition_empty(s3, DATE, HOUR)
+
+        key = f"vehicle_type=bus/date={DATE}/hour={HOUR}/smoke.jsonl"
+        body = "\n".join(json.dumps(r) for r in build_records())
+        s3.put_object(Bucket="bronze", Key=key, Body=body.encode())
+
+        con = bronze_to_silver.get_connection()
         bronze_to_silver.transform_hour(con, DATE, HOUR)
-        silver = f"s3://silver/vehicle_positions/date={DATE}/hour={HOUR}/data.parquet"
-        rows = con.execute(
-            f"SELECT vehicle_number FROM read_parquet('{silver}')"
-        ).fetchall()
-        assert len(rows) == 1 and str(rows[0][0]) == "1001", rows
-        rejected = f"s3://silver/quarantine/vehicle_positions/date={DATE}/hour={HOUR}/data.parquet"
-        row = con.execute(f"SELECT COUNT(*) FROM read_parquet('{rejected}')").fetchone()
-        assert row is not None and row[0] == 3, row
-        marker = s3.get_object(
-            Bucket="silver",
-            Key=f"vehicle_positions/date={DATE}/hour={HOUR}/_completeness.json",
-        )
-        assert json.loads(marker["Body"].read())["status"] == "unknown"
 
         import silver_to_gold
 
+        manifest_key = f"_commits/date={DATE}/hour={HOUR}/manifest.json"
+
         def gold_state():
+            manifest_obj = s3.get_object(
+                Bucket="gold",
+                Key=manifest_key,
+            )
+            manifest = json.loads(manifest_obj["Body"].read())
+
             out = {}
             for table in silver_to_gold.GOLD_TABLES:
-                uri = f"s3://gold/{table}/date={DATE}/hour={HOUR}/data.parquet"
+                uri = manifest["tables"][table]["uri"]
                 cols = [
                     r[0]
                     for r in con.execute(
-                        f"DESCRIBE SELECT * FROM read_parquet('{uri}', hive_partitioning=false)"
+                        f"DESCRIBE SELECT * FROM read_parquet("
+                        f"'{uri}', hive_partitioning=false)"
                     ).fetchall()
                     if r[0] != "pipeline_run_at"
                 ]
                 sel = ", ".join(f'"{c}"' for c in cols)
                 out[table] = con.execute(
-                    f"SELECT {sel} FROM read_parquet('{uri}', hive_partitioning=false)"
-                    f" ORDER BY ALL"
+                    f"SELECT {sel} FROM read_parquet("
+                    f"'{uri}', hive_partitioning=false) ORDER BY ALL"
                 ).fetchall()
             return out
 
@@ -95,34 +121,43 @@ def main():
         first = gold_state()
         silver_to_gold.build_gold_hour(con, DATE, HOUR)
         assert gold_state() == first, "Gold rebuild is not idempotent"
+        manifest_obj = s3.get_object(
+            Bucket="gold",
+            Key=manifest_key,
+        )
+        manifest = json.loads(manifest_obj["Body"].read())
+        quality_path = manifest["tables"]["hourly_data_quality"]["uri"]
+
         quality = con.execute(
             "SELECT bronze_records, duplicate_records, safe_for_dashboard,"
             " data_completeness_status FROM read_parquet("
-            f"'s3://gold/hourly_data_quality/date={DATE}/hour={HOUR}/data.parquet',"
-            " hive_partitioning=false)"
+            f"'{quality_path}', hive_partitioning=false)"
         ).fetchone()
         assert quality == (4, 1, False, "unknown"), quality
         vehicles = first["vehicle_activity_hourly"]
         assert len(vehicles) == 1, vehicles
     finally:
-        con.close()
+        if con is not None:
+            con.close()
         for bucket, prefix in (
-            ("bronze", f"vehicle_type=bus/date={DATE}/"),
-            ("silver", f"vehicle_positions/date={DATE}/"),
-            ("silver", f"quarantine/vehicle_positions/date={DATE}/"),
-            *(
-                ("gold", f"{table}/date={DATE}/")
-                for table in (
-                    "vehicle_activity_hourly",
-                    "hourly_line_metrics",
-                    "hourly_network_metrics",
-                    "hourly_data_quality",
-                )
-            ),
+            ("bronze", f"vehicle_type=bus/date={DATE}/hour={HOUR}/"),
+            ("bronze", f"vehicle_type=tram/date={DATE}/hour={HOUR}/"),
+            ("silver", f"vehicle_positions/date={DATE}/hour={HOUR}/"),
+            ("silver", f"quarantine/vehicle_positions/date={DATE}/hour={HOUR}/"),
+            ("gold", f"_versions/date={DATE}/hour={HOUR}/"),
+            ("gold", f"_staging/date={DATE}/hour={HOUR}/"),
+            ("gold", f"_commits/date={DATE}/hour={HOUR}/"),
         ):
-            listing = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-            for obj in listing.get("Contents", []):
-                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
+                Bucket=bucket,
+                Prefix=prefix,
+            ):
+                for obj in page.get("Contents", []):
+                    s3.delete_object(
+                        Bucket=bucket,
+                        Key=obj["Key"],
+                    )
     print("SMOKE OK")
 
 

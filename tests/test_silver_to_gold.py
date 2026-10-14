@@ -1,9 +1,10 @@
 import contextlib
+import json
 import os
 import shutil
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import duckdb
@@ -92,8 +93,10 @@ class GoldAggregationTests(unittest.TestCase):
         )
         total = self.con.execute(
             "SELECT SUM(position_events) FROM hourly_line_metrics"
-        ).fetchone()[0]
-        self.assertEqual(total, 6)
+        ).fetchone()
+        if total is None:
+            self.fail("Expected an aggregate result for hourly_line_metrics")
+        self.assertEqual(total[0], 6)
 
     def test_brigades_and_activity_span(self):
         build_all(self.con, self.path)
@@ -125,6 +128,8 @@ class GoldAggregationTests(unittest.TestCase):
                     "duplicate_records, partial_manifest_cycles "
                     "FROM hourly_data_quality"
                 ).fetchone()
+                if row is None:
+                    self.fail("Expected a quality metrics row")
                 self.assertIs(row[0], expected)
                 self.assertEqual(row[1], 6 + len(reasons))
                 self.assertAlmostEqual(
@@ -151,6 +156,8 @@ class GoldAggregationTests(unittest.TestCase):
             "silver_position_events, quarantined_records, quarantined_by_reason, "
             "partial_manifest_cycles FROM hourly_data_quality"
         ).fetchone()
+        if row is None:
+            self.fail("Expected a quality metrics row")
         self.assertEqual(row[8], 3)
         self.assertEqual(row[:3], ("present", 60, 57))
         self.assertAlmostEqual(row[3], 0.95)
@@ -280,14 +287,37 @@ class BuildGoldHourTests(unittest.TestCase):
 
     def run_build(self, status="complete", silver=True, path=None):
         marker = {"status": status, "cycles": 60, "complete_cycles": 60}
-        original = gold.partition_uris
         silver_path = path or self.path
 
         def fake_uris(date_str, hour_str):
-            return {**original(date_str, hour_str), "silver": silver_path}
+            partition = f"date={date_str}/hour={hour_str}"
+            publication_id = "test-publication"
+
+            return {
+                "silver": silver_path,
+                "quarantine": f"{silver_path.rsplit('/', 1)[0]}/quarantine.parquet",
+                "gold": {
+                    table: (
+                        f"s3://gold/_versions/{partition}/{publication_id}/"
+                        f"{table}/data.parquet"
+                    )
+                    for table in gold.GOLD_TABLES
+                },
+                "staging": {
+                    table: (
+                        f"s3://gold/_staging/{partition}/{publication_id}/"
+                        f"{table}.parquet.pending"
+                    )
+                    for table in gold.GOLD_TABLES
+                },
+                "publication_id": publication_id,
+                "partition": partition,
+                "manifest_uri": gold.publication_manifest_uri(date_str, hour_str),
+            }
 
         with (
             patch("silver_to_gold.read_completeness_marker", return_value=marker),
+            patch("silver_to_gold.write_diagnostic_manifest"),
             patch(
                 "silver_to_gold.s3_object_exists",
                 side_effect=lambda uri: silver and "quarantine" not in uri,
@@ -343,15 +373,52 @@ class BuildGoldHourTests(unittest.TestCase):
 
 
 class PublishTests(unittest.TestCase):
-    def test_partition_uris_use_gold_bucket_and_staging(self):
-        uris = gold.partition_uris("2026-01-15", "09")
-        self.assertEqual(
-            uris["gold"]["hourly_network_metrics"],
-            "s3://gold/hourly_network_metrics/date=2026-01-15/hour=09/data.parquet",
+    def test_partition_uris_use_versioned_gold_and_staging(self):
+        with patch(
+            "silver_to_gold.resolve_silver_artifacts",
+            return_value={
+                "data": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/data.parquet",
+                "quarantine": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/quarantine.parquet",
+                "completeness": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/_completeness.json",
+            },
+        ):
+            uris = gold.partition_uris("2026-01-15", "09")
+
+        self.assertIn("s3://gold/_versions/", uris["gold"]["hourly_network_metrics"])
+        self.assertIn(
+            "/date=2026-01-15/hour=09/", uris["gold"]["hourly_network_metrics"]
         )
+        self.assertTrue(
+            uris["gold"]["hourly_network_metrics"].endswith(
+                "/hourly_network_metrics/data.parquet"
+            )
+        )
+
+        self.assertTrue(uris["publication_id"])
+        self.assertEqual(uris["partition"], "date=2026-01-15/hour=09")
+
         for table in gold.GOLD_TABLES:
             self.assertTrue(uris["staging"][table].endswith(".parquet.pending"))
             self.assertIn("/_staging/", uris["staging"][table])
+            self.assertIn(uris["publication_id"], uris["staging"][table])
+
+    def test_partition_uris_include_commit_manifest(self):
+        with patch(
+            "silver_to_gold.resolve_silver_artifacts",
+            return_value={
+                "data": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/data.parquet",
+                "quarantine": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/quarantine.parquet",
+                "completeness": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/_completeness.json",
+            },
+        ):
+            uris = gold.partition_uris("2026-01-15", "09")
+
+        self.assertEqual(
+            uris["manifest_uri"],
+            gold.publication_manifest_uri("2026-01-15", "09"),
+        )
+        self.assertIn("/_commits/", uris["manifest_uri"])
+        self.assertTrue(uris["manifest_uri"].endswith("/manifest.json"))
 
 
 class LocalPipelineTestCase(unittest.TestCase):
@@ -377,18 +444,52 @@ class LocalPipelineTestCase(unittest.TestCase):
         )
         tmp.close()
 
+    def write_local_manifest(self, manifest_uri, manifest):
+        path = manifest_uri.replace("\\", "/")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(manifest, file, sort_keys=True)
+
+    # Generates local URIs for gold, staging, and manifest files.
     def local_uris(self, date_str, hour_str):
         partition = f"date={date_str}/hour={hour_str}"
+        publication_id = gold.uuid.uuid4().hex
+
+        gold_uris = {
+            table: (
+                f"{self.root}/gold/_versions/{partition}/"
+                f"{publication_id}/{table}/data.parquet"
+            )
+            for table in gold.GOLD_TABLES
+        }
+        staging_uris = {
+            table: (
+                f"{self.root}/gold/_staging/{partition}/"
+                f"{publication_id}/{table}.parquet.pending"
+            )
+            for table in gold.GOLD_TABLES
+        }
+
+        # DuckDB wymaga, aby lokalne katalogi docelowe już istniały.
+        for uri in gold_uris.values():
+            os.makedirs(os.path.dirname(uri), exist_ok=True)
+
+        for uri in staging_uris.values():
+            os.makedirs(os.path.dirname(uri), exist_ok=True)
+
+        manifest_uri = f"{self.root}/gold/_commits/{partition}/manifest.json"
+        os.makedirs(os.path.dirname(manifest_uri), exist_ok=True)
+        diagnostic_uri = f"{self.root}/gold/_diagnostics/{partition}/manifest.json"
+        os.makedirs(os.path.dirname(diagnostic_uri), exist_ok=True)
         return {
             "silver": self.silver,
             "quarantine": self.quarantine,
-            "gold": {
-                t: f"{self.root}/gold/{t}/{partition}/data.parquet"
-                for t in gold.GOLD_TABLES
-            },
-            "staging": {
-                t: f"{self.root}/staging/{t}.parquet.pending" for t in gold.GOLD_TABLES
-            },
+            "gold": gold_uris,
+            "staging": staging_uris,
+            "publication_id": publication_id,
+            "partition": partition,
+            "manifest_uri": manifest_uri,
+            "diagnostic_manifest_uri": diagnostic_uri,
         }
 
     @staticmethod
@@ -401,21 +502,53 @@ class LocalPipelineTestCase(unittest.TestCase):
         if os.path.exists(uri):
             os.remove(uri)
 
-    def build(self, run_at=RUN_AT, validate=None):
+    def build(self, run_at=RUN_AT, validate=None, copy_fn=None, manifest_fn=None):
         os.makedirs(f"{self.root}/staging", exist_ok=True)
         marker = {"status": self.status, "cycles": 60, "complete_cycles": 60}
-        patches = [
-            patch("silver_to_gold.read_completeness_marker", return_value=marker),
-            patch("silver_to_gold.s3_object_exists", side_effect=os.path.exists),
-            patch("silver_to_gold.partition_uris", side_effect=self.local_uris),
-            patch("silver_to_gold.copy_s3_object", side_effect=self.fake_copy),
-            patch("silver_to_gold.delete_s3_object", side_effect=self.fake_delete),
-        ]
-        if validate is not None:
-            patches.append(patch("silver_to_gold.validate_gold_tables", validate))
         with contextlib.ExitStack() as stack:
-            for p in patches:
-                stack.enter_context(p)
+            stack.enter_context(
+                patch(
+                    "silver_to_gold.write_publication_manifest",
+                    side_effect=manifest_fn or self.write_local_manifest,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "silver_to_gold.diagnostic_manifest_uri",
+                    side_effect=lambda date_str, hour_str: (
+                        f"{self.root}/gold/_diagnostics/"
+                        f"date={date_str}/hour={hour_str}/manifest.json"
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "silver_to_gold.write_diagnostic_manifest",
+                    side_effect=self.write_local_manifest,
+                )
+            )
+            stack.enter_context(
+                patch("silver_to_gold.read_completeness_marker", return_value=marker)
+            )
+            stack.enter_context(
+                patch("silver_to_gold.s3_object_exists", side_effect=os.path.exists)
+            )
+            stack.enter_context(
+                patch("silver_to_gold.partition_uris", side_effect=self.local_uris)
+            )
+            stack.enter_context(
+                patch(
+                    "silver_to_gold.copy_s3_object",
+                    side_effect=copy_fn or self.fake_copy,
+                )
+            )
+            stack.enter_context(
+                patch("silver_to_gold.delete_s3_object", side_effect=self.fake_delete)
+            )
+            if validate is not None:
+                stack.enter_context(
+                    patch("silver_to_gold.validate_gold_tables", validate)
+                )
             return gold.build_gold_hour(self.con, "2026-01-15", "12", run_at)
 
     def published(self):
@@ -425,18 +558,30 @@ class LocalPipelineTestCase(unittest.TestCase):
             for f in files
         )
 
+    def _manifest_table_uri(self, table):
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        return manifest["tables"][table]["uri"]
+
     def read_gold(self, table, exclude=("pipeline_run_at",)):
-        uri = f"{self.root}/gold/{table}/date=2026-01-15/hour=12/data.parquet"
+        uri = self._manifest_table_uri(table)
+
         cols = [
-            r[0]
-            for r in self.con.execute(
+            row[0]
+            for row in self.con.execute(
                 f"DESCRIBE SELECT * FROM read_parquet('{uri}', hive_partitioning=false)"
             ).fetchall()
-            if r[0] not in exclude
+            if row[0] not in exclude
         ]
-        sel = ", ".join(f'"{c}"' for c in cols)
+        sel = ", ".join(f'"{col}"' for col in cols)
+
         return self.con.execute(
-            f"SELECT {sel} FROM read_parquet('{uri}', hive_partitioning=false) "
+            f"SELECT {sel} FROM "
+            f"read_parquet('{uri}', hive_partitioning=false) "
             "ORDER BY ALL"
         ).fetchall()
 
@@ -446,22 +591,108 @@ class GoldProcessTests(LocalPipelineTestCase):
         self.write_quarantine(["duplicate", "stale_gps_time"])
         result = self.build()
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(len(self.published()), len(gold.GOLD_TABLES))
+        parquet_files = [path for path in self.published() if path.endswith(".parquet")]
+        self.assertEqual(len(parquet_files), len(gold.GOLD_TABLES))
         self.assertEqual(os.listdir(f"{self.root}/staging"), [])
 
     def test_rerun_is_idempotent_and_creates_no_duplicates(self):
         self.write_quarantine(["duplicate", "stale_gps_time"])
         self.build()
+
         first = {t: self.read_gold(t) for t in gold.GOLD_TABLES}
-        files = self.published()
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as f:
+            first_manifest = json.load(f)
+
         later = RUN_AT.replace(minute=45)
         self.build(run_at=later)
-        self.assertEqual(self.published(), files)
+
+        with open(manifest_uri, "r", encoding="utf-8") as f:
+            second_manifest = json.load(f)
+
+        self.assertNotEqual(
+            first_manifest["publication_id"],
+            second_manifest["publication_id"],
+        )
+        self.assertEqual(
+            set(second_manifest["tables"]),
+            set(gold.GOLD_TABLES),
+        )
+
         for table in gold.GOLD_TABLES:
             self.assertEqual(self.read_gold(table), first[table], table)
-            self.assertEqual(len(first[table]) > 0, True)
+            self.assertTrue(len(first[table]) > 0)
+            self.assertIn("uri", second_manifest["tables"][table])
+            self.assertTrue(os.path.exists(second_manifest["tables"][table]["uri"]))
+
         self.assertEqual(len(first["hourly_network_metrics"]), 1)
         self.assertEqual(len(first["hourly_data_quality"]), 1)
+
+    def test_missing_silver_keeps_previous_full_manifest(self):
+        self.build()
+
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            previous_manifest = json.load(file)
+
+        # Simulate a missing Silver partition on the next attempt.
+        self.silver = os.path.join(self.tmp.name, "missing-silver.parquet")
+
+        with self.assertRaises(gold.SilverDataMissingError):
+            self.build()
+
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            current_manifest = json.load(file)
+
+        self.assertEqual(current_manifest, previous_manifest)
+        self.assertEqual(set(current_manifest["tables"]), set(gold.GOLD_TABLES))
+
+        diagnostic_uri = (
+            f"{self.root}/gold/_diagnostics/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(diagnostic_uri, "r", encoding="utf-8") as file:
+            diagnostic_manifest = json.load(file)
+
+        self.assertEqual(diagnostic_manifest["status"], "silver_missing")
+        self.assertEqual(
+            set(diagnostic_manifest["tables"]),
+            {"hourly_data_quality"},
+        )
+
+    def test_empty_silver_writes_diagnostic_manifest(self):
+        self.build()
+
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            previous_manifest = json.load(file)
+
+        self.silver = make_silver(self.tmp.name, SILVER_SQL + " LIMIT 0")
+
+        with self.assertRaisesRegex(ValueError, "empty"):
+            self.build()
+
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            current_manifest = json.load(file)
+
+        self.assertEqual(current_manifest, previous_manifest)
+
+        diagnostic_uri = (
+            f"{self.root}/gold/_diagnostics/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(diagnostic_uri, "r", encoding="utf-8") as file:
+            diagnostic_manifest = json.load(file)
+
+        self.assertEqual(diagnostic_manifest["status"], "silver_empty")
+        self.assertEqual(
+            set(diagnostic_manifest["tables"]),
+            {"hourly_data_quality"},
+        )
 
     def test_hour_is_not_final_during_grace_period(self):
         self.build(run_at=datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
@@ -492,52 +723,63 @@ class GoldProcessTests(LocalPipelineTestCase):
         )
         self.build()
         trams = self.con.execute(
-            "SELECT vehicle_number FROM read_parquet('"
-            f"{self.root}/gold/vehicle_activity_hourly/date=2026-01-15/hour=12/"
-            "data.parquet', hive_partitioning=false) "
+            "SELECT vehicle_number "
+            f"FROM read_parquet('{self._manifest_table_uri('vehicle_activity_hourly')}', "
+            "hive_partitioning=false) "
             "WHERE vehicle_type = 'tram' ORDER BY 1"
         ).fetchall()
+
         self.assertEqual(trams, [("1000",), ("2001",)])
 
     def test_incomplete_status_is_never_published_as_complete(self):
         self.status = "incomplete"
         self.write_quarantine(["duplicate"])
+
         with self.assertLogs("silver_to_gold", level="WARNING"):
             result = self.build()
+
         self.assertEqual(result["status"], "incomplete")
+
         for table in ("hourly_network_metrics", "hourly_data_quality"):
             statuses = {
-                r[0]
-                for r in self.con.execute(
-                    "SELECT data_completeness_status FROM read_parquet('"
-                    f"{self.root}/gold/{table}/date=2026-01-15/hour=12/data.parquet',"
-                    " hive_partitioning=false)"
+                row[0]
+                for row in self.con.execute(
+                    f"SELECT data_completeness_status "
+                    f"FROM read_parquet('{self._manifest_table_uri(table)}', "
+                    "hive_partitioning=false)"
                 ).fetchall()
             }
             self.assertEqual(statuses, {"incomplete"}, table)
+
+        quality_uri = self._manifest_table_uri("hourly_data_quality")
         safe = self.con.execute(
-            "SELECT safe_for_dashboard FROM read_parquet('"
-            f"{self.root}/gold/hourly_data_quality/date=2026-01-15/hour=12/"
-            "data.parquet', hive_partitioning=false)"
-        ).fetchone()[0]
-        self.assertIs(safe, False)
+            f"SELECT safe_for_dashboard "
+            f"FROM read_parquet('{quality_uri}', "
+            "hive_partitioning=false)"
+        ).fetchone()
+        if safe is None:
+            self.fail("Expected a dashboard safety result")
+
+        self.assertIs(safe[0], False)
 
     def test_quarantined_duplicates_do_not_inflate_silver_metrics(self):
         self.write_quarantine(["duplicate"] * 5)
         self.build()
+
         totals = self.con.execute(
             "SELECT SUM(active_vehicles), SUM(position_events), SUM(silver_records) "
-            "FROM read_parquet('"
-            f"{self.root}/gold/hourly_network_metrics/date=2026-01-15/hour=12/"
-            "data.parquet', hive_partitioning=false)"
+            f"FROM read_parquet('{self._manifest_table_uri('hourly_network_metrics')}', "
+            "hive_partitioning=false)"
         ).fetchone()
+
         self.assertEqual(totals, (5, 6, 6))
+
         quality = self.con.execute(
             "SELECT bronze_records, silver_position_events, duplicate_records "
-            "FROM read_parquet('"
-            f"{self.root}/gold/hourly_data_quality/date=2026-01-15/hour=12/"
-            "data.parquet', hive_partitioning=false)"
+            f"FROM read_parquet('{self._manifest_table_uri('hourly_data_quality')}', "
+            "hive_partitioning=false)"
         ).fetchone()
+
         self.assertEqual(quality, (11, 6, 5))
 
     def test_validation_failure_publishes_nothing(self):
@@ -575,6 +817,64 @@ class GoldProcessTests(LocalPipelineTestCase):
             self.build(validate=boom)
         for table in gold.GOLD_TABLES:
             self.assertEqual(self.read_gold(table), before[table], table)
+
+    def test_failed_manifest_write_keeps_previous_publication(self):
+        self.build()
+
+        before = {
+            table: self.read_gold(table, exclude=()) for table in gold.GOLD_TABLES
+        }
+
+        manifest_uri = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            previous_manifest = json.load(file)
+
+        def fail_manifest(uri, manifest):
+            raise RuntimeError("forced manifest write failure")
+
+        next_run_at = RUN_AT + timedelta(seconds=1)
+
+        with self.assertRaisesRegex(RuntimeError, "forced manifest write failure"):
+            self.build(
+                run_at=next_run_at,
+                manifest_fn=fail_manifest,
+            )
+
+        with open(manifest_uri, "r", encoding="utf-8") as file:
+            current_manifest = json.load(file)
+
+        self.assertEqual(current_manifest, previous_manifest)
+
+        after = {table: self.read_gold(table, exclude=()) for table in gold.GOLD_TABLES}
+        self.assertEqual(after, before)
+
+    def test_failed_publish_copy_keeps_previous_publication(self):
+        # First publish: establish a known-good Gold state.
+        self.build()
+        before = {
+            table: self.read_gold(table, exclude=()) for table in gold.GOLD_TABLES
+        }
+
+        calls = []
+
+        def fail_on_second_copy(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:
+                raise RuntimeError("forced publish failure")
+            self.fake_copy(src, dst)
+
+        # Change run_at so the next publication contains different metadata.
+        next_run_at = RUN_AT + timedelta(seconds=1)
+
+        with self.assertRaisesRegex(RuntimeError, "forced publish failure"):
+            self.build(run_at=next_run_at, copy_fn=fail_on_second_copy)
+
+        self.assertEqual(len(calls), 2)
+
+        after = {table: self.read_gold(table, exclude=()) for table in gold.GOLD_TABLES}
+        self.assertEqual(after, before)
 
 
 class GoldSilverContractTests(LocalPipelineTestCase):
@@ -621,13 +921,16 @@ class GoldSilverContractTests(LocalPipelineTestCase):
 
     def test_empty_line_is_kept_as_unknown_not_dropped(self):
         self.build()
+
         lines = dict(
             self.con.execute(
-                "SELECT line, SUM(position_events) FROM read_parquet('"
-                f"{self.root}/gold/hourly_line_metrics/date=2026-01-15/hour=12/"
-                "data.parquet', hive_partitioning=false) GROUP BY line"
+                "SELECT line, SUM(position_events) "
+                f"FROM read_parquet('{self._manifest_table_uri('hourly_line_metrics')}', "
+                "hive_partitioning=false) "
+                "GROUP BY line"
             ).fetchall()
         )
+
         self.assertEqual(lines["unknown"], 2)
         self.assertEqual(sum(lines.values()), 6)
 

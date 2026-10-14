@@ -5,10 +5,12 @@ of all Warsaw public transport vehicles** (ZTM buses and trams) from the
 [UM Warszawa Open Data API](https://api.um.warszawa.pl) and stores them in an
 S3-compatible data lake. The implemented pipeline follows a **medallion
 architecture**: raw JSON Lines in bronze and cleaned, hourly Parquet in silver;
-gold analytics are planned.
+hourly business and data-quality metrics in gold.
 
-> 🚧 Work in progress – API ingestion, the hourly bronze → silver pipeline,
-> tests, and GitHub Actions CI are implemented. See the [roadmap](#roadmap).
+> 🚧 Work in progress – ingestion, hourly Bronze → Silver and Silver → Gold
+> pipelines, late-data recomputation, tests, and GitHub Actions CI are implemented.
+> A dashboard and production cloud deployment remain future work; see the
+> [roadmap](#roadmap).
 
 ## Architecture
 
@@ -16,9 +18,13 @@ gold analytics are planned.
 flowchart LR
     API[ZTM API] -->|every 30 seconds| Ingest[Python ingestion container]
     Ingest -->|raw JSON Lines| Bronze[MinIO Bronze bucket]
-    Bronze -->|completed UTC hour| Airflow[Apache Airflow hourly DAG]
-    Airflow --> Transform[Python transformation with DuckDB]
-    Transform -->|cleaned hourly Parquet| Silver[MinIO Silver bucket]
+    Bronze -->|completed UTC hour| SilverDAG[Airflow Bronze to Silver DAG]
+    SilverDAG -->|DuckDB transform| Silver[MinIO Silver bucket]
+    Silver -->|same-hour partition| GoldDAG[Airflow Silver to Gold DAG]
+    GoldDAG -->|hourly metrics and data quality| Gold[MinIO Gold bucket]
+    Bronze -. late arrivals in last 24 h .-> LateDAG[Airflow late-data DAG]
+    LateDAG -->|recompute Silver and Gold| Silver
+    LateDAG --> Gold
 ```
 
 Locally the data lake runs on **MinIO**, which provides an S3-compatible API.
@@ -35,7 +41,7 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 | Transformation | DuckDB |
 | Containerization | Docker, Docker Compose |
 | Data formats | JSON Lines (bronze), Parquet (silver), Hive-style partitioning |
-| Testing and linting | pytest / unittest, Ruff |
+| Testing and linting | unittest, Ruff |
 | CI | GitHub Actions |
 
 ## How to run
@@ -59,33 +65,49 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
    ```
    Keep your real API key and MinIO credentials in `.env`; never commit that file.
 
+   If reusing an existing Airflow metadata volume, pause the three project DAGs
+   before restarting the stack. The paused-at-creation setting below applies
+   only to DAGs Airflow discovers for the first time.
+
 3. Build and start the local stack:
    ```bash
    docker compose up -d --build
    ```
 
    Compose starts MinIO, the ingestion container, and Airflow. Ingestion creates
-   the `bronze` and `silver` buckets if they do not exist.
+   the `bronze`, `silver`, and `gold` buckets if they do not exist. Newly
+   discovered Airflow DAGs are paused by default so they cannot run before the
+   required pool is configured.
 
-4. Check ingestion logs:
+4. Create the Airflow pool that serializes writes to Silver and Gold:
+   ```bash
+   docker compose exec airflow airflow pools set ztm_silver_gold_writer 1 "Serializes Silver and Gold writes"
+   ```
+
+5. Open the Airflow UI at http://localhost:8080 and unpause the
+   `bronze_to_silver_hourly`, `silver_to_gold_hourly`, and
+   `reprocess_late_data_hourly` DAGs. The first two share an hourly schedule:
+   Bronze → Silver processes a completed UTC hour, then Silver → Gold waits
+   for that hour's Silver task and builds the four Gold tables. The late-data
+   DAG runs hourly at minute 30 and recomputes eligible closed hours from the
+   last 24 hours. Gold fails on a schema mismatch or missing Silver; task
+   retries and published row counts/status are visible in Airflow.
+
+   An hour with no Bronze data *after* ingestion has started (an outage)
+   **fails** the Silver run after retries so the gap remains visible; once
+   Bronze data is available again, clear the failed run in the UI to reprocess
+   it. Hours before the first Bronze object are skipped. Hourly catchup is
+   disabled, so the DAGs do not automatically create runs for every missed
+   interval since their `start_date`; existing historical runs are not deleted.
+   MinIO's console is at http://localhost:9001.
+
+6. Check ingestion logs:
    ```bash
    docker compose logs -f ingestion
    ```
 
-5. Open the Airflow UI at http://localhost:8080 and check the
-   `bronze_to_silver_hourly` DAG. It processes the completed UTC hour and writes
-   Parquet output to Silver. An hour with no Bronze data *after* ingestion has
-   started (an outage) **fails** the run after retries, so the gap is visible;
-   once Bronze data is available again, clear the failed run in the UI to
-   reprocess it. Hours before the first Bronze object are skipped. Catchup is
-   enabled from the DAG `start_date`. The `silver_to_gold_hourly` DAG shares
-   the same schedule, waits (sensor) for the Silver task of the same hour, and
-   builds the four Gold tables; it fails on a schema mismatch or missing
-   Silver, retries, and logs published row counts and completeness status.
-   MinIO's console is at http://localhost:9001.
-
-To stop the services, run `docker compose down`. Bronze and Silver objects are
-kept in the `minio_data` Docker volume.
+To stop the services, run `docker compose down`. Bronze, Silver, and Gold
+objects are kept in the `minio_data` Docker volume.
 
 ## Data layout (bronze layer)
 
@@ -170,26 +192,30 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
   wins). If the same GPS fix is ingested just before and just after an hour
   boundary, it can appear in two consecutive Silver files. This is deliberate:
   widening the window would change every quality/rejection query and break
-  per-hour count reconciliation. Gold models must deduplicate again, e.g.
-  `QUALIFY ROW_NUMBER() OVER (PARTITION BY vehicle_type, vehicle_number,
-  gps_time_utc ORDER BY ingested_at DESC) = 1`.
+  per-hour count reconciliation. Gold is also built per Silver hour; therefore
+  a fix present in two adjacent Silver partitions can contribute to both hourly
+  results. Do not interpret the sum of hourly position counts as a globally
+  deduplicated event count.
 - Completeness: every ingestion cycle writes a manifest to
   `s3://bronze/_manifests/date=/hour=/` (`complete` only if both bus and tram
   were fetched). The Silver transform writes
   `vehicle_positions/date=/hour=/_completeness.json` with status `complete`
   (≥90% of cycles complete), `incomplete`, or `unknown` (no manifests, e.g.
   data from before this feature). Silver is still published for incomplete
-  hours, but Gold/dashboards must only aggregate hours for which
-  `is_hour_complete(date, hour)` (in `bronze_to_silver.py`) is true; a missing
-  marker is treated as `unknown`, i.e. not complete. Incomplete hours should be
-  excluded or flagged in the UI.
+  hours. Gold preserves metrics for incomplete and unknown hours but marks
+  their quality; dashboard consumers should use
+  `hourly_data_quality.safe_for_dashboard = TRUE` as the default filter and
+  visibly flag excluded hours. A missing completeness marker is treated as
+  `unknown`, not complete.
 - Late data: closed hours of the last 24 h are recomputed by the
   `reprocess_late_data_hourly` DAG (`late_data.py`) when Bronze objects are
-  newer than the Silver partition, which also repairs gaps. Partitions are
-  overwritten atomically and idempotently; older hours are frozen. Gold rows
-  carry `pipeline_run_at`, `source_max_ingested_at` and `is_final` (an hour is
-  final 15 min after it closes); `safe_for_dashboard` requires `is_final`.
-  See `docs/gold-data-contract.md`.
+  newer than the Silver partition, which also repairs gaps. Each Silver or Gold
+  output object is replaced atomically and reruns are idempotent; the four Gold
+  objects are not a single cross-table transaction, and the quality table is
+  published last. Older hours are frozen. Gold rows carry `pipeline_run_at`,
+  `source_max_ingested_at` and `is_final` (an hour is final 15 min after it
+  closes); `safe_for_dashboard` requires `is_final`. See
+  `docs/gold-data-contract.md`.
 - A successful API response with an empty result is logged and counted as a
   degraded source window. Alerts are currently log-based; no external alert
   destination is configured.
@@ -205,19 +231,23 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
       quarantine output, and deterministic deduplication
 - [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
       GitHub Actions CI
-- [x] **Stage 4 foundation** – [Gold data contract](docs/gold-data-contract.md)
+- [x] **Gold stage 1** – [Gold data contract](docs/gold-data-contract.md)
       defines grains, keys, metric definitions, publication conditions, and
       incomplete/missing-data behavior
-- [x] **Stage 4 build** – `silver_to_gold.py` builds four Gold tables
-      (atomic publish, schema validation, idempotent) and runs as a DAG task
-      after Silver
-- [ ] **Next** – Gold dashboard and expected-hour gap axis; consider dbt when
-      the models justify it
+- [x] **Gold stages 2–4** – `silver_to_gold.py` builds four Gold tables
+      (per-object atomic publish, schema validation, idempotent) and runs as a
+      DAG task after Silver
+- [x] **Gold stage 5** – Airflow Silver → Gold DAG waits for the same-hour Silver
+      task; shared writer pool serializes partition writes
+- [x] **Gold stage 6** – late-data policy recomputes eligible closed hours from
+      the last 24 hours, with finality and source-ingestion metadata in Gold
+- [ ] **Next** – Gold dashboard with an expected-hour gap axis; consider dbt
+      when the models justify it
 - [ ] **Next** – add volume thresholds, external alerting, and integration
       coverage for a more reliable deployment
 - [ ] **Could** – deploy to AWS S3 and provision infrastructure with Terraform
-- [ ] **Could** – add a dashboard (for example, Metabase) after Gold metrics
-      exist
+- [ ] **Could** – expand dashboard options (for example, Metabase) after the
+      first Gold dashboard is in place
 - [ ] Kafka and Spark are intentionally deferred until a streaming-scale use
       case justifies their operational cost.
 

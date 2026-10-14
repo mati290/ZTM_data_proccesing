@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import boto3
 import requests
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
@@ -169,7 +170,11 @@ def write_cycle_manifest(s3, bus_count, tram_count, failed_sources, empty_source
             Bucket="bronze", Key=key, Body=json.dumps(manifest).encode("utf-8")
         )
     except (BotoCoreError, ClientError) as error:
-        logger.warning("Could not write cycle manifest: %s", _safe_error_summary(error))
+        logger.error(
+            "Could not write cycle manifest: %s",
+            _safe_error_summary(error),
+        )
+        raise
 
 
 def run_once(api_key, s3):
@@ -241,6 +246,14 @@ def main():
         endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
         aws_access_key_id=os.getenv("MINIO_USER"),
         aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
+        config=Config(
+            connect_timeout=5,
+            read_timeout=15,
+            retries={
+                "mode": "standard",
+                "max_attempts": 3,
+            },
+        ),
     )
 
     ensure_bucket_with_retry(s3)
@@ -259,6 +272,13 @@ def main():
         try:
             result = run_once(api_key, s3)
             degraded = bool(result["failed_sources"] or result["empty_sources"])
+            logger.info(
+                "Ingestion cycle finished: status=%s buses=%s trams=%s total=%s",
+                "degraded" if degraded else "complete",
+                result["buses"],
+                result["trams"],
+                result["total"],
+            )
         except (
             requests.RequestException,
             ZTMApiError,

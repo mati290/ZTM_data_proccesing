@@ -2,7 +2,7 @@
   minio:
     # The Chainguard public registry provides the free `latest` channel.
     # Pin this to a digest before using the stack outside local development.
-    image: cgr.dev/chainguard/minio:latest
+    image: cgr.dev/chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_USER:?set MINIO_USER in .env}
@@ -26,7 +26,12 @@
     depends_on:
       - minio
     restart: unless-stopped
-
+    healthcheck:
+      test: ["CMD", "python", "check_ingestion_health.py"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
   airflow:
     build:
       context: .
@@ -39,11 +44,12 @@
       MINIO_USER: ${MINIO_USER:?set MINIO_USER in .env}
       MINIO_PASSWORD: ${MINIO_PASSWORD:?set MINIO_PASSWORD in .env}
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
       AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY:?set AIRFLOW__CORE__FERNET_KEY in .env}"
       PYTHONPATH: /opt/airflow/src
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./bronze_to_silver.py:/opt/airflow/src/bronze_to_silver.py
