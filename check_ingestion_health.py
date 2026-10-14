@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -46,10 +47,22 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
                 f"Latest Bronze manifest is stale: age={age_seconds:.0f}s limit={max_age_seconds}s",
             )
 
+        response = s3.get_object(Bucket="bronze", Key=latest["Key"])
+        body = response["Body"].read()
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+
+        manifest = json.loads(body)
+        status = manifest.get("status")
+
+        if status != "complete":
+            return False, f"Latest Bronze manifest has unhealthy status: {status!r}"
+
         return (
             True,
-            f"Latest Bronze manifest is fresh: age={age_seconds:.0f}s limit={max_age_seconds}s",
+            f"Latest Bronze manifest is fresh and complete: age={age_seconds:.0f}s limit={max_age_seconds}s",
         )
+
     except (BotoCoreError, ClientError, KeyError, TypeError, ValueError) as error:
         logger.error("Ingestion health check failed: %s", type(error).__name__)
         return False, f"S3 manifest check failed: {type(error).__name__}"

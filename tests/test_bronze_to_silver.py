@@ -348,6 +348,19 @@ class CompletenessTests(unittest.TestCase):
         result = assess_completeness("2026-10-09", "07", client)
         self.assertEqual(result["status"], "unknown")
 
+    def test_missing_cycles_cannot_be_counted_as_complete(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 113),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["cycles"], 113)
+        self.assertEqual(result["complete_cycles"], 113)
+
     def test_incomplete_when_hour_has_too_few_cycles(self):
         result = assess_completeness(
             "2026-10-09",
@@ -358,27 +371,56 @@ class CompletenessTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "incomplete")
         self.assertEqual(result["expected_cycles"], 120)
-        self.assertEqual(result["minimum_required_cycles"], 90)
+        self.assertEqual(result["minimum_required_cycles"], 114)
+
+    def test_incomplete_when_coverage_is_below_95_percent(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 113),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["minimum_required_cycles"], 114)
 
     def test_complete_when_hour_meets_minimum_cycle_count(self):
         result = assess_completeness(
             "2026-10-09",
             "07",
-            self._client(["complete"] * 90),
+            self._client(["complete"] * 114),
             poll_interval_seconds=30,
         )
 
+        self.assertEqual(result["status"], "complete")
+
+    def test_coverage_uses_expected_cycles_not_only_existing_manifests(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 114),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["cycles"], 114)
         self.assertEqual(result["status"], "complete")
 
     def test_incomplete_when_complete_cycle_ratio_is_below_threshold(self):
         result = assess_completeness(
             "2026-10-09",
             "07",
-            self._client(["complete"] * 107 + ["partial"] * 13),
-            poll_interval_seconds=360,
+            self._client(["complete"] * 102 + ["partial"] * 12),
+            poll_interval_seconds=30,
         )
 
         self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["minimum_required_cycles"], 114)
+        self.assertEqual(result["cycles"], 114)
+        self.assertEqual(result["complete_cycles"], 102)
+        self.assertEqual(result["partial_cycles"], 12)
 
     def test_active_manifest_rejects_artifact_from_another_version(self):
         manifest = {
@@ -437,6 +479,19 @@ class CompletenessTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             resolve_silver_artifacts("2026-10-09", "07", client)
+
+    def test_complete_when_coverage_is_exactly_95_percent(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 114),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["cycles"], 114)
+        self.assertEqual(result["complete_cycles"], 114)
 
 
 class BronzeToSilverSqlTests(unittest.TestCase):

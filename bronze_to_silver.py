@@ -515,7 +515,7 @@ def is_before_first_bronze_hour(date_str: str, hour_str: str, s3_client=None) ->
 
 
 MIN_COMPLETE_CYCLE_RATIO = 0.9
-MIN_CYCLE_COVERAGE_RATIO = 0.75
+MIN_CYCLE_COVERAGE_RATIO = 0.95
 
 
 def completeness_thresholds(

@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
@@ -13,7 +14,7 @@ class IngestionHealthTests(unittest.TestCase):
         self.s3 = Mock()
         self.paginator = self.s3.get_paginator.return_value
 
-    def set_manifest(self, age_seconds):
+    def set_manifest(self, age_seconds, status="complete"):
         self.paginator.paginate.return_value = [
             {
                 "Contents": [
@@ -25,6 +26,12 @@ class IngestionHealthTests(unittest.TestCase):
             }
         ]
 
+        self.s3.get_object.return_value = {
+            "Body": Mock(
+                read=Mock(return_value=json.dumps({"status": status}).encode("utf-8"))
+            )
+        }
+
     def test_fresh_manifest_is_healthy(self):
         self.set_manifest(30)
 
@@ -34,6 +41,16 @@ class IngestionHealthTests(unittest.TestCase):
 
         self.assertTrue(healthy)
         self.assertIn("fresh", message)
+
+    def test_fresh_partial_manifest_is_unhealthy(self):
+        self.set_manifest(30, status="partial")
+
+        healthy, message = check_ingestion_health(
+            self.s3, max_age_seconds=120, now=self.now
+        )
+
+        self.assertFalse(healthy)
+        self.assertIn("partial", message.lower())
 
     def test_stale_manifest_is_unhealthy(self):
         self.set_manifest(121)

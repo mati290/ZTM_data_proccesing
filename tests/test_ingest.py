@@ -400,6 +400,34 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertIn("trams=34", logs)
         self.assertIn("total=46", logs)
 
+    def test_run_once_does_not_write_manifest_when_bronze_write_fails(self):
+        s3 = Mock()
+        with (
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[
+                    [{"VehicleNumber": "1"}],
+                    [{"VehicleNumber": "2"}],
+                ],
+            ),
+            patch(
+                "ingest.save_to_bronze",
+                side_effect=ClientError(
+                    {
+                        "Error": {
+                            "Code": "InternalError",
+                            "Message": "bronze write failed",
+                        }
+                    },
+                    "PutObject",
+                ),
+            ),
+            self.assertRaises(ClientError),
+        ):
+            run_once("test-key", s3)
+
+        s3.put_object.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
