@@ -352,7 +352,15 @@ class BuildGoldHourTests(unittest.TestCase):
 
 class PublishTests(unittest.TestCase):
     def test_partition_uris_use_versioned_gold_and_staging(self):
-        uris = gold.partition_uris("2026-01-15", "09")
+        with patch(
+            "silver_to_gold.resolve_silver_artifacts",
+            return_value={
+                "data": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/data.parquet",
+                "quarantine": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/quarantine.parquet",
+                "completeness": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/_completeness.json",
+            },
+        ):
+            uris = gold.partition_uris("2026-01-15", "09")
 
         self.assertIn("s3://gold/_versions/", uris["gold"]["hourly_network_metrics"])
         self.assertIn(
@@ -373,7 +381,15 @@ class PublishTests(unittest.TestCase):
             self.assertIn(uris["publication_id"], uris["staging"][table])
 
     def test_partition_uris_include_commit_manifest(self):
-        uris = gold.partition_uris("2026-01-15", "09")
+        with patch(
+            "silver_to_gold.resolve_silver_artifacts",
+            return_value={
+                "data": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/data.parquet",
+                "quarantine": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/quarantine.parquet",
+                "completeness": "s3://silver/vehicle_positions/date=2026-01-15/hour=09/_completeness.json",
+            },
+        ):
+            uris = gold.partition_uris("2026-01-15", "09")
 
         self.assertEqual(
             uris["manifest_uri"],
