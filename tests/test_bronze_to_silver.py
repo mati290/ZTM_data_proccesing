@@ -651,6 +651,7 @@ class TransformHourTests(unittest.TestCase):
             patch("bronze_to_silver.validate_silver_schema"),
             patch("bronze_to_silver.copy_s3_object") as copy_mock,
             patch("bronze_to_silver.delete_s3_object"),
+            patch("bronze_to_silver.write_silver_active_manifest"),
             self.assertLogs("bronze_to_silver", level="WARNING") as logs,
         ):
             transform_hour(connection, "2026-10-09", "7")
@@ -739,6 +740,14 @@ class TransformHourTests(unittest.TestCase):
             patch("bronze_to_silver.s3_object_exists", return_value=True),
             patch("bronze_to_silver.copy_s3_object") as copy_mock,
             patch("bronze_to_silver.delete_s3_object") as delete_mock,
+            patch(
+                "bronze_to_silver.resolve_silver_artifacts",
+                return_value={
+                    "data": "s3://silver/vehicle_positions/date=2026-10-09/hour=07/data.parquet",
+                    "quarantine": "s3://silver/vehicle_positions/date=2026-10-09/hour=07/quarantine.parquet",
+                    "completeness": "s3://silver/vehicle_positions/date=2026-10-09/hour=07/_completeness.json",
+                },
+            ),
             self.assertRaises(FileExistsError),
         ):
             transform_hour(connection, "2026-10-09", "7", overwrite=False)

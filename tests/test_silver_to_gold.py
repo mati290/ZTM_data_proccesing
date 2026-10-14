@@ -287,11 +287,33 @@ class BuildGoldHourTests(unittest.TestCase):
 
     def run_build(self, status="complete", silver=True, path=None):
         marker = {"status": status, "cycles": 60, "complete_cycles": 60}
-        original = gold.partition_uris
         silver_path = path or self.path
 
         def fake_uris(date_str, hour_str):
-            return {**original(date_str, hour_str), "silver": silver_path}
+            partition = f"date={date_str}/hour={hour_str}"
+            publication_id = "test-publication"
+
+            return {
+                "silver": silver_path,
+                "quarantine": f"{silver_path.rsplit('/', 1)[0]}/quarantine.parquet",
+                "gold": {
+                    table: (
+                        f"s3://gold/_versions/{partition}/{publication_id}/"
+                        f"{table}/data.parquet"
+                    )
+                    for table in gold.GOLD_TABLES
+                },
+                "staging": {
+                    table: (
+                        f"s3://gold/_staging/{partition}/{publication_id}/"
+                        f"{table}.parquet.pending"
+                    )
+                    for table in gold.GOLD_TABLES
+                },
+                "publication_id": publication_id,
+                "partition": partition,
+                "manifest_uri": gold.publication_manifest_uri(date_str, hour_str),
+            }
 
         with (
             patch("silver_to_gold.read_completeness_marker", return_value=marker),
