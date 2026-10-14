@@ -18,7 +18,7 @@ nie zostały zlane.
 `data_completeness_status`:
 
 - `complete` oznacza jednocześnie:
-  - co najmniej 75% oczekiwanych cykli ingestu zostało zapisanych;
+  - co najmniej 95% oczekiwanych cykli ingestu zostało zapisanych;
   - co najmniej 90% zapisanych manifestów ma status `complete`;
 - `incomplete` oznacza, że zapisano co najmniej jeden manifest, ale:
   - liczba zapisanych cykli jest mniejsza niż wymagane minimum; albo
