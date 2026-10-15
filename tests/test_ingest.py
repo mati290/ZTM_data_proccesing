@@ -11,11 +11,11 @@ from ingest import (
     ensure_bucket,
     ensure_bucket_with_retry,
     fetch_positions,
+    get_poll_interval_seconds,
     get_slot_start,
     main,
     run_once,
     save_to_bronze,
-    get_poll_interval_seconds,
     seconds_until_next_slot,
 )
 
@@ -42,9 +42,8 @@ class GetSlotStartTests(unittest.TestCase):
         timestamp = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
 
         for interval in (0, -30):
-            with self.subTest(interval=interval):
-                with self.assertRaises(ValueError):
-                    get_slot_start(timestamp, interval)
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
+                get_slot_start(timestamp, interval)
 
 
 class GetPollIntervalSecondsTests(unittest.TestCase):
@@ -54,13 +53,15 @@ class GetPollIntervalSecondsTests(unittest.TestCase):
 
     def test_rejects_nonpositive_interval(self):
         for value in ("0", "-1"):
-            with self.subTest(value=value):
-                with patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": value}):
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "POLL_INTERVAL_SECONDS must be a positive integer",
-                    ):
-                        get_poll_interval_seconds()
+            with (
+                self.subTest(value=value),
+                patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": value}),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "POLL_INTERVAL_SECONDS must be a positive integer",
+                ),
+            ):
+                get_poll_interval_seconds()
 
 
 class SecondsUntilNextSlotTests(unittest.TestCase):
@@ -82,9 +83,8 @@ class SecondsUntilNextSlotTests(unittest.TestCase):
         timestamp = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
 
         for interval in (0, -30):
-            with self.subTest(interval=interval):
-                with self.assertRaises(ValueError):
-                    seconds_until_next_slot(timestamp, interval)
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
+                seconds_until_next_slot(timestamp, interval)
 
 
 class SaveToBronzeTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import logging
 import math
@@ -532,6 +532,7 @@ def completeness_thresholds(
     minimum_required_cycles = math.ceil(expected_cycles * MIN_CYCLE_COVERAGE_RATIO)
     return expected_cycles, minimum_required_cycles
 
+
 def expected_slots_elapsed(
     date_str: str,
     hour_str: str,
@@ -541,9 +542,7 @@ def expected_slots_elapsed(
     if poll_interval_seconds <= 0:
         raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
 
-    hour_start = datetime.fromisoformat(
-        f"{date_str}T{hour_str}:00:00+00:00"
-    )
+    hour_start = datetime.fromisoformat(f"{date_str}T{hour_str}:00:00+00:00")
     hour_end = hour_start.replace(minute=59, second=59) + timedelta(seconds=1)
     now_utc = now_utc.astimezone(timezone.utc)
 
@@ -557,6 +556,7 @@ def expected_slots_elapsed(
         math.ceil(3600 / poll_interval_seconds),
         math.floor(elapsed_seconds / poll_interval_seconds) + 1,
     )
+
 
 def assess_completeness(
     date_str: str,
@@ -589,7 +589,6 @@ def assess_completeness(
                 manifest.get("status") == "complete"
             )
 
-
     total = len(keys)
     if poll_interval_seconds is None:
         poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
@@ -606,10 +605,7 @@ def assess_completeness(
         poll_interval_seconds,
     )
 
-    minimum_required_cycles = math.ceil(
-        expected_cycles * MIN_CYCLE_COVERAGE_RATIO
-    )
-
+    minimum_required_cycles = math.ceil(expected_cycles * MIN_CYCLE_COVERAGE_RATIO)
 
     if slot_statuses:
         expected_prefix = f"{date_str}T{hour_str}:"
@@ -633,11 +629,9 @@ def assess_completeness(
                 continue
 
             if parsed_slot.strftime("%Y-%m-%dT%H:") == expected_prefix:
-                valid_slots[parsed_slot] = (
-                    valid_slots.get(parsed_slot, False) or any(statuses)
+                valid_slots[parsed_slot] = valid_slots.get(parsed_slot, False) or any(
+                    statuses
                 )
-
-
 
         assessed_cycles = len(valid_slots)
         assessed_complete = sum(valid_slots.values())
@@ -669,7 +663,6 @@ def assess_completeness(
         "expected_cycles": expected_cycles,
         "minimum_required_cycles": minimum_required_cycles,
     }
-
 
 
 def write_completeness_marker(completeness: dict, silver_dir: str) -> None:

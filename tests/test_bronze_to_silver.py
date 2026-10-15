@@ -120,9 +120,7 @@ class CompletenessTests(unittest.TestCase):
                         ],
                     ),
                     poll_interval_seconds=30,
-                    now_utc=datetime(
-                        2026, 10, 9, 7, 0, 15, tzinfo=timezone.utc
-                    ),
+                    now_utc=datetime(2026, 10, 9, 7, 0, 15, tzinfo=timezone.utc),
                 )
 
                 self.assertEqual(result["expected_cycles"], 1)
@@ -426,7 +424,7 @@ class CompletenessTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _client(statuses,slot_starts=None):
+    def _client(statuses, slot_starts=None):
         client = Mock()
         keys = [
             f"_manifests/date=2026-10-09/hour=07/c{i}.json"
