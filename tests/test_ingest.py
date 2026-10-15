@@ -11,10 +11,80 @@ from ingest import (
     ensure_bucket,
     ensure_bucket_with_retry,
     fetch_positions,
+    get_slot_start,
     main,
     run_once,
     save_to_bronze,
+    get_poll_interval_seconds,
+    seconds_until_next_slot,
 )
+
+
+class GetSlotStartTests(unittest.TestCase):
+    def test_aligns_timestamp_to_utc_slot(self):
+        timestamp = datetime(2026, 10, 8, 12, 0, 47, tzinfo=timezone.utc)
+
+        result = get_slot_start(timestamp, 30)
+
+        self.assertEqual(
+            result,
+            datetime(2026, 10, 8, 12, 0, 30, tzinfo=timezone.utc),
+        )
+
+    def test_keeps_exact_slot_boundary(self):
+        timestamp = datetime(2026, 10, 8, 12, 1, 0, tzinfo=timezone.utc)
+
+        result = get_slot_start(timestamp, 30)
+
+        self.assertEqual(result, timestamp)
+
+    def test_rejects_nonpositive_interval(self):
+        timestamp = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+
+        for interval in (0, -30):
+            with self.subTest(interval=interval):
+                with self.assertRaises(ValueError):
+                    get_slot_start(timestamp, interval)
+
+
+class GetPollIntervalSecondsTests(unittest.TestCase):
+    def test_returns_configured_interval(self):
+        with patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": "45"}):
+            self.assertEqual(get_poll_interval_seconds(), 45)
+
+    def test_rejects_nonpositive_interval(self):
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                with patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": value}):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "POLL_INTERVAL_SECONDS must be a positive integer",
+                    ):
+                        get_poll_interval_seconds()
+
+
+class SecondsUntilNextSlotTests(unittest.TestCase):
+    def test_returns_seconds_until_next_utc_slot(self):
+        timestamp = datetime(2026, 10, 8, 12, 0, 10, tzinfo=timezone.utc)
+
+        result = seconds_until_next_slot(timestamp, 30)
+
+        self.assertAlmostEqual(result, 20)
+
+    def test_returns_full_interval_at_exact_slot_boundary(self):
+        timestamp = datetime(2026, 10, 8, 12, 0, 30, tzinfo=timezone.utc)
+
+        result = seconds_until_next_slot(timestamp, 30)
+
+        self.assertAlmostEqual(result, 30)
+
+    def test_rejects_nonpositive_interval(self):
+        timestamp = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+
+        for interval in (0, -30):
+            with self.subTest(interval=interval):
+                with self.assertRaises(ValueError):
+                    seconds_until_next_slot(timestamp, interval)
 
 
 class SaveToBronzeTests(unittest.TestCase):
@@ -213,6 +283,14 @@ class SaveToBronzeTests(unittest.TestCase):
 
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
         self.assertEqual(manifest["status"], "complete")
+        self.assertIn("cycle_started_at", manifest)
+        datetime.fromisoformat(manifest["cycle_started_at"])
+
+        self.assertIn("cycle_slot_start", manifest)
+
+        slot_start = datetime.fromisoformat(manifest["cycle_slot_start"])
+        self.assertEqual(slot_start.tzinfo, timezone.utc)
+        self.assertEqual(slot_start.second % 30, 0)
 
     def test_main_configures_s3_timeouts_and_retries(self):
         s3_client = Mock()

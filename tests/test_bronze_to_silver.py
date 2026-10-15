@@ -87,6 +87,124 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(manifest["publication_id"], publication_id)
         self.assertEqual(manifest["artifacts"], artifacts)
 
+    def test_legacy_manifest_does_not_fill_missing_utc_slot(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(
+                ["complete", "complete"],
+                ["2026-10-09T07:00:00+00:00", None],
+            ),
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["cycles"], 2)
+        self.assertEqual(result["missing_cycles"], 1)
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_complete_manifest_wins_over_partial_for_same_slot(self):
+        for statuses in (
+            ["complete", "partial"],
+            ["partial", "complete"],
+        ):
+            with self.subTest(statuses=statuses):
+                result = assess_completeness(
+                    "2026-10-09",
+                    "07",
+                    self._client(
+                        statuses,
+                        [
+                            "2026-10-09T07:00:00+00:00",
+                            "2026-10-09T07:00:00+00:00",
+                        ],
+                    ),
+                    poll_interval_seconds=30,
+                    now_utc=datetime(
+                        2026, 10, 9, 7, 0, 15, tzinfo=timezone.utc
+                    ),
+                )
+
+                self.assertEqual(result["expected_cycles"], 1)
+                self.assertEqual(result["missing_cycles"], 0)
+                self.assertEqual(result["status"], "complete")
+
+    def test_invalid_utc_slot_does_not_increase_coverage(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(
+                ["complete", "complete"],
+                [
+                    "2026-10-09T07:00:00+00:00",
+                    "not-a-timestamp",
+                ],
+            ),
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["missing_cycles"], 1)
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_future_utc_slot_does_not_increase_coverage(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(
+                ["complete", "complete"],
+                [
+                    "2026-10-09T07:00:00+00:00",
+                    "2026-10-09T07:01:00+00:00",
+                ],
+            ),
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["missing_cycles"], 1)
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_duplicate_complete_manifests_do_not_inflate_complete_ratio(self):
+        slot_starts = [
+            f"2026-10-09T07:{minute:02d}:{second:02d}+00:00"
+            for minute in range(57)
+            for second in (0, 30)
+        ]
+        statuses = ["complete"] * 102 + ["partial"] * 12
+
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(
+                statuses + ["complete"] * 20,
+                slot_starts + [slot_starts[0]] * 20,
+            ),
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["missing_cycles"], 6)
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_misaligned_utc_slot_does_not_increase_coverage(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(
+                ["complete", "complete"],
+                [
+                    "2026-10-09T07:00:00+00:00",
+                    "2026-10-09T07:00:15+00:00",
+                ],
+            ),
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["missing_cycles"], 1)
+        self.assertEqual(result["status"], "incomplete")
+
     def test_write_silver_active_manifest_rejects_invalid_artifact(self):
         publication_id = "a" * 32
         partition = "date=2026-10-09/hour=07"
@@ -308,7 +426,7 @@ class CompletenessTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _client(statuses):
+    def _client(statuses,slot_starts=None):
         client = Mock()
         keys = [
             f"_manifests/date=2026-10-09/hour=07/c{i}.json"
@@ -317,10 +435,13 @@ class CompletenessTests(unittest.TestCase):
         client.get_paginator.return_value.paginate.return_value = [
             {"Contents": [{"Key": key} for key in keys]}
         ]
-        bodies = {
-            key: json.dumps({"status": status}).encode()
-            for key, status in zip(keys, statuses)
-        }
+        bodies = {}
+        for index, (key, status) in enumerate(zip(keys, statuses)):
+            manifest = {"status": status}
+            if slot_starts is not None:
+                manifest["cycle_slot_start"] = slot_starts[index]
+            bodies[key] = json.dumps(manifest).encode()
+
         client.get_object.side_effect = lambda Bucket, Key: {
             "Body": Mock(read=Mock(return_value=bodies[Key]))
         }
@@ -421,6 +542,70 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(result["cycles"], 114)
         self.assertEqual(result["complete_cycles"], 102)
         self.assertEqual(result["partial_cycles"], 12)
+
+    def test_ignores_utc_slots_outside_requested_hour(self):
+        slot_starts = [
+            "2026-10-09T06:59:30+00:00",
+            "2026-10-09T07:00:00+00:00",
+        ]
+
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete", "complete"], slot_starts),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["cycles"], 2)
+        self.assertEqual(result["missing_cycles"], 119)
+
+    def test_duplicate_utc_slot_does_not_increase_coverage(self):
+        slot_starts = [
+            "2026-10-09T07:00:00+00:00",
+            "2026-10-09T07:00:00+00:00",
+        ]
+
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete", "complete"], slot_starts),
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["cycles"], 2)
+        self.assertEqual(result["missing_cycles"], 1)
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_reports_missing_utc_slot(self):
+        slot_starts = [
+            f"2026-10-09T07:{minute:02d}:{second:02d}+00:00"
+            for minute in range(60)
+            for second in (0, 30)
+            if not (minute == 12 and second == 30)
+        ]
+
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * len(slot_starts), slot_starts),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["cycles"], 119)
+        self.assertEqual(result["missing_cycles"], 1)
+
+    def test_reports_missing_cycles(self):
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            self._client(["complete"] * 114),
+            poll_interval_seconds=30,
+        )
+
+        self.assertEqual(result["expected_cycles"], 120)
+        self.assertEqual(result["cycles"], 114)
+        self.assertEqual(result["missing_cycles"], 6)
 
     def test_active_manifest_rejects_artifact_from_another_version(self):
         manifest = {

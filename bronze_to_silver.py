@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import logging
 import math
@@ -532,12 +532,38 @@ def completeness_thresholds(
     minimum_required_cycles = math.ceil(expected_cycles * MIN_CYCLE_COVERAGE_RATIO)
     return expected_cycles, minimum_required_cycles
 
+def expected_slots_elapsed(
+    date_str: str,
+    hour_str: str,
+    now_utc: datetime,
+    poll_interval_seconds: int,
+) -> int:
+    if poll_interval_seconds <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
+
+    hour_start = datetime.fromisoformat(
+        f"{date_str}T{hour_str}:00:00+00:00"
+    )
+    hour_end = hour_start.replace(minute=59, second=59) + timedelta(seconds=1)
+    now_utc = now_utc.astimezone(timezone.utc)
+
+    if now_utc < hour_start:
+        return 0
+
+    elapsed_until = min(now_utc, hour_end)
+    elapsed_seconds = (elapsed_until - hour_start).total_seconds()
+
+    return min(
+        math.ceil(3600 / poll_interval_seconds),
+        math.floor(elapsed_seconds / poll_interval_seconds) + 1,
+    )
 
 def assess_completeness(
     date_str: str,
     hour_str: str,
     s3_client=None,
     poll_interval_seconds: int | None = None,
+    now_utc: datetime | None = None,
 ) -> dict:
     """Summarize ingestion cycle manifests for an hour (bus + tram both fetched)."""
     s3_client = s3_client or _s3_client()
@@ -549,18 +575,85 @@ def assess_completeness(
         keys.extend(obj["Key"] for obj in page.get("Contents", []))
 
     complete = 0
+    slot_statuses: dict[str, list[bool]] = {}
     for key in keys:
         body = s3_client.get_object(Bucket="bronze", Key=key)["Body"].read()
-        if json.loads(body).get("status") == "complete":
+        manifest = json.loads(body)
+
+        if manifest.get("status") == "complete":
             complete += 1
 
+        slot_start = manifest.get("cycle_slot_start")
+        if slot_start:
+            slot_statuses.setdefault(slot_start, []).append(
+                manifest.get("status") == "complete"
+            )
+
+
     total = len(keys)
-    expected_cycles, minimum_required_cycles = completeness_thresholds(
-        poll_interval_seconds
+    if poll_interval_seconds is None:
+        poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware")
+
+    expected_cycles = expected_slots_elapsed(
+        date_str,
+        hour_str,
+        now_utc,
+        poll_interval_seconds,
     )
+
+    minimum_required_cycles = math.ceil(
+        expected_cycles * MIN_CYCLE_COVERAGE_RATIO
+    )
+
+
+    if slot_statuses:
+        expected_prefix = f"{date_str}T{hour_str}:"
+        valid_slots: dict[datetime, bool] = {}
+
+        for slot_start, statuses in slot_statuses.items():
+            try:
+                parsed_slot = datetime.fromisoformat(slot_start)
+            except ValueError:
+                continue
+            if parsed_slot.tzinfo is None:
+                continue
+
+            parsed_slot = parsed_slot.astimezone(timezone.utc)
+            if parsed_slot > now_utc:
+                continue
+            if (
+                parsed_slot.microsecond != 0
+                or int(parsed_slot.timestamp()) % poll_interval_seconds != 0
+            ):
+                continue
+
+            if parsed_slot.strftime("%Y-%m-%dT%H:") == expected_prefix:
+                valid_slots[parsed_slot] = (
+                    valid_slots.get(parsed_slot, False) or any(statuses)
+                )
+
+
+
+        assessed_cycles = len(valid_slots)
+        assessed_complete = sum(valid_slots.values())
+    else:
+        assessed_cycles = total
+        assessed_complete = complete
+
+    missing_cycles = max(0, expected_cycles - assessed_cycles)
+
     if total == 0:
         status = "unknown"
-    elif total < minimum_required_cycles or complete / total < MIN_COMPLETE_CYCLE_RATIO:
+    elif (
+        expected_cycles - missing_cycles < minimum_required_cycles
+        or assessed_cycles == 0
+        or assessed_complete / assessed_cycles < MIN_COMPLETE_CYCLE_RATIO
+    ):
         status = "incomplete"
     else:
         status = "complete"
@@ -571,10 +664,12 @@ def assess_completeness(
         "cycles": total,
         "complete_cycles": complete,
         "partial_cycles": total - complete,
+        "missing_cycles": missing_cycles,
         "min_complete_ratio": MIN_COMPLETE_CYCLE_RATIO,
         "expected_cycles": expected_cycles,
         "minimum_required_cycles": minimum_required_cycles,
     }
+
 
 
 def write_completeness_marker(completeness: dict, silver_dir: str) -> None:

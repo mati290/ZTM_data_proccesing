@@ -149,12 +149,22 @@ def _ensure_single_bucket(s3, bucket):
         s3.create_bucket(Bucket=bucket)
 
 
-def write_cycle_manifest(s3, bus_count, tram_count, failed_sources, empty_sources):
+def write_cycle_manifest(
+    s3,
+    bus_count,
+    tram_count,
+    failed_sources,
+    empty_sources,
+    cycle_started_at,
+    cycle_slot_start,
+):
     """Record whether a cycle fetched both sources, so Silver can flag partial hours."""
     now = datetime.now(timezone.utc)
     complete = bus_count > 0 and tram_count > 0
     manifest = {
         "ingested_at": now.isoformat(),
+        "cycle_started_at": cycle_started_at.isoformat(),
+        "cycle_slot_start": cycle_slot_start.isoformat(),
         "status": "complete" if complete else "partial",
         "buses": bus_count,
         "trams": tram_count,
@@ -178,6 +188,9 @@ def write_cycle_manifest(s3, bus_count, tram_count, failed_sources, empty_source
 
 
 def run_once(api_key, s3):
+    cycle_started_at = datetime.now(timezone.utc)
+    poll_interval_seconds = get_poll_interval_seconds()
+    cycle_slot_start = get_slot_start(cycle_started_at, poll_interval_seconds)
     buses = []
     trams = []
     failed_sources = []
@@ -219,7 +232,15 @@ def run_once(api_key, s3):
     if trams:
         save_to_bronze(s3, trams, "tram")
 
-    write_cycle_manifest(s3, len(buses), len(trams), failed_sources, empty_sources)
+    write_cycle_manifest(
+        s3,
+        len(buses),
+        len(trams),
+        failed_sources,
+        empty_sources,
+        cycle_started_at,
+        cycle_slot_start,
+    )
 
     return {
         "buses": len(buses),
@@ -233,6 +254,34 @@ def run_once(api_key, s3):
 def _handle_sigterm(signum, frame):
     logger.info("Received SIGTERM, shutting down")
     raise SystemExit(0)
+
+
+def get_poll_interval_seconds():
+    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+    if interval <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
+    return interval
+
+
+def seconds_until_next_slot(timestamp, interval_seconds):
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+
+    timestamp = timestamp.astimezone(timezone.utc)
+    epoch_seconds = timestamp.timestamp()
+    next_slot = (int(epoch_seconds // interval_seconds) + 1) * interval_seconds
+    return next_slot - epoch_seconds
+
+
+def get_slot_start(timestamp, interval_seconds):
+    """Return the UTC-aligned slot start for a timestamp."""
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+
+    timestamp = timestamp.astimezone(timezone.utc)
+    epoch_seconds = timestamp.timestamp()
+    slot_epoch = int(epoch_seconds // interval_seconds) * interval_seconds
+    return datetime.fromtimestamp(slot_epoch, tz=timezone.utc)
 
 
 def main():
@@ -258,7 +307,7 @@ def main():
 
     ensure_bucket_with_retry(s3)
 
-    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+    interval = get_poll_interval_seconds()
     if interval <= 0:
         raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
     alert_threshold = int(os.getenv("DEGRADED_CYCLES_ALERT_THRESHOLD", "10"))
@@ -295,7 +344,11 @@ def main():
             logger.critical(
                 "ALERT: ingestion degraded for %s consecutive cycles", degraded_cycles
             )
-        time.sleep(interval)
+        sleep_seconds = seconds_until_next_slot(
+            datetime.now(timezone.utc),
+            interval,
+        )
+        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,40 @@ class IngestionHealthTests(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertIn("partial", message.lower())
 
+    def test_uses_latest_manifest_by_last_modified(self):
+        older = self.now - timedelta(seconds=60)
+        newer = self.now - timedelta(seconds=10)
+
+        self.paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {
+                        "Key": "_manifests/older.json",
+                        "LastModified": older,
+                    },
+                    {
+                        "Key": "_manifests/newer.json",
+                        "LastModified": newer,
+                    },
+                ]
+            }
+        ]
+
+        self.s3.get_object.return_value = {
+            "Body": Mock(
+                read=Mock(
+                    return_value=json.dumps({"status": "complete"}).encode("utf-8")
+                )
+            )
+        }
+
+        healthy, _ = check_ingestion_health(self.s3, max_age_seconds=120, now=self.now)
+
+        self.assertTrue(healthy)
+        self.s3.get_object.assert_called_once_with(
+            Bucket="bronze", Key="_manifests/newer.json"
+        )
+
     def test_stale_manifest_is_unhealthy(self):
         self.set_manifest(121)
 
