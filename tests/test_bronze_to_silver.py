@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import duckdb
 from botocore.exceptions import ClientError
 
+import bronze_to_silver
 from bronze_to_silver import (
     QUALITY_SQL,
     REJECTED_SQL,
@@ -54,6 +55,145 @@ class CompletenessTests(unittest.TestCase):
             body.read.return_value = json.dumps({"status": status}).encode()
             client.get_object.return_value = {"Body": body}
         return client
+
+    def test_manifest_must_be_a_json_object(self):
+        for payload in ([], None, "complete", 123):
+            with self.subTest(payload=payload):
+                client = self._client(["complete"])
+                client.get_object.side_effect = None
+                client.get_object.return_value = {
+                    "Body": Mock(read=Mock(return_value=json.dumps(payload).encode()))
+                }
+
+                with self.assertRaisesRegex(TypeError, "JSON object"):
+                    assess_completeness(
+                        "2026-10-09",
+                        "07",
+                        client,
+                        poll_interval_seconds=30,
+                        now_utc=datetime(2026, 10, 9, 8, tzinfo=timezone.utc),
+                    )
+
+    def test_slot_metrics_distinguish_legacy_and_invalid_slots(self):
+        for slot_starts, expected_count, expected_coverage in (
+            (None, None, None),
+            (["invalid-timestamp"], 0, 0.0),
+        ):
+            with self.subTest(slot_starts=slot_starts):
+                result = assess_completeness(
+                    "2026-10-09",
+                    "07",
+                    self._client(["complete"], slot_starts),
+                    poll_interval_seconds=30,
+                    now_utc=datetime(2026, 10, 9, 7, 0, 15, tzinfo=timezone.utc),
+                )
+
+                self.assertEqual(result["observed_slots"], expected_count)
+                self.assertEqual(result["complete_slots"], expected_count)
+                self.assertEqual(result["slot_coverage_ratio"], expected_coverage)
+                self.assertIsNone(result["complete_slot_ratio"])
+
+    def test_completeness_reads_only_captured_manifests(self):
+        client = self._client(["complete", "partial"])
+        source_inputs = [
+            {
+                "key": "_manifests/date=2026-10-09/hour=07/c0.json",
+                "etag": '"test-etag"',
+                "size": 123,
+                "last_modified": "2026-10-09T07:00:05+00:00",
+            }
+        ]
+
+        result = assess_completeness(
+            "2026-10-09",
+            "07",
+            client,
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 8, tzinfo=timezone.utc),
+            source_inputs=source_inputs,
+        )
+
+        self.assertEqual(result["cycles"], 1)
+        self.assertEqual(result["complete_cycles"], 1)
+        client.get_paginator.assert_not_called()
+        client.get_object.assert_called_once_with(
+            Bucket="bronze",
+            Key="_manifests/date=2026-10-09/hour=07/c0.json",
+        )
+
+    def test_invalid_slots_do_not_fall_back_to_legacy_manifest_counting(self):
+        for invalid_slot in (
+            ["2026-10-09T07:00:00+00:00"],
+            {"start": "2026-10-09T07:00:00+00:00"},
+            123,
+            True,
+            "",
+            None,
+        ):
+            with self.subTest(invalid_slot=invalid_slot):
+                result = assess_completeness(
+                    "2026-10-09",
+                    "07",
+                    self._client(["complete"], [invalid_slot]),
+                    poll_interval_seconds=30,
+                    now_utc=datetime(2026, 10, 9, 7, 0, 15, tzinfo=timezone.utc),
+                )
+
+                self.assertEqual(result["missing_cycles"], 1)
+                self.assertEqual(result["status"], "incomplete")
+
+    def test_invalid_slot_types_do_not_crash_or_increase_coverage(self):
+        for invalid_slot in (
+            ["2026-10-09T07:00:30+00:00"],
+            {"start": "2026-10-09T07:00:30+00:00"},
+            123,
+            True,
+        ):
+            with self.subTest(invalid_slot=invalid_slot):
+                result = assess_completeness(
+                    "2026-10-09",
+                    "07",
+                    self._client(
+                        ["complete", "complete"],
+                        ["2026-10-09T07:00:00+00:00", invalid_slot],
+                    ),
+                    poll_interval_seconds=30,
+                    now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+                )
+
+                self.assertEqual(result["missing_cycles"], 1)
+                self.assertEqual(result["status"], "incomplete")
+
+    def test_active_manifest_records_bronze_inputs(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        version_dir = f"s3://silver/_versions/{partition}/{publication_id}"
+        artifacts = {
+            "data": f"{version_dir}/data.parquet",
+            "quarantine": f"{version_dir}/quarantine.parquet",
+            "completeness": f"{version_dir}/_completeness.json",
+        }
+        source_inputs = [
+            {
+                "key": "vehicle_type=bus/date=2026-10-09/hour=07/a.jsonl",
+                "etag": '"test-etag"',
+                "size": 123,
+                "last_modified": "2026-10-09T07:00:05+00:00",
+            }
+        ]
+        client = Mock()
+
+        with patch("bronze_to_silver._s3_client", return_value=client):
+            write_silver_active_manifest(
+                "2026-10-09",
+                "07",
+                publication_id,
+                artifacts,
+                source_inputs=source_inputs,
+            )
+
+        manifest = json.loads(client.put_object.call_args.kwargs["Body"])
+        self.assertEqual(manifest["source_inputs"], source_inputs)
 
     def test_write_silver_active_manifest_publishes_pointer(self):
         publication_id = "a" * 32
@@ -574,6 +714,10 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(result["cycles"], 2)
         self.assertEqual(result["missing_cycles"], 1)
         self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["observed_slots"], 1)
+        self.assertEqual(result["complete_slots"], 1)
+        self.assertEqual(result["slot_coverage_ratio"], 0.5)
+        self.assertEqual(result["complete_slot_ratio"], 1.0)
 
     def test_reports_missing_utc_slot(self):
         slot_starts = [
@@ -695,6 +839,49 @@ class BronzeToSilverSqlTests(unittest.TestCase):
 
         self.assertEqual(metrics, (11, 9, 9, 3, 1, 3, 1, 1, 1, 2, 1))
 
+    def test_all_queries_can_use_materialized_input(self):
+        bronze_to_silver.materialize_bronze_inputs(self.connection, [self.bronze_path])
+
+        for template in (QUALITY_SQL, TRANSFORM_SQL, REJECTED_SQL):
+            with self.subTest(template=template[:80]):
+                expected = self.connection.execute(
+                    template.format(bronze_path=self.bronze_path)
+                ).fetchall()
+
+                query = bronze_to_silver.sql_from_materialized_input(template)
+
+                self.assertNotIn("read_json_auto", query)
+                actual = self.connection.execute(query).fetchall()
+                self.assertCountEqual(actual, expected)
+
+    def test_materialized_input_is_unchanged_when_source_files_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "original.jsonl"
+            original.write_text(
+                json.dumps({"VehicleNumber": "initial"}) + "\n",
+                encoding="utf-8",
+            )
+
+            bronze_to_silver.materialize_bronze_inputs(
+                self.connection, [original.as_posix()]
+            )
+
+            original.write_text(
+                json.dumps({"VehicleNumber": "changed"}) + "\n",
+                encoding="utf-8",
+            )
+            late_file = Path(directory) / "late.jsonl"
+            late_file.write_text(
+                json.dumps({"VehicleNumber": "late"}) + "\n",
+                encoding="utf-8",
+            )
+
+            rows = self.connection.execute(
+                "SELECT VehicleNumber FROM bronze_input"
+            ).fetchall()
+
+        self.assertEqual(rows, [("initial",)])
+
     def test_transform_keeps_only_fresh_valid_unique_record(self):
         query = TRANSFORM_SQL.format(bronze_path=self.bronze_path)
 
@@ -785,6 +972,19 @@ class TransformHourTests(unittest.TestCase):
         self.write_marker_mock = patch(
             "bronze_to_silver.write_completeness_marker"
         ).start()
+        self.source_inputs = [
+            {
+                "key": "vehicle_type=bus/date=2026-10-09/hour=07/a.jsonl",
+                "etag": '"test-etag"',
+                "size": 123,
+                "last_modified": "2026-10-09T07:00:05+00:00",
+            }
+        ]
+        patch(
+            "bronze_to_silver.capture_bronze_inputs",
+            return_value=self.source_inputs,
+        ).start()
+        patch("bronze_to_silver.materialize_bronze_inputs").start()
         self.addCleanup(patch.stopall)
 
     @staticmethod
@@ -809,6 +1009,44 @@ class TransformHourTests(unittest.TestCase):
             "SELECT file FROM glob("
             "'s3://bronze/vehicle_type=*/date=2026-10-09/hour=07/*.jsonl') LIMIT 1"
         )
+
+    def test_transform_records_inputs_captured_before_reading_data(self):
+        connection = self._happy_path_connection()
+        source_inputs = [
+            {
+                "key": "vehicle_type=bus/date=2026-10-09/hour=07/a.jsonl",
+                "etag": '"test-etag"',
+                "size": 123,
+                "last_modified": "2026-10-09T07:00:05+00:00",
+            }
+        ]
+
+        def capture_inputs(*args, **kwargs):
+            for statement in connection.execute.call_args_list:
+                self.assertNotIn("read_json_auto", statement.args[0])
+            return source_inputs
+
+        with (
+            patch(
+                "bronze_to_silver.capture_bronze_inputs",
+                side_effect=capture_inputs,
+            ) as capture,
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.copy_s3_object"),
+            patch("bronze_to_silver.delete_s3_object"),
+            patch("bronze_to_silver.write_silver_active_manifest") as publish,
+            patch("bronze_to_silver.materialize_bronze_inputs") as materialize,
+        ):
+            transform_hour(connection, "2026-10-09", "7")
+
+        capture.assert_called_once()
+        self.assertEqual(publish.call_args.kwargs["source_inputs"], source_inputs)
+        materialize.assert_called_once_with(
+            connection,
+            ["s3://bronze/vehicle_type=bus/date=2026-10-09/hour=07/a.jsonl"],
+        )
+        for statement in connection.execute.call_args_list:
+            self.assertNotIn("read_json_auto", statement.args[0])
 
     def test_propagates_bronze_discovery_io_error(self):
         connection = Mock()
@@ -859,7 +1097,9 @@ class TransformHourTests(unittest.TestCase):
         delete_mock.assert_any_call(rejected_source)
         self.assertEqual(delete_mock.call_count, 2)
 
-        self.assess_mock.assert_called_once_with("2026-10-09", "07")
+        self.assess_mock.assert_called_once_with(
+            "2026-10-09", "07", source_inputs=self.source_inputs
+        )
         self.write_marker_mock.assert_called_once_with(
             self.completeness,
             f"{version_prefix}{publication_id}",
@@ -875,6 +1115,7 @@ class TransformHourTests(unittest.TestCase):
                     f"{version_prefix}{publication_id}/_completeness.json"
                 ),
             },
+            source_inputs=self.source_inputs,
         )
 
     def test_warns_and_still_publishes_when_hour_is_incomplete(self):

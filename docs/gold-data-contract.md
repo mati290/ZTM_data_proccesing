@@ -6,33 +6,64 @@ Gold odpowiada na pytania biznesowe. Nie kopiuje wierszy Silver; agreguje je
 do metryk o jawnie określonym ziarnie. Wszystkie przedziały godzinowe są
 godzinami UTC w formacie `[date + hour, date + hour + 1h)`.
 
-Źródłem obserwacji jest
-`s3://silver/vehicle_positions/date=YYYY-MM-DD/hour=HH/data.parquet`.
-Zawiera ono poprawne, deduplikowane obserwacje. Wiersz jest unikalny w obrębie
-godziny dla `(vehicle_type, vehicle_number, gps_time_utc)`. Typ pojazdu
+Nowe dane Bronze i manifest cyklu są przypisywane do partycji godziny UTC,
+w której rozpoczyna się slot cyklu pobierania. Cykl przekraczający granicę
+godziny lub północ zachowuje tę samą partycję dla autobusów, tramwajów
+i manifestu. Pole `_ingested_at` nadal zawiera rzeczywisty czas zapisu
+danych. Godzina partycji nie oznacza godziny zdarzenia GPS i może różnić
+się od godziny `_ingested_at`. Historyczne obiekty zapisane według czasu
+zapisu pozostają w dotychczasowych partycjach.
+
+Źródłem obserwacji jest plik Silver wskazany przez pole `artifacts.data`
+w aktywnym manifeście
+`s3://silver/vehicle_positions/date=YYYY-MM-DD/hour=HH/_active.json`.
+Nowe publikacje zapisują dane, kwarantannę i marker kompletności pod
+wersjonowaną ścieżką `s3://silver/_versions/date=.../hour=.../<publication_id>/`.
+Gdy aktywnego manifestu nie ma, odczyt zachowuje zgodność z historyczną
+ścieżką `s3://silver/vehicle_positions/date=.../hour=.../data.parquet`.
+Plik danych zawiera poprawne, deduplikowane obserwacje. Wiersz jest unikalny
+w obrębie godziny dla `(vehicle_type, vehicle_number, gps_time_utc)`. Typ pojazdu
 identyfikuje `bus` albo `tram`. Liczba pojazdów zawsze liczy pary
 `(vehicle_type, vehicle_number)`, aby jednakowe numery autobusów i tramwajów
 nie zostały zlane.
 
-`_completeness.json` z tej samej partycji Silver jest autorytatywnym źródłem
-`data_completeness_status`:
+Marker kompletności wskazany przez `artifacts.completeness` tej samej
+publikacji Silver jest źródłem `data_completeness_status`. Dla historycznego
+układu plików jest to `_completeness.json` obok `data.parquet`:
 
-- `complete` oznacza jednocześnie:
-  - co najmniej 95% oczekiwanych cykli ingestu zostało zapisanych;
-  - co najmniej 90% zapisanych manifestów ma status `complete`;
-- `incomplete` oznacza, że zapisano co najmniej jeden manifest, ale:
-  - liczba zapisanych cykli jest mniejsza niż wymagane minimum; albo
-  - udział kompletnych cykli jest niższy niż 90%;
-- `unknown` oznacza brak manifestów albo brak markera
+- `complete` wymaga co najmniej 95% pokrycia oczekiwanych slotów UTC
+  oraz co najmniej 90% kompletnych slotów spośród obecnych poprawnych slotów.
+- `incomplete` oznacza obecność manifestów bez spełnienia obu progów.
+- `unknown` oznacza brak manifestów albo brak markera kompletności.
 
-`complete` nie gwarantuje, że każde wywołanie API zwróciło dane; to status
-według progu manifestów, a nie dowód pełnej obserwowalności. `unknown` nigdy
-nie jest traktowane jako `complete`.
+Slot jest kompletny, jeśli przynajmniej jeden jego manifest ma status
+`complete`. Duplikaty nie zwiększają pokrycia ani udziału kompletnych slotów.
+Sloty błędne, spoza godziny, z przyszłości lub niewyrównane do interwału
+nie zwiększają pokrycia. Przy mieszanych manifestach starsze wpisy bez slotu
+nie uzupełniają brakujących slotów. Obecne pole `cycle_slot_start` z błędną
+wartością, w tym `null`, nie uruchamia historycznego sposobu liczenia.
+
+Wyłącznie godziny, w których żaden manifest nie zawiera pola
+`cycle_slot_start`, korzystają z historycznego liczenia manifestów:
+co najmniej 95% oczekiwanej liczby cykli i co najmniej 90% manifestów
+ze statusem `complete`. Ich metryki unikalnych slotów pozostają nieznane.
+
+Dla zakończonej godziny i interwału 30 sekund oczekiwane jest 120 slotów,
+więc minimum pokrycia wynosi 114. Podczas oceny bieżącej godziny liczba
+oczekiwanych slotów obejmuje tylko sloty rozpoczęte do czasu oceny włącznie.
+Zadania godzinowe Airflow przetwarzają zakończone godziny.
+
+`complete` opisuje spełnienie progów pobierania, a nie gwarancję obserwacji
+wszystkich pojazdów. `unknown` nigdy nie jest traktowane jako `complete`.
+Błędy odczytu storage, niepoprawny marker lub sprzeczne liczniki nie są
+zamieniane na `unknown`: przerywają budowanie Gold.
 
 Wiersze z niekompletnych lub nieznanych godzin można zachować w Gold razem ze
 statusem, ale dashboardy nie mogą przedstawiać ich jako wiarygodnych wartości
 bez oznaczenia. Widoki prezentujące wyłącznie wiarygodne metryki filtrują
-`data_completeness_status = 'complete'`. Brak partycji Gold nie oznacza zera.
+`hourly_data_quality.safe_for_dashboard = TRUE`, łącząc tabele dla tej samej
+godziny i publikacji Gold. Sam status `complete` nie potwierdza finalizacji
+ani spełnienia reguł jakości rekordów. Brak partycji Gold nie oznacza zera.
 
 ## `hourly_network_metrics`
 
@@ -143,28 +174,35 @@ przetwarzaniem danych.
 |---|---|
 | Ziarno | Jedna oczekiwana godzina UTC |
 | Klucz unikalności | `(date, hour)` |
-| Źródło | Silver, kwarantanna Silver, marker Silver oraz manifesty Bronze |
-| Warunek publikacji | Publikowany zawsze jako ostatni (rekord zatwierdzający godzinę), także gdy Silver jest brakujący lub pusty - wtedy zadanie następnie kończy się błędem |
+| Źródło | Silver, kwarantanna i marker kompletności tej samej publikacji Silver; liczniki cykli i slotów pochodzą z markera, nie z ponownego listowania Bronze przez Gold |
+| Warunek publikacji | W pełnej publikacji jest zatwierdzany wspólnym manifestem razem z trzema tabelami metryk. Gdy Silver jest brakujący lub pusty, publikowana jest tylko diagnostyka jakości, po czym zadanie kończy się błędem |
 | Brak danych | Wygenerować rekord jakości z jawnym `silver_partition_status`; nie zastępować nieznanych liczników zerami |
 | Niekompletność | Zachować wszystkie dostępne liczniki, status kompletności i status runu. Nie nazywać takich metryk wiarygodną aktywnością sieci |
 
 | Kolumna | Definicja weryfikowalna w SQL |
 |---|---|
 | `date`, `hour` | Partycja UTC godziny (`data_interval_start` runu Airflow) |
-| `silver_partition_status` | `present` gdy `data.parquet` istnieje, `missing` w przeciwnym razie |
-| `data_completeness_status` | Status `_completeness.json`; `unknown` gdy pliku nie ma lub nie da się potwierdzić statusu |
-| `manifest_cycles` | Liczba manifestów Bronze znalezionych dla godziny |
+| `silver_partition_status` | `present`, gdy wskazany plik danych Silver istnieje (również gdy jest pusty); `missing`, gdy go brak. Pusta partycja jest dodatkowo oznaczana jako `silver_empty` w manifeście diagnostycznym |
+| `data_completeness_status` | Zweryfikowany status markera kompletności Silver; `unknown`, gdy markera brak lub jawnie raportuje brak manifestów. Błędy odczytu i walidacji przerywają zadanie |
+| `manifest_cycles` | Liczba manifestów uwzględnionych w markerze kompletności publikacji Silver; obejmuje duplikaty; `NULL`, gdy licznik jest nieznany |
 | `complete_manifest_cycles` | Liczba tych manifestów z `status = 'complete'` |
-| `complete_cycle_ratio` | `complete_manifest_cycles / manifest_cycles`; `NULL`, gdy `manifest_cycles = 0` |
+| `complete_cycle_ratio` | `complete_manifest_cycles / manifest_cycles`; `NULL` przy nieznanych licznikach lub zerowym mianowniku. Opisuje manifesty; dla danych ze slotami nie jest proporcją decydującą o kompletności |
 | `partial_manifest_cycles` | `manifest_cycles - complete_manifest_cycles`; `NULL`, gdy liczba cykli jest nieznana |
+| `expected_slots` | Oczekiwana liczba slotów, odczytana z `expected_cycles` markera Silver; 120 dla pełnej godziny przy interwale 30 s; `NULL`, gdy brak tej informacji |
+| `observed_slots` | Liczba unikalnych poprawnych slotów UTC uwzględnionych w ocenie; `0`, gdy metadane slotów istnieją, ale żaden slot nie jest poprawny; `NULL` dla historycznych manifestów bez slotów |
+| `complete_slots` | Liczba kompletnych unikalnych slotów; `0` przy braku kompletnych slotów, `NULL`, gdy liczba jest nieznana |
+| `slot_coverage_ratio` | `observed_slots / expected_slots`; `NULL` przy nieznanych licznikach lub zerowym mianowniku |
+| `complete_slot_ratio` | `complete_slots / observed_slots`; `NULL` przy nieznanych licznikach lub zerowym mianowniku |
 | `bronze_records` | `silver_position_events + quarantined_records` (zastępuje `records_processed`). Jest to dokładna liczba rekordów Bronze po odczycie, bo transformacja Bronze→Silver weryfikuje `przed - po = odrzucone`; `NULL`, gdy którykolwiek składnik jest nieznany |
 | `silver_position_events` | `COUNT(*)` z Silver; `NULL`, gdy partycja Silver nie istnieje |
-| `quarantined_records` | `COUNT(*)` z partycji kwarantanny; `NULL`, gdy plik kwarantanny nie istnieje lub jest niedostępny |
-| `rejection_pct` | `100 * quarantined_records / bronze_records` (skala 0–100); `NULL`, gdy `bronze_records` jest `NULL` lub 0. Zawiera odrzucenia rutynowe (ok. 40% to `stale_gps_time`), więc nie jest progiem jakości |
+| `quarantined_records` | `COUNT(*)` z kwarantanny aktywnej publikacji Silver; `NULL`, gdy pliku brak. Błąd dostępu lub odczytu przerywa zadanie |
+| `rejection_pct` | `100 * quarantined_records / bronze_records` (skala 0–100); `NULL`, gdy `bronze_records` jest `NULL` lub 0. Zawiera również odrzucenia rutynowe (`duplicate`, `stale_gps_time`), więc nie jest samodzielnym progiem jakości |
 | `duplicate_records` | Liczba wierszy kwarantanny z `rejection_reason = 'duplicate'`; `NULL`, gdy brak kwarantanny |
 | `integrity_rejection_pct` | Jak `rejection_pct`, ale bez przyczyn rutynowych (`duplicate`, `stale_gps_time`), tj. `invalid_coordinates`, `future_gps_time` itp. |
 | `quarantined_by_reason` | Liczności `GROUP BY rejection_reason` z kwarantanny; pusta lista tylko wtedy, gdy kwarantanna została odczytana i nie zawiera wierszy |
 | `safe_for_dashboard` | `TRUE` wtedy i tylko wtedy, gdy `data_completeness_status = 'complete'`, Silver ma co najmniej jeden wiersz, `is_final = TRUE`, `bronze_records` jest znane i `integrity_rejection_pct <= 5`. Nigdy `NULL` (brak informacji = `FALSE`) |
+| `is_final` | `TRUE`, gdy czas budowania publikacji jest nie wcześniejszy niż koniec godziny + 15 min; nie zamyka 24-godzinnego okna korekt |
+| `source_max_ingested_at` | `MAX(ingested_at)` z użytego Silver; `NULL`, gdy Silver nie istnieje lub jest pusty; nie jest identyfikatorem wersji ani pełnym znacznikiem zmian wejścia |
 | `pipeline_run_at` | Czas UTC utworzenia wiersza jakości |
 
 Sama lista partycji Bronze, Silver i manifestów nie pozwala wykryć godziny,
@@ -190,27 +228,46 @@ brak aktywności.
 5. Wszystkie tabele Gold są idempotentnie odtwarzane dla klucza godzinowego.
    `pipeline_run_at` jest metadanymi wykonania i nie stanowi części klucza.
 6. Każdy wiersz Gold ma `is_final` i `source_max_ingested_at`. Godzina jest
-   finalna (`is_final = TRUE`), gdy czas runu ≥ koniec godziny + 15 min
-   (`FINALITY_GRACE`); wcześniej jest nadal otwarta na późne dane.
+   gotowa według okresu oczekiwania (`is_final = TRUE`), gdy czas runu
+   ≥ koniec godziny + 15 min (`FINALITY_GRACE`); wcześniej flaga ma wartość
+   `FALSE`. Okno dopuszczalnych korekt jest osobną regułą.
    `safe_for_dashboard` wymaga dodatkowo `is_final = TRUE`.
    `source_max_ingested_at` to największy `ingested_at` w Silver użytym do
-   budowy partycji (`NULL`, gdy Silver nie istnieje); wzrost tej wartości po
-   ponownym przeliczeniu oznacza, że dotarły późne dane.
+   budowy partycji (`NULL`, gdy Silver nie istnieje lub jest pusty). Sama
+   wartość tego maksimum nie identyfikuje wszystkich zmian wejścia ani wersji
+   Silver; do tego służą `source_inputs` i `source_silver_uri`.
+   `is_final` oznacza gotowość po okresie oczekiwania, a nie niezmienność
+   danych. Korekty nadal są dopuszczane w 24-godzinnym oknie.
+   Manifest pełnej publikacji Gold zawiera `is_final` oraz `source_silver_uri`.
+   DAG korekt wybiera również godziny wymagające finalizacji, nawet gdy nie
+   przybyło danych Bronze, i aktualizuje sam Gold, zachowując aktualny Silver.
+   Finalizacja następuje podczas pierwszego wykonania DAG-u po upływie okresu
+   oczekiwania; przy harmonogramie `:30` nie musi nastąpić dokładnie w `:15`.
 7. Polityka korekt: DAG `reprocess_late_data_hourly` (co godzinę, `:30`)
-   przelicza Silver i Gold dla zamkniętych godzin z ostatnich 24 h, w których
-   obiekty Bronze są nowsze niż partycja Silver (lub Silver brakuje). Starsze
-   godziny są zamrożone. Nadpisanie partycji jest atomowe (server-side copy)
-   i idempotentne; równoległy przebieg z głównymi DAG-ami jest bezpieczny.
+   sprawdza zamknięte godziny z ostatnich 24 h. Nowe publikacje Silver zapisują
+   w aktywnym manifeście `source_inputs`: klucze, ETag, rozmiary i czasy
+   modyfikacji wejściowych plików Bronze oraz manifestów cykli. Zmiana tego
+   zestawu powoduje przebudowę Silver i Gold, również gdy nowe obiekty
+   powstały przed publikacją Silver. Dane wybranych plików są odczytywane raz
+   do tabeli tymczasowej DuckDB, wspólnej dla kontroli jakości, Silver
+   i kwarantanny. Kompletność korzysta z wybranej listy manifestów.
+   Bronze jest traktowane jako wejście append-only: istniejące obiekty nie
+   powinny być nadpisywane. Listowanie metadanych nie jest transakcyjnym
+   snapshotem storage, a ETag nie jest zakładany jako suma MD5.
+   Dla starszych publikacji bez `source_inputs` pozostaje porównanie czasów
+   modyfikacji. Brakujący, nieaktualny lub wymagający finalizacji Gold jest
+   odbudowywany bez przebudowy aktualnego Silver. Starsze godziny poza oknem
+   korekt nie są automatycznie przeliczane. Wspólny pool Airflow serializuje
+   zapisy projektowych DAG-ów; uruchomienia ręczne muszą przestrzegać tej
+   samej zasady.
 
-
-## Implementacja (silver_to_gold.py)
 
 ## Implementacja (`silver_to_gold.py`)
 
 - **Publikacja atomowa:** tabele `vehicle_activity_hourly`, `hourly_line_metrics`, `hourly_network_metrics` i `hourly_data_quality` są najpierw zapisywane w `s3://gold/_staging/`, a następnie walidowane pod kątem schematu i liczby wierszy. Po walidacji pliki trafiają do unikalnych, wersjonowanych ścieżek w `s3://gold/_versions/`. Dopiero po przygotowaniu wszystkich czterech tabel zapisywany jest manifest w `s3://gold/_commits/`, wskazujący URI opublikowanych plików i ich liczby wierszy. Konsument powinien odczytywać manifest i korzystać z URI, które wskazuje, zamiast zakładać stałe ścieżki plików.
-- **Granica publikacji:** manifest jest punktem zatwierdzenia pełnej publikacji Gold. Jeśli przygotowanie lub kopiowanie tabel zakończy się błędem przed zapisaniem manifestu, poprzednia publikacja pozostaje wskazywana przez dotychczasowy manifest. Zapis pojedynczego obiektu manifestu w S3 atomowo zastępuje jego poprzednią wersję.
+- **Granica publikacji:** manifest pod `s3://gold/_commits/date=YYYY-MM-DD/hour=HH/manifest.json` jest punktem zatwierdzenia pełnej publikacji Gold. Zawiera `publication_id`, `partition`, `source_silver_uri`, `is_final` oraz URI i liczby wierszy wszystkich tabel. Konsument powinien odczytać go raz i używać wskazanych URI dla całej publikacji. Jeśli przygotowanie lub kopiowanie tabel zakończy się błędem przed zapisaniem manifestu, poprzednia publikacja pozostaje wskazywana przez dotychczasowy manifest. Zapis pojedynczego obiektu manifestu w S3 atomowo zastępuje jego poprzednią wersję.
 - **Publikacja diagnostyczna:** gdy Silver nie istnieje lub jest pusty, pipeline publikuje wyłącznie `hourly_data_quality` oraz osobny manifest diagnostyczny w `s3://gold/_diagnostics/date=YYYY-MM-DD/hour=HH/manifest.json`. Pole `status` przyjmuje wartość `silver_missing` dla brakującej partycji albo `silver_empty` dla istniejącej, lecz pustej partycji. Manifest diagnostyczny zawiera `publication_id`, `partition`, `status` oraz URI i liczbę wierszy tabeli `hourly_data_quality`. Nie jest to pełna publikacja Gold i manifest diagnostyczny nie zastępuje ani nie nadpisuje manifestu pełnej publikacji w `s3://gold/_commits/date=YYYY-MM-DD/hour=HH/manifest.json`. Konsumenci szukający diagnostyki powinni sprawdzać ścieżkę `_diagnostics/`; konsumenci pełnych danych Gold powinni korzystać wyłącznie z `_commits/`.
 - **Idempotencja:** ponowne przeliczenie godziny publikuje nową wersję plików i aktualizuje manifest. `pipeline_run_at` jest metadaną uruchomienia i może się zmieniać; pozostałe dane powinny być zgodne z wejściem i kontraktem.
-- **Walidacje:** schemat Silver przed agregacją, spójność krzyżowa tabel (suma pojazdów i zdarzeń) oraz unikalność kluczy.
+- **Walidacje:** schemat i zawartość Silver przed agregacją, schemat i liczba wierszy plików staging, spójność krzyżowa tabel oraz unikalność kluczy. Liczba kompletnych slotów nie może przekraczać liczby obecnych slotów ani manifestów complete; liczba obecnych slotów nie może przekraczać oczekiwanych slotów ani znanej liczby manifestów. Liczniki muszą być nieujemnymi liczbami całkowitymi; wartości logiczne są odrzucane. Proporcje Gold są wyliczane z liczników.
 - **Kompletność:** godziny ze statusem `incomplete` lub `unknown` są publikowane z jawnym `data_completeness_status`. Konsument powinien uwzględniać ten status oraz `safe_for_dashboard` i `is_final`, zamiast traktować samą obecność danych jako gwarancję ich gotowości.
 - **Zakres jakości:** jakość nie obejmuje statusu Airflow. Luki w godzinach należy wykrywać na podstawie orkiestracji i oczekiwanej osi czasu na dashboardzie.

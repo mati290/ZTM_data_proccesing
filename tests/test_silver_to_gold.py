@@ -61,6 +61,42 @@ class GoldAggregationTests(unittest.TestCase):
         self.addCleanup(self.con.close)
         self.path = make_silver(self.tmp.name)
 
+    def test_quality_distinguishes_slot_and_manifest_metrics(self):
+        silver_rows = build_all(self.con, self.path)
+        marker = {
+            "status": "incomplete",
+            "cycles": 2,
+            "complete_cycles": 2,
+            "expected_cycles": 2,
+            "observed_slots": 1,
+            "complete_slots": 1,
+        }
+
+        with patch(
+            "silver_to_gold.read_completeness_marker",
+            return_value=marker,
+        ):
+            completeness = gold.load_completeness("2026-01-15", "12")
+
+        gold.build_quality_table(
+            self.con,
+            "2026-01-15",
+            "12",
+            completeness,
+            silver_rows,
+            True,
+            RUN_AT,
+        )
+
+        row = self.con.execute(
+            "SELECT manifest_cycles, complete_manifest_cycles, "
+            "complete_cycle_ratio, expected_slots, observed_slots, "
+            "complete_slots, slot_coverage_ratio, complete_slot_ratio "
+            "FROM hourly_data_quality"
+        ).fetchone()
+
+        self.assertEqual(row, (2, 2, 1.0, 2, 1, 1, 0.5, 1.0))
+
     def test_network_metrics_follow_contract(self):
         build_all(self.con, self.path)
         row = self.con.execute(
@@ -246,8 +282,37 @@ class CompletenessTests(unittest.TestCase):
         ):
             result = gold.load_completeness("2026-01-15", "12")
         self.assertEqual(
-            result, {"status": "unknown", "cycles": None, "complete_cycles": None}
+            result,
+            {
+                "status": "unknown",
+                "cycles": None,
+                "complete_cycles": None,
+                "expected_cycles": None,
+                "observed_slots": None,
+                "complete_slots": None,
+                "slot_coverage_ratio": None,
+                "complete_slot_ratio": None,
+            },
         )
+
+    def test_complete_slots_cannot_exceed_complete_manifest_count(self):
+        marker = {
+            "status": "incomplete",
+            "cycles": 3,
+            "complete_cycles": 1,
+            "expected_cycles": 2,
+            "observed_slots": 2,
+            "complete_slots": 2,
+        }
+
+        with (
+            patch(
+                "silver_to_gold.read_completeness_marker",
+                return_value=marker,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            gold.load_completeness("2026-01-15", "12")
 
     def test_invalid_status_is_rejected(self):
         with (
@@ -258,6 +323,30 @@ class CompletenessTests(unittest.TestCase):
             self.assertRaises(ValueError),
         ):
             gold.load_completeness("2026-01-15", "12")
+
+    def test_loads_slot_counts_separately_from_manifest_counts(self):
+        marker = {
+            "status": "incomplete",
+            "cycles": 2,
+            "complete_cycles": 2,
+            "expected_cycles": 2,
+            "observed_slots": 1,
+            "complete_slots": 1,
+        }
+
+        with patch(
+            "silver_to_gold.read_completeness_marker",
+            return_value=marker,
+        ):
+            result = gold.load_completeness("2026-01-15", "12")
+
+        self.assertEqual(result["cycles"], 2)
+        self.assertEqual(result["complete_cycles"], 2)
+        self.assertEqual(result["expected_cycles"], 2)
+        self.assertEqual(result["observed_slots"], 1)
+        self.assertEqual(result["complete_slots"], 1)
+        self.assertEqual(result["slot_coverage_ratio"], 0.5)
+        self.assertEqual(result["complete_slot_ratio"], 1.0)
 
     def test_marker_for_other_partition_is_rejected(self):
         marker = {"status": "complete", "date": "2026-01-14", "hour": "12"}
@@ -629,6 +718,40 @@ class GoldProcessTests(LocalPipelineTestCase):
 
         self.assertEqual(len(first["hourly_network_metrics"]), 1)
         self.assertEqual(len(first["hourly_data_quality"]), 1)
+
+    def test_manifest_finality_matches_published_quality(self):
+        self.write_quarantine(["duplicate", "stale_gps_time"])
+
+        for minute, expected_final in ((14, False), (15, True)):
+            with self.subTest(minute=minute):
+                self.build(run_at=RUN_AT.replace(minute=minute))
+
+                manifest_path = (
+                    f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+                )
+                with open(manifest_path, encoding="utf-8") as file:
+                    manifest = json.load(file)
+
+                self.assertIs(manifest["is_final"], expected_final)
+
+                quality_uri = manifest["tables"]["hourly_data_quality"]["uri"]
+                actual_final = self.con.execute(
+                    "SELECT is_final FROM read_parquet("
+                    f"'{quality_uri}', hive_partitioning=false)"
+                ).fetchone()[0]
+                self.assertIs(actual_final, expected_final)
+
+    def test_manifest_records_source_silver_uri(self):
+        self.write_quarantine(["duplicate", "stale_gps_time"])
+        self.build()
+
+        manifest_path = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_path, encoding="utf-8") as file:
+            manifest = json.load(file)
+
+        self.assertEqual(manifest["source_silver_uri"], self.silver)
 
     def test_missing_silver_keeps_previous_full_manifest(self):
         self.build()

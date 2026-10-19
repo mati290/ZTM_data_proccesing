@@ -109,6 +109,11 @@ GOLD_SCHEMAS = {
         ("complete_manifest_cycles", "BIGINT"),
         ("partial_manifest_cycles", "BIGINT"),
         ("complete_cycle_ratio", "DOUBLE"),
+        ("expected_slots", "BIGINT"),
+        ("observed_slots", "BIGINT"),
+        ("complete_slots", "BIGINT"),
+        ("slot_coverage_ratio", "DOUBLE"),
+        ("complete_slot_ratio", "DOUBLE"),
         ("bronze_records", "BIGINT"),
         ("silver_position_events", "BIGINT"),
         ("quarantined_records", "BIGINT"),
@@ -236,7 +241,43 @@ def load_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
         raise ValueError("Completeness marker must have both cycles counters or none")
     if cycles is not None and complete_cycles > cycles:
         raise ValueError("Completeness marker has complete_cycles > cycles")
-    return {"status": status, "cycles": cycles, "complete_cycles": complete_cycles}
+    expected_cycles = _non_negative_int(marker, "expected_cycles")
+    observed_slots = _non_negative_int(marker, "observed_slots")
+    complete_slots = _non_negative_int(marker, "complete_slots")
+
+    if (observed_slots is None) != (complete_slots is None):
+        raise ValueError("Completeness marker must have both slot counters or none")
+
+    if observed_slots is not None:
+        if expected_cycles is None:
+            raise ValueError("Slot counters require expected_cycles")
+        if complete_slots > observed_slots:
+            raise ValueError("Completeness marker has complete_slots > observed_slots")
+        if observed_slots > expected_cycles:
+            raise ValueError("Completeness marker has observed_slots > expected_cycles")
+        if cycles is None or observed_slots > cycles:
+            raise ValueError("Slot counters exceed known manifest count")
+        if complete_slots > complete_cycles:
+            raise ValueError("Completeness marker has complete_slots > complete_cycles")
+
+    return {
+        "status": status,
+        "cycles": cycles,
+        "complete_cycles": complete_cycles,
+        "expected_cycles": expected_cycles,
+        "observed_slots": observed_slots,
+        "complete_slots": complete_slots,
+        "slot_coverage_ratio": (
+            observed_slots / expected_cycles
+            if observed_slots is not None and expected_cycles > 0
+            else None
+        ),
+        "complete_slot_ratio": (
+            complete_slots / observed_slots
+            if observed_slots is not None and observed_slots > 0
+            else None
+        ),
+    }
 
 
 def _sql_bigint(value) -> str:
@@ -500,6 +541,15 @@ def build_quality_table(
             {_sql_bigint(complete_cycles)} AS complete_manifest_cycles,
             {partial} AS partial_manifest_cycles,
             {ratio} AS complete_cycle_ratio,
+            {_sql_bigint(completeness.get("expected_cycles"))} AS expected_slots,
+            {_sql_bigint(completeness.get("observed_slots"))} AS observed_slots,
+            {_sql_bigint(completeness.get("complete_slots"))} AS complete_slots,
+            CAST({_sql_bigint(completeness.get("observed_slots"))} AS DOUBLE)
+                / NULLIF({_sql_bigint(completeness.get("expected_cycles"))}, 0)
+                AS slot_coverage_ratio,
+            CAST({_sql_bigint(completeness.get("complete_slots"))} AS DOUBLE)
+                / NULLIF({_sql_bigint(completeness.get("observed_slots"))}, 0)
+                AS complete_slot_ratio,
             bronze_records,
             {_sql_bigint(silver_rows)} AS silver_position_events,
             quarantined_records,
@@ -611,9 +661,14 @@ def publish_tables(con, tables, uris: dict) -> dict:
 
         # 3. Commit only a complete publication.
         if tuple(tables) == GOLD_TABLES:
+            is_final = con.execute(
+                "SELECT is_final FROM hourly_data_quality"
+            ).fetchone()[0]
             manifest = {
                 "publication_id": uris["publication_id"],
                 "partition": uris["partition"],
+                "source_silver_uri": uris["silver"],
+                "is_final": is_final,
                 "tables": {
                     table: {
                         "uri": uris["gold"][table],

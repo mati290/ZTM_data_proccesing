@@ -177,7 +177,13 @@ The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
   Chainguard MinIO channel supplies `latest`; use a tested image digest before
   deploying outside local development.
 - **Docker layer caching:** dependencies are installed before the code is
-  copied, so code changes rebuild the image in seconds.
+- Nowe dane Bronze i manifest cyklu są przypisywane do partycji godziny UTC,
+  w której rozpoczyna się slot cyklu pobierania. Cykl przekraczający granicę
+  godziny lub północ zachowuje tę samą partycję dla autobusów, tramwajów
+  i manifestu. Pole `_ingested_at` nadal zawiera rzeczywisty czas zapisu
+  danych. Godzina partycji nie oznacza godziny zdarzenia GPS i może różnić
+  się od godziny `_ingested_at`. Historyczne obiekty zapisane według czasu
+  zapisu pozostają w dotychczasowych partycjach.
 
 ## Known limitations
 

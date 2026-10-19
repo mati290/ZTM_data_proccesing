@@ -1,15 +1,16 @@
-"""Late-data correction: recomputes Silver and Gold for recent hours that changed.
+"""Repair recent closed hours and finalize Gold publications.
 
-Policy:
-  * only closed hours inside the correction window (default 24h) are considered;
-  * an hour is stale when Bronze was written after the Silver partition was published,
-    or when Silver is missing although Bronze exists (this also repairs gaps);
-  * hours older than the window are frozen;
-  * the current (open) hour is never touched - the regular DAGs own it.
-Every rewrite is an atomic overwrite of an idempotent partition.
+Within the correction window (default 24h), compare current Bronze data
+and manifest metadata with the inputs recorded by Silver. Legacy Silver
+publications use modification times as a fallback.
+
+Rebuild Silver only when required. Repair missing or outdated Gold and
+finalize eligible Gold publications without rebuilding fresh Silver.
+Project DAGs serialize writes through a shared Airflow pool.
 """
 
 import argparse
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -80,7 +81,14 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
         )
         if not any(obj.get("Key") == key for obj in response.get("Contents", [])):
             return True
-
+    recorded_inputs = bronze_to_silver.read_silver_source_inputs(
+        date_str, hour_str, s3_client
+    )
+    if recorded_inputs is not None:
+        current_inputs = bronze_to_silver.capture_bronze_inputs(
+            date_str, hour_str, s3_client
+        )
+        return current_inputs != recorded_inputs
     data_bucket, data_key = _parse_s3_uri(artifacts["data"])
     silver_latest = _max_last_modified(
         s3_client,
@@ -89,6 +97,44 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
     )
 
     return silver_latest is None or bronze_latest > silver_latest
+
+
+def is_gold_stale(
+    date_str: str, hour_str: str, s3_client, now: datetime | None = None
+) -> bool:
+    """Check whether Gold references the currently active Silver data."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
+    manifest_uri = silver_to_gold.publication_manifest_uri(date_str, hour_str)
+    bucket, key = _parse_s3_uri(manifest_uri)
+
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
+            return True
+        raise
+
+    manifest = json.loads(response["Body"].read())
+    if not isinstance(manifest, dict):
+        raise TypeError("Gold publication manifest must be a JSON object")
+
+    expected_partition = f"date={date_str}/hour={hour_str}"
+    if manifest.get("partition") != expected_partition:
+        raise ValueError("Gold publication manifest references another partition")
+
+    if manifest.get("source_silver_uri") != artifacts["data"]:
+        return True
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+
+    return manifest.get("is_final") is not True and silver_to_gold.is_hour_final(
+        date_str, hour_str, now
+    )
 
 
 def find_stale_hours(
@@ -104,17 +150,34 @@ def find_stale_hours(
         date_str, hour_str = hour_start.strftime("%Y-%m-%d"), hour_start.strftime("%H")
         if is_hour_stale(date_str, hour_str, s3_client):
             stale.append((date_str, hour_str))
+            continue
+
+        artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
+        bucket, key = _parse_s3_uri(artifacts["data"])
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+        silver_exists = any(
+            obj.get("Key") == key for obj in response.get("Contents", [])
+        )
+
+        if silver_exists and is_gold_stale(date_str, hour_str, s3_client, now=now):
+            stale.append((date_str, hour_str))
     return stale
 
 
-def recompute_hour(con, date_str, hour_str, run_at=None):
-    bronze_to_silver.transform_hour(con, date_str, hour_str, overwrite=True)
+def recompute_hour(con, date_str, hour_str, run_at=None, s3_client=None):
+    s3_client = s3_client or bronze_to_silver._s3_client()
+    if is_hour_stale(date_str, hour_str, s3_client):
+        bronze_to_silver.transform_hour(con, date_str, hour_str, overwrite=True)
     return silver_to_gold.build_gold_hour(con, date_str, hour_str, run_at)
 
 
 def reprocess_late_data(
     now=None, window_hours=CORRECTION_WINDOW_HOURS, s3_client=None, con=None
 ) -> dict:
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.astimezone(timezone.utc)
     stale = find_stale_hours(now, window_hours, s3_client)
     logger.info("Hours to recompute in the last %sh: %s", window_hours, stale)
     if not stale:
@@ -126,7 +189,9 @@ def reprocess_late_data(
     try:
         for date_str, hour_str in stale:
             try:
-                result = recompute_hour(con, date_str, hour_str)
+                result = recompute_hour(
+                    con, date_str, hour_str, run_at=now, s3_client=s3_client
+                )
                 recomputed.append(f"{date_str} {hour_str}")
                 logger.info(
                     "Recomputed %s hour %s: status=%s",

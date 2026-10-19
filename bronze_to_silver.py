@@ -44,11 +44,16 @@ class BronzeDataMissingError(FileNotFoundError):
     """Raised when an hourly Bronze partition contains no files."""
 
 
-BASE_CTES = """
+BRONZE_SOURCE_CTE = """
 WITH source AS (
     SELECT *
     FROM read_json_auto('{bronze_path}', hive_partitioning = true)
 ),
+"""
+
+BASE_CTES = (
+    BRONZE_SOURCE_CTE
+    + """
 typed_base AS (
     SELECT
         vehicle_type,
@@ -128,6 +133,7 @@ deduplicated AS (
     WHERE row_num = 1
 )
 """
+)
 TRANSFORM_SQL = BASE_CTES + "SELECT * FROM deduplicated"
 
 REJECTED_SQL = (
@@ -416,6 +422,7 @@ def write_silver_active_manifest(
     hour_str: str,
     publication_id: str,
     artifacts: dict[str, str],
+    source_inputs: list[dict] | None = None,
 ) -> None:
     """Publish a prepared Silver version by replacing its active manifest."""
     date_str, hour_str = validate_partition(date_str, hour_str)
@@ -448,6 +455,8 @@ def write_silver_active_manifest(
         "status": "published",
         "artifacts": artifacts,
     }
+    if source_inputs is not None:
+        manifest["source_inputs"] = source_inputs
     _s3_client().put_object(
         Bucket="silver",
         Key=f"vehicle_positions/{partition}/_active.json",
@@ -495,6 +504,97 @@ def copy_s3_object(source_uri: str, destination_uri: str) -> None:
         Key=destination_key,
         CopySource={"Bucket": source_bucket, "Key": source_key},
     )
+
+
+def sql_from_materialized_input(template: str) -> str:
+    """Use the captured input table while preserving transformation rules."""
+    if not template.startswith(BRONZE_SOURCE_CTE):
+        raise ValueError("SQL template must start with the Bronze source CTE")
+
+    source_cte = "WITH source AS (SELECT * FROM bronze_input),\n"
+    return source_cte + template[len(BRONZE_SOURCE_CTE) :]
+
+
+def materialize_bronze_inputs(con, files: list[str]) -> None:
+    """Read the selected files once into a temporary input table."""
+    if not files:
+        raise BronzeDataMissingError("No Bronze files selected for processing")
+
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE bronze_input AS
+        SELECT *
+        FROM read_json_auto(?, hive_partitioning = true)
+        """,
+        [files],
+    )
+
+
+def read_silver_source_inputs(
+    date_str: str, hour_str: str, s3_client=None
+) -> list[dict] | None:
+    """Read recorded inputs; None means a legacy publication."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    s3_client = s3_client or _s3_client()
+    partition = f"date={date_str}/hour={hour_str}"
+    key = f"vehicle_positions/{partition}/_active.json"
+
+    try:
+        response = s3_client.get_object(Bucket="silver", Key=key)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
+            return None
+        raise
+
+    manifest = json.loads(response["Body"].read())
+    if not isinstance(manifest, dict):
+        raise TypeError("Active Silver manifest must be a JSON object")
+    if manifest.get("partition") != partition:
+        raise ValueError("Active Silver manifest references another partition")
+    if "source_inputs" not in manifest:
+        return None
+
+    source_inputs = manifest["source_inputs"]
+    if not isinstance(source_inputs, list):
+        raise TypeError("Silver source_inputs must be a list")
+
+    return source_inputs
+
+
+def capture_bronze_inputs(date_str: str, hour_str: str, s3_client=None) -> list[dict]:
+    """List data and manifest objects identifying one hour's input."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    s3_client = s3_client or _s3_client()
+    partition = f"date={date_str}/hour={hour_str}/"
+    prefixes = (
+        (f"vehicle_type=bus/{partition}", ".jsonl"),
+        (f"vehicle_type=tram/{partition}", ".jsonl"),
+        (f"_manifests/{partition}", ".json"),
+    )
+    inputs = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+
+    for prefix, suffix in prefixes:
+        for page in paginator.paginate(Bucket="bronze", Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(suffix):
+                    continue
+
+                inputs.append(
+                    {
+                        "key": key,
+                        "etag": obj.get("ETag"),
+                        "size": obj.get("Size"),
+                        "last_modified": obj["LastModified"]
+                        .astimezone(timezone.utc)
+                        .isoformat(),
+                    }
+                )
+
+    return sorted(inputs, key=lambda obj: obj["key"])
 
 
 def is_before_first_bronze_hour(date_str: str, hour_str: str, s3_client=None) -> bool:
@@ -564,27 +664,41 @@ def assess_completeness(
     s3_client=None,
     poll_interval_seconds: int | None = None,
     now_utc: datetime | None = None,
+    source_inputs: list[dict] | None = None,
 ) -> dict:
     """Summarize ingestion cycle manifests for an hour (bus + tram both fetched)."""
     s3_client = s3_client or _s3_client()
     prefix = f"_manifests/date={date_str}/hour={hour_str}/"
-    keys = []
-    for page in s3_client.get_paginator("list_objects_v2").paginate(
-        Bucket="bronze", Prefix=prefix
-    ):
-        keys.extend(obj["Key"] for obj in page.get("Contents", []))
+    if source_inputs is None:
+        keys = []
+        for page in s3_client.get_paginator("list_objects_v2").paginate(
+            Bucket="bronze", Prefix=prefix
+        ):
+            keys.extend(obj["Key"] for obj in page.get("Contents", []))
+    else:
+        keys = [
+            obj["key"]
+            for obj in source_inputs
+            if obj["key"].startswith(prefix) and obj["key"].endswith(".json")
+        ]
 
     complete = 0
     slot_statuses: dict[str, list[bool]] = {}
+    has_slot_metadata = False
     for key in keys:
         body = s3_client.get_object(Bucket="bronze", Key=key)["Body"].read()
         manifest = json.loads(body)
+        if not isinstance(manifest, dict):
+            raise TypeError("Cycle manifest must be a JSON object")
 
         if manifest.get("status") == "complete":
             complete += 1
 
+        if "cycle_slot_start" in manifest:
+            has_slot_metadata = True
+
         slot_start = manifest.get("cycle_slot_start")
-        if slot_start:
+        if isinstance(slot_start, str) and slot_start:
             slot_statuses.setdefault(slot_start, []).append(
                 manifest.get("status") == "complete"
             )
@@ -607,7 +721,7 @@ def assess_completeness(
 
     minimum_required_cycles = math.ceil(expected_cycles * MIN_CYCLE_COVERAGE_RATIO)
 
-    if slot_statuses:
+    if has_slot_metadata:
         expected_prefix = f"{date_str}T{hour_str}:"
         valid_slots: dict[datetime, bool] = {}
 
@@ -658,6 +772,18 @@ def assess_completeness(
         "cycles": total,
         "complete_cycles": complete,
         "partial_cycles": total - complete,
+        "observed_slots": assessed_cycles if has_slot_metadata else None,
+        "complete_slots": assessed_complete if has_slot_metadata else None,
+        "slot_coverage_ratio": (
+            assessed_cycles / expected_cycles
+            if has_slot_metadata and expected_cycles > 0
+            else None
+        ),
+        "complete_slot_ratio": (
+            assessed_complete / assessed_cycles
+            if has_slot_metadata and assessed_cycles > 0
+            else None
+        ),
         "missing_cycles": missing_cycles,
         "min_complete_ratio": MIN_COMPLETE_CYCLE_RATIO,
         "expected_cycles": expected_cycles,
@@ -740,7 +866,14 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
             "refusing to report success for an empty partition."
         )
 
-    quality_sql = QUALITY_SQL.format(bronze_path=bronze_path)
+    source_inputs = capture_bronze_inputs(date_str, hour_str)
+    data_files = [
+        f"s3://bronze/{obj['key']}"
+        for obj in source_inputs
+        if obj["key"].endswith(".jsonl")
+    ]
+    materialize_bronze_inputs(con, data_files)
+    quality_sql = sql_from_materialized_input(QUALITY_SQL)
     (
         before,
         after_coordinates,
@@ -756,8 +889,8 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
     ) = con.execute(quality_sql).fetchone()
     validate_output_quality(date_str, hour_str, before, after)
 
-    sql = TRANSFORM_SQL.format(bronze_path=bronze_path)
-    rejected_sql = REJECTED_SQL.format(bronze_path=bronze_path)
+    sql = sql_from_materialized_input(TRANSFORM_SQL)
+    rejected_sql = sql_from_materialized_input(REJECTED_SQL)
     rejected_count = before - after
 
     if not overwrite:
@@ -803,7 +936,9 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
                 "refusing to publish."
             )
 
-        completeness = assess_completeness(date_str, hour_str)
+        completeness = assess_completeness(
+            date_str, hour_str, source_inputs=source_inputs
+        )
 
         # Prepare the complete new version before switching the active pointer.
         copy_s3_object(rejected_temp_file, rejected_file)
@@ -816,6 +951,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
             hour_str,
             publication_id,
             artifacts,
+            source_inputs=source_inputs,
         )
 
         if completeness["status"] != "complete":

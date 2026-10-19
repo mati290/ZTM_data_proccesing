@@ -1,7 +1,7 @@
 import json
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 from botocore.exceptions import BotoCoreError, ClientError
 from requests import HTTPError, Timeout
@@ -117,6 +117,46 @@ class SaveToBronzeTests(unittest.TestCase):
 
         self.assertEqual(records, [{"VehicleNumber": "123"}])
         self.assertEqual(request.call_args.kwargs["params"]["type"], 1)
+
+    def test_cycle_crossing_midnight_keeps_data_and_manifest_in_slot_partition(self):
+        s3 = Mock()
+        started_at = datetime(2026, 10, 15, 23, 59, 45, tzinfo=timezone.utc)
+        bus_written_at = datetime(2026, 10, 16, 0, 0, 5, tzinfo=timezone.utc)
+        tram_written_at = datetime(2026, 10, 16, 0, 0, 6, tzinfo=timezone.utc)
+        manifest_written_at = datetime(2026, 10, 16, 0, 0, 7, tzinfo=timezone.utc)
+
+        with (
+            patch("ingest.datetime", wraps=datetime) as clock,
+            patch("ingest.get_poll_interval_seconds", return_value=30),
+            patch(
+                "ingest.fetch_positions",
+                side_effect=[
+                    [{"VehicleNumber": "1"}],
+                    [{"VehicleNumber": "2"}],
+                ],
+            ),
+        ):
+            clock.now.side_effect = [
+                started_at,
+                bus_written_at,
+                tram_written_at,
+                manifest_written_at,
+            ]
+            run_once("test-key", s3)
+
+        writes = s3.put_object.call_args_list
+        self.assertEqual(len(writes), 3)
+        for write in writes:
+            self.assertIn("/date=2026-10-15/hour=23/", write.kwargs["Key"])
+
+        bus_record = json.loads(writes[0].kwargs["Body"])
+        self.assertEqual(bus_record["_ingested_at"], bus_written_at.isoformat())
+        manifest = json.loads(writes[2].kwargs["Body"])
+        self.assertEqual(
+            manifest["cycle_slot_start"],
+            "2026-10-15T23:59:30+00:00",
+        )
+        self.assertEqual(manifest["ingested_at"], manifest_written_at.isoformat())
 
     def test_fetch_positions_rejects_api_error_result(self):
         response = Mock()
@@ -238,7 +278,7 @@ class SaveToBronzeTests(unittest.TestCase):
                 "empty_sources": [],
             },
         )
-        save_mock.assert_called_once_with(s3, bus_records, "bus")
+        save_mock.assert_called_once_with(s3, bus_records, "bus", cycle_slot_start=ANY)
         manifest_call = s3.put_object.call_args
         self.assertTrue(manifest_call.kwargs["Key"].startswith("_manifests/"))
         manifest = json.loads(manifest_call.kwargs["Body"])

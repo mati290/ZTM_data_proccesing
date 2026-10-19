@@ -73,12 +73,18 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
     raise RuntimeError(f"Failed to fetch positions for vehicle type {vehicle_type}")
 
 
-def save_to_bronze(s3, records, vehicle_label):
+def save_to_bronze(
+    s3, records, vehicle_label, cycle_slot_start: datetime | None = None
+):
     if not records:
         logger.warning(f"No records fetched for vehicle type {vehicle_label}")
         return
 
     ingested_at = datetime.now(timezone.utc)
+    partition_time = cycle_slot_start or ingested_at
+    if partition_time.tzinfo is None:
+        raise ValueError("cycle_slot_start must be timezone-aware")
+    partition_time = partition_time.astimezone(timezone.utc)
 
     file_name = (
         f"positions_{ingested_at.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.jsonl"
@@ -86,8 +92,8 @@ def save_to_bronze(s3, records, vehicle_label):
 
     key = (
         f"vehicle_type={vehicle_label}/"
-        f"date={ingested_at.strftime('%Y-%m-%d')}/"
-        f"hour={ingested_at.strftime('%H')}/"
+        f"date={partition_time.strftime('%Y-%m-%d')}/"
+        f"hour={partition_time.strftime('%H')}/"
         f"{file_name}"
     )
 
@@ -171,8 +177,10 @@ def write_cycle_manifest(
         "failed_sources": failed_sources,
         "empty_sources": empty_sources,
     }
+    partition_time = cycle_slot_start.astimezone(timezone.utc)
     key = (
-        f"_manifests/date={now.strftime('%Y-%m-%d')}/hour={now.strftime('%H')}/"
+        f"_manifests/date={partition_time.strftime('%Y-%m-%d')}/"
+        f"hour={partition_time.strftime('%H')}/"
         f"cycle_{now.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.json"
     )
     try:
@@ -228,9 +236,9 @@ def run_once(api_key, s3):
     )
 
     if buses:
-        save_to_bronze(s3, buses, "bus")
+        save_to_bronze(s3, buses, "bus", cycle_slot_start=cycle_slot_start)
     if trams:
-        save_to_bronze(s3, trams, "tram")
+        save_to_bronze(s3, trams, "tram", cycle_slot_start=cycle_slot_start)
 
     write_cycle_manifest(
         s3,

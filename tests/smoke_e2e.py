@@ -1,7 +1,14 @@
-"""End-to-end smoke test: Bronze JSONL in MinIO -> Silver Parquet.
+"""End-to-end smoke test: Bronze JSONL -> Silver -> Gold in MinIO.
 
-Run inside the Airflow container (same DuckDB version as production):
+Run inside the Airflow container against a dedicated test MinIO instance:
     python /tmp/smoke_e2e.py
+
+Never target the application's real data lake. Cleanup deletes objects
+under the fixed test partition prefixes. The lock serializes cooperating
+smoke tests; it does not protect against other writers.
+
+An interrupted process may leave a lock. Remove it manually only after
+confirming that no smoke test is running and inspecting leftover test data.
 """
 
 import json
@@ -9,6 +16,8 @@ import os
 import sys
 
 import boto3
+import duckdb
+from botocore.exceptions import BotoCoreError, ClientError
 
 sys.path.insert(0, "/opt/airflow/src")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -17,6 +26,26 @@ import bronze_to_silver
 
 DATE = "2020-01-15"
 HOUR = "12"
+
+SMOKE_LOCK_KEY = f"_smoke_locks/date={DATE}/hour={HOUR}/lock.json"
+
+
+def acquire_smoke_lock(s3) -> None:
+    try:
+        s3.put_object(
+            Bucket="bronze",
+            Key=SMOKE_LOCK_KEY,
+            Body=b"smoke-test",
+            IfNoneMatch="*",
+        )
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code == "PreconditionFailed" or status == 412:
+            raise RuntimeError(
+                "Smoke test is already running or a previous lock remains"
+            ) from exc
+        raise
 
 
 def build_records():
@@ -38,21 +67,27 @@ def build_records():
     return [good, good, stale, outside]
 
 
-def assert_test_partition_empty(s3, date_str, hour_str):
-    prefixes = [
+def test_partition_prefixes(date_str: str, hour_str: str) -> list[tuple[str, str]]:
+    return [
         ("bronze", f"vehicle_type=bus/date={date_str}/hour={hour_str}/"),
         ("bronze", f"vehicle_type=tram/date={date_str}/hour={hour_str}/"),
+        ("bronze", f"_manifests/date={date_str}/hour={hour_str}/"),
         ("silver", f"vehicle_positions/date={date_str}/hour={hour_str}/"),
         (
             "silver",
             f"quarantine/vehicle_positions/date={date_str}/hour={hour_str}/",
         ),
+        ("silver", f"_versions/date={date_str}/hour={hour_str}/"),
+        ("silver", f"_staging/date={date_str}/hour={hour_str}/"),
         ("gold", f"_versions/date={date_str}/hour={hour_str}/"),
         ("gold", f"_staging/date={date_str}/hour={hour_str}/"),
         ("gold", f"_commits/date={date_str}/hour={hour_str}/"),
+        ("gold", f"_diagnostics/date={date_str}/hour={hour_str}/"),
     ]
 
-    for bucket, prefix in prefixes:
+
+def assert_test_partition_empty(s3, date_str: str, hour_str: str):
+    for bucket, prefix in test_partition_prefixes(date_str, hour_str):
         response = s3.list_objects_v2(
             Bucket=bucket,
             Prefix=prefix,
@@ -72,15 +107,33 @@ def main():
         aws_secret_access_key=os.environ["MINIO_PASSWORD"],
     )
 
+    existing = {b["Name"] for b in s3.list_buckets()["Buckets"]}
+    for bucket in ("bronze", "silver", "gold"):
+        if bucket not in existing:
+            s3.create_bucket(Bucket=bucket)
+
+    acquire_smoke_lock(s3)
+    try:
+        run_smoke_test(s3)
+    finally:
+        primary_error = sys.exc_info()[1]
+        try:
+            s3.delete_object(Bucket="bronze", Key=SMOKE_LOCK_KEY)
+        except (BotoCoreError, ClientError) as exc:
+            print(
+                "Smoke cleanup: lock release failed "
+                f"({type(exc).__name__}); lock may remain",
+                file=sys.stderr,
+            )
+            if primary_error is None:
+                raise
+
+
+def run_smoke_test(s3) -> None:
+    assert_test_partition_empty(s3, DATE, HOUR)
+
     con = None
     try:
-        existing = {b["Name"] for b in s3.list_buckets()["Buckets"]}
-        for bucket in ("bronze", "silver", "gold"):
-            if bucket not in existing:
-                s3.create_bucket(Bucket=bucket)
-
-        assert_test_partition_empty(s3, DATE, HOUR)
-
         key = f"vehicle_type=bus/date={DATE}/hour={HOUR}/smoke.jsonl"
         body = "\n".join(json.dumps(r) for r in build_records())
         s3.put_object(Bucket="bronze", Key=key, Body=body.encode())
@@ -137,28 +190,50 @@ def main():
         vehicles = first["vehicle_activity_hourly"]
         assert len(vehicles) == 1, vehicles
     finally:
+        primary_error = sys.exc_info()[1]
+        cleanup_errors: list[Exception] = []
+
         if con is not None:
-            con.close()
-        for bucket, prefix in (
-            ("bronze", f"vehicle_type=bus/date={DATE}/hour={HOUR}/"),
-            ("bronze", f"vehicle_type=tram/date={DATE}/hour={HOUR}/"),
-            ("silver", f"vehicle_positions/date={DATE}/hour={HOUR}/"),
-            ("silver", f"quarantine/vehicle_positions/date={DATE}/hour={HOUR}/"),
-            ("gold", f"_versions/date={DATE}/hour={HOUR}/"),
-            ("gold", f"_staging/date={DATE}/hour={HOUR}/"),
-            ("gold", f"_commits/date={DATE}/hour={HOUR}/"),
-        ):
-            paginator = s3.get_paginator("list_objects_v2")
-            for page in paginator.paginate(
-                Bucket=bucket,
-                Prefix=prefix,
-            ):
-                for obj in page.get("Contents", []):
-                    s3.delete_object(
-                        Bucket=bucket,
-                        Key=obj["Key"],
-                    )
-    print("SMOKE OK")
+            try:
+                con.close()
+            except duckdb.Error as exc:
+                cleanup_errors.append(exc)
+                print(
+                    f"Smoke cleanup: connection close failed ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+
+        for bucket, prefix in test_partition_prefixes(DATE, HOUR):
+            try:
+                paginator = s3.get_paginator("list_objects_v2")
+                for page in paginator.paginate(
+                    Bucket=bucket,
+                    Prefix=prefix,
+                ):
+                    for obj in page.get("Contents", []):
+                        try:
+                            s3.delete_object(
+                                Bucket=bucket,
+                                Key=obj["Key"],
+                            )
+                        except (BotoCoreError, ClientError) as exc:
+                            cleanup_errors.append(exc)
+                            print(
+                                "Smoke cleanup: object deletion failed "
+                                f"({type(exc).__name__})",
+                                file=sys.stderr,
+                            )
+            except (BotoCoreError, ClientError) as exc:
+                cleanup_errors.append(exc)
+                print(
+                    f"Smoke cleanup: object listing failed ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+
+        if cleanup_errors and primary_error is None:
+            raise RuntimeError(
+                f"Smoke cleanup failed: {len(cleanup_errors)} error(s)"
+            ) from cleanup_errors[0]
 
 
 if __name__ == "__main__":
