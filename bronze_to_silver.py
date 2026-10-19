@@ -44,12 +44,31 @@ class BronzeDataMissingError(FileNotFoundError):
     """Raised when an hourly Bronze partition contains no files."""
 
 
+BRONZE_JSON_COLUMNS = {
+    "vehicle_type": "VARCHAR",
+    "VehicleNumber": "VARCHAR",
+    "Lines": "VARCHAR",
+    "Brigade": "VARCHAR",
+    "Lat": "VARCHAR",
+    "Lon": "VARCHAR",
+    "Time": "VARCHAR",
+    "_ingested_at": "VARCHAR",
+}
+
 BRONZE_SOURCE_CTE = """
 WITH source AS (
     SELECT *
-    FROM read_json_auto('{bronze_path}', hive_partitioning = true)
+    FROM read_json_auto(
+        '{bronze_path}',
+        columns = {bronze_columns},
+        format = 'newline_delimited',
+        hive_partitioning = true
+    )
 ),
-"""
+""".replace(
+    "{bronze_columns}",
+    repr(BRONZE_JSON_COLUMNS).replace("{", "{{").replace("}", "}}"),
+)
 
 BASE_CTES = (
     BRONZE_SOURCE_CTE
@@ -516,7 +535,7 @@ def sql_from_materialized_input(template: str) -> str:
 
 
 def materialize_bronze_inputs(con, files: list[str]) -> None:
-    """Read the selected files once into a temporary input table."""
+    """Read selected files once using the explicit Bronze input schema."""
     if not files:
         raise BronzeDataMissingError("No Bronze files selected for processing")
 
@@ -524,9 +543,14 @@ def materialize_bronze_inputs(con, files: list[str]) -> None:
         """
         CREATE OR REPLACE TEMP TABLE bronze_input AS
         SELECT *
-        FROM read_json_auto(?, hive_partitioning = true)
+        FROM read_json_auto(
+            ?,
+            columns = ?,
+            format = 'newline_delimited',
+            hive_partitioning = true
+        )
         """,
-        [files],
+        [files, BRONZE_JSON_COLUMNS],
     )
 
 

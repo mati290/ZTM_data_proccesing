@@ -829,6 +829,131 @@ class BronzeToSilverSqlTests(unittest.TestCase):
         self.connection = duckdb.connect()
         self.connection.execute("SET TimeZone = 'UTC';")
 
+    def test_explicit_schema_preserves_hive_type_and_identifiers(self):
+        record = {
+            "VehicleNumber": "0012",
+            "Lines": "007",
+            "Brigade": "01",
+            "Lat": 52.2,
+            "Lon": 21.0,
+            "Time": "2026-07-15 14:00:00",
+            "_ingested_at": "2026-07-15T12:00:30+00:00",
+        }
+        invalid_record = {
+            **record,
+            "VehicleNumber": "0013",
+            "Lat": "not-a-number",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = (
+                Path(directory)
+                / "vehicle_type=bus"
+                / "date=2026-07-15"
+                / "hour=12"
+                / "positions.jsonl"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "\n".join(json.dumps(item) for item in (record, invalid_record)) + "\n",
+                encoding="utf-8",
+            )
+            bronze_to_silver.materialize_bronze_inputs(
+                self.connection,
+                [path.as_posix()],
+            )
+            transform = bronze_to_silver.sql_from_materialized_input(TRANSFORM_SQL)
+            rejected = bronze_to_silver.sql_from_materialized_input(REJECTED_SQL)
+            rows = self.connection.execute(transform).fetchall()
+            reasons = self.connection.execute(
+                f"SELECT rejection_reason FROM ({rejected})"
+            ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][:4], ("bus", "0012", "007", "01"))
+        self.assertEqual(reasons, [("invalid_coordinates",)])
+
+    def test_missing_required_fields_are_quarantined(self):
+        valid_record = {
+            "vehicle_type": "bus",
+            "VehicleNumber": "0012",
+            "Lines": "007",
+            "Brigade": "01",
+            "Lat": 52.2,
+            "Lon": 21.0,
+            "Time": "2026-07-15 14:00:00",
+            "_ingested_at": "2026-07-15T12:00:30+00:00",
+        }
+        cases = (
+            ("VehicleNumber", "missing_vehicle_number"),
+            ("Lat", "invalid_coordinates"),
+            ("Lon", "invalid_coordinates"),
+            ("Time", "missing_or_invalid_timestamp"),
+            ("_ingested_at", "missing_or_invalid_timestamp"),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "positions.jsonl"
+            for field, expected_reason in cases:
+                with self.subTest(field=field):
+                    record = valid_record.copy()
+                    record.pop(field)
+                    path.write_text(
+                        json.dumps(record) + "\n",
+                        encoding="utf-8",
+                    )
+                    bronze_to_silver.materialize_bronze_inputs(
+                        self.connection,
+                        [path.as_posix()],
+                    )
+                    transform = bronze_to_silver.sql_from_materialized_input(
+                        TRANSFORM_SQL
+                    )
+                    rejected = bronze_to_silver.sql_from_materialized_input(
+                        REJECTED_SQL
+                    )
+
+                    self.assertEqual(
+                        self.connection.execute(transform).fetchall(),
+                        [],
+                    )
+                    reasons = self.connection.execute(
+                        f"SELECT rejection_reason FROM ({rejected})"
+                    ).fetchall()
+                    self.assertEqual(reasons, [(expected_reason,)])
+
+    def test_missing_optional_fields_are_loaded_as_null(self):
+        record = {
+            "vehicle_type": "bus",
+            "VehicleNumber": "0012",
+            "Lat": 52.2,
+            "Lon": 21.0,
+            "Time": "2026-07-15 14:00:00",
+            "_ingested_at": "2026-07-15T12:00:30+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "positions.jsonl"
+            path.write_text(
+                json.dumps(record) + "\n",
+                encoding="utf-8",
+            )
+            bronze_to_silver.materialize_bronze_inputs(
+                self.connection,
+                [path.as_posix()],
+            )
+            query = bronze_to_silver.sql_from_materialized_input(TRANSFORM_SQL)
+            rows = self.connection.execute(query).fetchall()
+            direct_rows = self.connection.execute(
+                TRANSFORM_SQL.format(bronze_path=path.as_posix())
+            ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "0012")
+        self.assertIsNone(rows[0][2])
+        self.assertIsNone(rows[0][3])
+        self.assertEqual(direct_rows, rows)
+
     def tearDown(self):
         self.connection.close()
 
