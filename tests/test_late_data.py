@@ -40,6 +40,17 @@ class FakeS3:
         ]
         return {"Contents": items} if items else {}
 
+    def head_object(self, Bucket, Key):
+        if (Bucket, Key) not in self.objects:
+            raise ClientError(
+                {
+                    "Error": {"Code": "NoSuchKey"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "HeadObject",
+            )
+        return {}
+
     def get_object(self, Bucket, Key):
         value = self.objects.get((Bucket, Key))
         if value is None:
@@ -166,26 +177,21 @@ class StaleHourTests(unittest.TestCase):
                 )
 
     def test_fresh_silver_and_matching_gold_do_not_require_repair(self):
-        result = self.stale(
-            bronze("12", T0),
-            silver("12", T0 + timedelta(minutes=35)),
-            silver_completeness("12", T0 + timedelta(minutes=35)),
-            silver_quarantine("12", T0 + timedelta(minutes=35)),
-            (
-                (
-                    "gold",
-                    "_commits/date=2026-01-15/hour=12/manifest.json",
-                ),
-                {
-                    "partition": "date=2026-01-15/hour=12",
-                    "source_silver_uri": (
-                        "s3://silver/vehicle_positions/"
-                        "date=2026-01-15/hour=12/data.parquet"
-                    ),
-                    "is_final": True,
-                },
-            ),
+        published_at = T0 + timedelta(minutes=35)
+        silver_uri = (
+            "s3://silver/vehicle_positions/date=2026-01-15/hour=12/data.parquet"
         )
+        objects = dict(
+            [
+                bronze("12", T0),
+                silver("12", published_at),
+                silver_completeness("12", published_at),
+                silver_quarantine("12", published_at),
+            ]
+        )
+        objects.update(gold_publication_objects(gold_manifest(silver_uri)))
+
+        result = self.stale(*objects.items())
 
         self.assertEqual(result, [])
 
@@ -300,6 +306,40 @@ class StaleHourTests(unittest.TestCase):
         self.assertFalse(result)
 
 
+def gold_manifest(silver_uri: str, is_final: bool = True) -> dict:
+    partition = "date=2026-01-15/hour=12"
+    publication_id = "b" * 32
+    return {
+        "publication_id": publication_id,
+        "partition": partition,
+        "source_silver_uri": silver_uri,
+        "is_final": is_final,
+        "tables": {
+            table: {
+                "uri": (
+                    f"s3://gold/_versions/{partition}/"
+                    f"{publication_id}/{table}/data.parquet"
+                ),
+                "rows": 1,
+            }
+            for table in late_data.silver_to_gold.GOLD_TABLES
+        },
+    }
+
+
+def gold_publication_objects(manifest: dict) -> dict:
+    objects = {
+        (
+            "gold",
+            f"_commits/{manifest['partition']}/manifest.json",
+        ): manifest,
+    }
+    for metadata in manifest["tables"].values():
+        bucket, key = bronze_to_silver._parse_s3_uri(metadata["uri"])
+        objects[(bucket, key)] = NOW
+    return objects
+
+
 class StaleGoldTests(unittest.TestCase):
     def test_missing_gold_requires_rebuild(self):
         silver_uri = (
@@ -316,14 +356,165 @@ class StaleGoldTests(unittest.TestCase):
 
         self.assertTrue(result)
 
-    def test_gold_without_finality_metadata_requires_rebuild_after_grace(self):
+    def test_invalid_gold_artifact_metadata_requires_rebuild(self):
+        silver_uri = (
+            f"s3://silver/_versions/date=2026-01-15/hour=12/{'a' * 32}/data.parquet"
+        )
+        table = late_data.silver_to_gold.GOLD_TABLES[0]
+        invalid_values = (
+            None,
+            {"uri": "s3://other-bucket/data.parquet", "rows": 1},
+            {
+                "uri": (
+                    "s3://gold/_versions/date=2026-01-15/hour=11/"
+                    f"{'b' * 32}/{table}/data.parquet"
+                ),
+                "rows": 1,
+            },
+        )
+
+        for metadata in invalid_values:
+            with self.subTest(metadata=metadata):
+                manifest = gold_manifest(silver_uri)
+                manifest["tables"][table] = metadata
+                s3 = Mock()
+                s3.get_object.return_value = {
+                    "Body": Mock(read=Mock(return_value=json.dumps(manifest).encode()))
+                }
+
+                with patch.object(
+                    late_data,
+                    "resolve_silver_artifacts",
+                    return_value={"data": silver_uri},
+                ):
+                    result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+                self.assertTrue(result)
+                s3.head_object.assert_not_called()
+
+    def test_complete_gold_publication_does_not_require_rebuild(self):
+        silver_uri = (
+            f"s3://silver/_versions/date=2026-01-15/hour=12/{'a' * 32}/data.parquet"
+        )
+        s3 = Mock()
+        s3.get_object.return_value = {
+            "Body": Mock(
+                read=Mock(return_value=json.dumps(gold_manifest(silver_uri)).encode())
+            )
+        }
+        s3.head_object.return_value = {}
+
+        with patch.object(
+            late_data,
+            "resolve_silver_artifacts",
+            return_value={"data": silver_uri},
+        ):
+            result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+        self.assertFalse(result)
+        self.assertEqual(s3.head_object.call_count, 4)
+
+    def test_gold_file_storage_errors_propagate(self):
+        silver_uri = (
+            f"s3://silver/_versions/date=2026-01-15/hour=12/{'a' * 32}/data.parquet"
+        )
+
+        for code, status in (("AccessDenied", 403), ("InternalError", 500)):
+            with self.subTest(code=code):
+                error = ClientError(
+                    {
+                        "Error": {"Code": code},
+                        "ResponseMetadata": {"HTTPStatusCode": status},
+                    },
+                    "HeadObject",
+                )
+                s3 = Mock()
+                s3.get_object.return_value = {
+                    "Body": Mock(
+                        read=Mock(
+                            return_value=json.dumps(gold_manifest(silver_uri)).encode()
+                        )
+                    )
+                }
+                s3.head_object.side_effect = error
+
+                with (
+                    patch.object(
+                        late_data,
+                        "resolve_silver_artifacts",
+                        return_value={"data": silver_uri},
+                    ),
+                    self.assertRaises(ClientError) as raised,
+                ):
+                    late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+                self.assertIs(raised.exception, error)
+
+    def test_missing_gold_file_requires_rebuild(self):
+        partition = "date=2026-01-15/hour=12"
+        publication_id = "b" * 32
+        silver_uri = f"s3://silver/_versions/{partition}/{'a' * 32}/data.parquet"
+        tables = {
+            table: {
+                "uri": (
+                    f"s3://gold/_versions/{partition}/"
+                    f"{publication_id}/{table}/data.parquet"
+                ),
+                "rows": 1,
+            }
+            for table in late_data.silver_to_gold.GOLD_TABLES
+        }
+        manifest = {
+            "publication_id": publication_id,
+            "partition": partition,
+            "source_silver_uri": silver_uri,
+            "is_final": True,
+            "tables": tables,
+        }
+        missing_key = (
+            f"_versions/{partition}/{publication_id}/"
+            "hourly_network_metrics/data.parquet"
+        )
+
+        def head_object(Bucket, Key):
+            if Bucket == "gold" and Key == missing_key:
+                raise ClientError(
+                    {
+                        "Error": {"Code": "NoSuchKey"},
+                        "ResponseMetadata": {"HTTPStatusCode": 404},
+                    },
+                    "HeadObject",
+                )
+            return {}
+
+        s3 = Mock()
+        s3.get_object.return_value = {
+            "Body": Mock(read=Mock(return_value=json.dumps(manifest).encode()))
+        }
+        s3.head_object.side_effect = head_object
+
+        with patch.object(
+            late_data,
+            "resolve_silver_artifacts",
+            return_value={"data": silver_uri},
+        ):
+            result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+        self.assertTrue(result)
+        s3.head_object.assert_any_call(Bucket="gold", Key=missing_key)
+
+    def test_gold_without_required_tables_requires_rebuild(self):
         partition = "date=2026-01-15/hour=12"
         silver_uri = f"s3://silver/_versions/{partition}/{'a' * 32}/data.parquet"
+
         s3 = FakeS3(
             {
                 ("gold", f"_commits/{partition}/manifest.json"): {
+                    "publication_id": "b" * 32,
                     "partition": partition,
                     "source_silver_uri": silver_uri,
+                    "is_final": True,
+                    "tables": {},
                 }
             }
         )
@@ -336,6 +527,28 @@ class StaleGoldTests(unittest.TestCase):
             result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
 
         self.assertTrue(result)
+
+    def test_gold_without_finality_metadata_requires_rebuild_after_grace(self):
+        partition = "date=2026-01-15/hour=12"
+        silver_uri = f"s3://silver/_versions/{partition}/{'a' * 32}/data.parquet"
+
+        for minute, expected_stale in ((14, False), (15, True)):
+            with self.subTest(minute=minute):
+                manifest = gold_manifest(silver_uri)
+                manifest.pop("is_final")
+                s3 = FakeS3(gold_publication_objects(manifest))
+                checked_at = NOW.replace(minute=minute, second=0, microsecond=0)
+
+                with patch.object(
+                    late_data,
+                    "resolve_silver_artifacts",
+                    return_value={"data": silver_uri},
+                ):
+                    result = late_data.is_gold_stale(
+                        "2026-01-15", "12", s3, now=checked_at
+                    )
+
+                self.assertEqual(result, expected_stale)
 
     def test_hour_with_fresh_silver_and_missing_gold_is_selected_for_repair(self):
         published_at = T0 + timedelta(minutes=35)
@@ -369,49 +582,43 @@ class StaleGoldTests(unittest.TestCase):
             (None, True),
         ):
             with self.subTest(source_uri=source_uri):
-                manifest = {"partition": partition, "is_final": True}
-                if source_uri is not None:
+                manifest = gold_manifest(current_uri)
+                if source_uri is None:
+                    manifest.pop("source_silver_uri")
+                else:
                     manifest["source_silver_uri"] = source_uri
 
-                s3 = FakeS3(
-                    {
-                        (
-                            "gold",
-                            f"_commits/{partition}/manifest.json",
-                        ): manifest
-                    }
-                )
+                s3 = FakeS3(gold_publication_objects(manifest))
 
                 with patch.object(
                     late_data,
                     "resolve_silver_artifacts",
                     return_value={"data": current_uri},
                 ):
-                    result = late_data.is_gold_stale("2026-01-15", "12", s3)
+                    result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
 
                 self.assertEqual(result, expected_stale)
 
     def test_nonfinal_gold_requires_rebuild_after_grace_period(self):
         partition = "date=2026-01-15/hour=12"
         silver_uri = f"s3://silver/_versions/{partition}/{'a' * 32}/data.parquet"
-        s3 = FakeS3(
-            {
-                ("gold", f"_commits/{partition}/manifest.json"): {
-                    "partition": partition,
-                    "source_silver_uri": silver_uri,
-                    "is_final": False,
-                }
-            }
-        )
 
-        with patch.object(
-            late_data,
-            "resolve_silver_artifacts",
-            return_value={"data": silver_uri},
-        ):
-            result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+        for minute, expected_stale in ((14, False), (15, True)):
+            with self.subTest(minute=minute):
+                manifest = gold_manifest(silver_uri, is_final=False)
+                s3 = FakeS3(gold_publication_objects(manifest))
+                checked_at = NOW.replace(minute=minute, second=0, microsecond=0)
 
-        self.assertTrue(result)
+                with patch.object(
+                    late_data,
+                    "resolve_silver_artifacts",
+                    return_value={"data": silver_uri},
+                ):
+                    result = late_data.is_gold_stale(
+                        "2026-01-15", "12", s3, now=checked_at
+                    )
+
+                self.assertEqual(result, expected_stale)
 
 
 class ReprocessTests(unittest.TestCase):
@@ -454,28 +661,20 @@ class ReprocessTests(unittest.TestCase):
 
     def test_nonfinal_gold_is_finalized_without_new_bronze(self):
         published_at = T0 + timedelta(minutes=35)
-        manifest_key = (
-            "gold",
-            "_commits/date=2026-01-15/hour=12/manifest.json",
+        silver_uri = (
+            "s3://silver/vehicle_positions/date=2026-01-15/hour=12/data.parquet"
         )
-        manifest = {
-            "partition": "date=2026-01-15/hour=12",
-            "source_silver_uri": (
-                "s3://silver/vehicle_positions/date=2026-01-15/hour=12/data.parquet"
-            ),
-            "is_final": False,
-        }
-        s3 = FakeS3(
-            dict(
-                [
-                    bronze("12", T0),
-                    silver("12", published_at),
-                    silver_completeness("12", published_at),
-                    silver_quarantine("12", published_at),
-                    (manifest_key, manifest),
-                ]
-            )
+        manifest = gold_manifest(silver_uri, is_final=False)
+        objects = dict(
+            [
+                bronze("12", T0),
+                silver("12", published_at),
+                silver_completeness("12", published_at),
+                silver_quarantine("12", published_at),
+            ]
         )
+        objects.update(gold_publication_objects(manifest))
+        s3 = FakeS3(objects)
         con = Mock()
         before_grace = NOW.replace(minute=14)
         after_grace = NOW.replace(minute=15)
@@ -534,13 +733,10 @@ class ReprocessTests(unittest.TestCase):
             if len(attempts) == 1:
                 raise RuntimeError("Simulated Gold failure")
 
-            s3.objects[("gold", "_commits/date=2026-01-15/hour=12/manifest.json")] = {
-                "partition": "date=2026-01-15/hour=12",
-                "source_silver_uri": (
-                    "s3://silver/vehicle_positions/date=2026-01-15/hour=12/data.parquet"
-                ),
-                "is_final": True,
-            }
+            silver_uri = (
+                "s3://silver/vehicle_positions/date=2026-01-15/hour=12/data.parquet"
+            )
+            s3.objects.update(gold_publication_objects(gold_manifest(silver_uri)))
             return {"status": "complete", "rows": {}}
 
         with (

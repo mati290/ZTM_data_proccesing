@@ -127,7 +127,38 @@ def is_gold_stale(
 
     if manifest.get("source_silver_uri") != artifacts["data"]:
         return True
+    tables = manifest.get("tables")
+    if not isinstance(tables, dict):
+        return True
+    if set(tables) != set(silver_to_gold.GOLD_TABLES):
+        return True
+    publication_id = manifest.get("publication_id")
+    if (
+        not isinstance(publication_id, str)
+        or len(publication_id) != 32
+        or any(char not in "0123456789abcdef" for char in publication_id)
+    ):
+        return True
 
+    for table in silver_to_gold.GOLD_TABLES:
+        metadata = tables[table]
+        expected_key = (
+            f"_versions/{expected_partition}/{publication_id}/{table}/data.parquet"
+        )
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("uri") != f"s3://gold/{expected_key}"
+        ):
+            return True
+
+        try:
+            s3_client.head_object(Bucket="gold", Key=expected_key)
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
+                return True
+            raise
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
