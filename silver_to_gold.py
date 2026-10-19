@@ -13,6 +13,8 @@ import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 
 from bronze_to_silver import (
+    MIN_COMPLETE_CYCLE_RATIO,
+    MIN_CYCLE_COVERAGE_RATIO,
     _parse_s3_uri,
     _s3_client,
     copy_s3_object,
@@ -259,7 +261,18 @@ def load_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
             raise ValueError("Slot counters exceed known manifest count")
         if complete_slots > complete_cycles:
             raise ValueError("Completeness marker has complete_slots > complete_cycles")
-
+        if status == "complete" and (
+            expected_cycles == 0
+            or observed_slots / expected_cycles < MIN_CYCLE_COVERAGE_RATIO
+        ):
+            raise ValueError("Complete marker does not meet the minimum slot coverage")
+        if status == "complete" and (
+            observed_slots == 0
+            or complete_slots / observed_slots < MIN_COMPLETE_CYCLE_RATIO
+        ):
+            raise ValueError(
+                "Complete marker does not meet the minimum complete slot ratio"
+            )
     return {
         "status": status,
         "cycles": cycles,

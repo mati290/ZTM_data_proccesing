@@ -295,6 +295,87 @@ class CompletenessTests(unittest.TestCase):
             },
         )
 
+    def test_complete_marker_rejects_zero_slot_counts(self):
+        for expected, observed in ((0, 0), (120, 0)):
+            with self.subTest(expected=expected, observed=observed):
+                marker = {
+                    "status": "complete",
+                    "cycles": 0,
+                    "complete_cycles": 0,
+                    "expected_cycles": expected,
+                    "observed_slots": observed,
+                    "complete_slots": 0,
+                }
+
+                with (
+                    patch(
+                        "silver_to_gold.read_completeness_marker",
+                        return_value=marker,
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    gold.load_completeness("2026-01-15", "12")
+
+    def test_complete_marker_accepts_exact_slot_thresholds(self):
+        for observed, complete in ((114, 114), (120, 108)):
+            with self.subTest(observed=observed, complete=complete):
+                marker = {
+                    "status": "complete",
+                    "cycles": 120,
+                    "complete_cycles": complete,
+                    "expected_cycles": 120,
+                    "observed_slots": observed,
+                    "complete_slots": complete,
+                }
+
+                with patch(
+                    "silver_to_gold.read_completeness_marker",
+                    return_value=marker,
+                ):
+                    result = gold.load_completeness("2026-01-15", "12")
+
+                self.assertEqual(result["status"], "complete")
+                self.assertEqual(result["observed_slots"], observed)
+                self.assertEqual(result["complete_slots"], complete)
+
+    def test_complete_marker_with_insufficient_complete_slot_ratio_is_rejected(self):
+        marker = {
+            "status": "complete",
+            "cycles": 120,
+            "complete_cycles": 107,
+            "expected_cycles": 120,
+            "observed_slots": 120,
+            "complete_slots": 107,
+        }
+
+        with (
+            patch(
+                "silver_to_gold.read_completeness_marker",
+                return_value=marker,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            gold.load_completeness("2026-01-15", "12")
+
+    def test_complete_marker_with_insufficient_slot_coverage_is_rejected(self):
+        marker = {
+            "status": "complete",
+            "cycles": 120,
+            "complete_cycles": 120,
+            "expected_cycles": 120,
+            "observed_slots": 1,
+            "complete_slots": 1,
+        }
+
+        with (
+            patch(
+                "silver_to_gold.read_completeness_marker",
+                return_value=marker,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            gold.load_completeness("2026-01-15", "12")
+
     def test_complete_slots_cannot_exceed_complete_manifest_count(self):
         marker = {
             "status": "incomplete",
