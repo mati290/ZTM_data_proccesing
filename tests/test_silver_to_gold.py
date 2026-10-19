@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import duckdb
 
@@ -455,6 +455,30 @@ class BuildGoldHourTests(unittest.TestCase):
         self.con.execute("SET TimeZone='UTC'")
         self.addCleanup(self.con.close)
 
+    def test_legacy_silver_etag_is_captured_before_reading(self):
+        silver_key = "vehicle_positions/date=2026-01-15/hour=12/data.parquet"
+        silver_uri = f"s3://silver/{silver_key}"
+        s3 = Mock()
+        s3.head_object.return_value = {"ETag": '"source-etag"'}
+        original_load = gold.load_silver_hour
+
+        def load_after_capture(connection, uri):
+            self.assertEqual(uri, silver_uri)
+            s3.head_object.assert_called_once_with(
+                Bucket="silver",
+                Key=silver_key,
+            )
+            return original_load(connection, self.path)
+
+        with (
+            patch("silver_to_gold._s3_client", return_value=s3),
+            patch(
+                "silver_to_gold.load_silver_hour",
+                side_effect=load_after_capture,
+            ),
+        ):
+            self.run_build(path=silver_uri)
+
     def run_build(self, status="complete", silver=True, path=None):
         marker = {"status": status, "cycles": 60, "complete_cycles": 60}
         silver_path = path or self.path
@@ -764,6 +788,30 @@ class GoldProcessTests(LocalPipelineTestCase):
         parquet_files = [path for path in self.published() if path.endswith(".parquet")]
         self.assertEqual(len(parquet_files), len(gold.GOLD_TABLES))
         self.assertEqual(os.listdir(f"{self.root}/staging"), [])
+
+    def test_manifest_records_source_silver_etag(self):
+        self.write_quarantine(["duplicate", "stale_gps_time"])
+        original_local_uris = self.local_uris
+
+        def local_uris_with_etag(date_str, hour_str):
+            uris = original_local_uris(date_str, hour_str)
+            uris["source_silver_etag"] = '"source-etag"'
+            return uris
+
+        with patch.object(
+            self,
+            "local_uris",
+            side_effect=local_uris_with_etag,
+        ):
+            self.build()
+
+        manifest_path = (
+            f"{self.root}/gold/_commits/date=2026-01-15/hour=12/manifest.json"
+        )
+        with open(manifest_path, encoding="utf-8") as file:
+            manifest = json.load(file)
+
+        self.assertEqual(manifest["source_silver_etag"], '"source-etag"')
 
     def test_rerun_is_idempotent_and_creates_no_duplicates(self):
         self.write_quarantine(["duplicate", "stale_gps_time"])

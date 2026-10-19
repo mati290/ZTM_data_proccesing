@@ -127,6 +127,29 @@ def is_gold_stale(
 
     if manifest.get("source_silver_uri") != artifacts["data"]:
         return True
+    legacy_key = f"vehicle_positions/{expected_partition}/data.parquet"
+    if artifacts["data"] == f"s3://silver/{legacy_key}":
+        recorded_etag = manifest.get("source_silver_etag")
+        if not isinstance(recorded_etag, str) or not recorded_etag:
+            return True
+
+        try:
+            source_metadata = s3_client.head_object(
+                Bucket="silver",
+                Key=legacy_key,
+            )
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
+                return True
+            raise
+
+        current_etag = source_metadata.get("ETag")
+        if not isinstance(current_etag, str) or not current_etag:
+            raise ValueError("Legacy Silver object is missing a valid ETag")
+        if recorded_etag != current_etag:
+            return True
     tables = manifest.get("tables")
     if not isinstance(tables, dict):
         return True

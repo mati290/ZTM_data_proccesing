@@ -49,7 +49,7 @@ class FakeS3:
                 },
                 "HeadObject",
             )
-        return {}
+        return {"ETag": '"fixture-etag"'}
 
     def get_object(self, Bucket, Key):
         value = self.objects.get((Bucket, Key))
@@ -313,6 +313,11 @@ def gold_manifest(silver_uri: str, is_final: bool = True) -> dict:
         "publication_id": publication_id,
         "partition": partition,
         "source_silver_uri": silver_uri,
+        "source_silver_etag": (
+            '"fixture-etag"'
+            if silver_uri.startswith("s3://silver/vehicle_positions/")
+            else None
+        ),
         "is_final": is_final,
         "tables": {
             table: {
@@ -355,6 +360,69 @@ class StaleGoldTests(unittest.TestCase):
             result = late_data.is_gold_stale("2026-01-15", "12", s3)
 
         self.assertTrue(result)
+
+    def test_legacy_gold_without_source_etag_requires_rebuild(self):
+        silver_key = "vehicle_positions/date=2026-01-15/hour=12/data.parquet"
+        silver_uri = f"s3://silver/{silver_key}"
+        manifest = gold_manifest(silver_uri)
+        manifest.pop("source_silver_etag")
+        objects = gold_publication_objects(manifest)
+        objects[("silver", silver_key)] = NOW
+        s3 = FakeS3(objects)
+
+        with patch.object(
+            late_data,
+            "resolve_silver_artifacts",
+            return_value={"data": silver_uri},
+        ):
+            result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+        self.assertTrue(result)
+
+    def test_unchanged_legacy_silver_does_not_require_gold_rebuild(self):
+        silver_key = "vehicle_positions/date=2026-01-15/hour=12/data.parquet"
+        silver_uri = f"s3://silver/{silver_key}"
+        manifest = gold_manifest(silver_uri)
+        objects = gold_publication_objects(manifest)
+        objects[("silver", silver_key)] = NOW
+        s3 = FakeS3(objects)
+
+        with patch.object(
+            late_data,
+            "resolve_silver_artifacts",
+            return_value={"data": silver_uri},
+        ):
+            result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+        self.assertFalse(result)
+
+    def test_changed_legacy_silver_etag_requires_gold_rebuild(self):
+        silver_key = "vehicle_positions/date=2026-01-15/hour=12/data.parquet"
+        silver_uri = f"s3://silver/{silver_key}"
+        manifest = gold_manifest(silver_uri)
+        manifest["source_silver_etag"] = '"previous-etag"'
+
+        s3 = Mock()
+        s3.get_object.return_value = {
+            "Body": Mock(read=Mock(return_value=json.dumps(manifest).encode()))
+        }
+
+        def head_object(Bucket, Key):
+            if Bucket == "silver" and Key == silver_key:
+                return {"ETag": '"current-etag"'}
+            return {}
+
+        s3.head_object.side_effect = head_object
+
+        with patch.object(
+            late_data,
+            "resolve_silver_artifacts",
+            return_value={"data": silver_uri},
+        ):
+            result = late_data.is_gold_stale("2026-01-15", "12", s3, now=NOW)
+
+        self.assertTrue(result)
+        s3.head_object.assert_any_call(Bucket="silver", Key=silver_key)
 
     def test_invalid_gold_artifact_metadata_requires_rebuild(self):
         silver_uri = (

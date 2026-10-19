@@ -681,6 +681,7 @@ def publish_tables(con, tables, uris: dict) -> dict:
                 "publication_id": uris["publication_id"],
                 "partition": uris["partition"],
                 "source_silver_uri": uris["silver"],
+                "source_silver_etag": uris.get("source_silver_etag"),
                 "is_final": is_final,
                 "tables": {
                     table: {
@@ -715,6 +716,17 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     completeness = load_completeness(date_str, hour_str, s3_client)
     silver_present = s3_object_exists(uris["silver"])
     quarantine_present = s3_object_exists(uris["quarantine"])
+    legacy_key = f"vehicle_positions/{uris['partition']}/data.parquet"
+    if silver_present and uris["silver"] == f"s3://silver/{legacy_key}":
+        source_client = s3_client or _s3_client()
+        source_metadata = source_client.head_object(
+            Bucket="silver",
+            Key=legacy_key,
+        )
+        source_etag = source_metadata.get("ETag")
+        if not isinstance(source_etag, str) or not source_etag:
+            raise ValueError("Legacy Silver object is missing a valid ETag")
+        uris["source_silver_etag"] = source_etag
 
     silver_rows = load_silver_hour(con, uris["silver"]) if silver_present else None
     if quarantine_present:
