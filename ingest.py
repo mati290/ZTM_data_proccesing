@@ -168,6 +168,7 @@ def write_cycle_manifest(
     now = datetime.now(timezone.utc)
     complete = bus_count > 0 and tram_count > 0
     manifest = {
+        "schema_version": 1,
         "ingested_at": now.isoformat(),
         "cycle_started_at": cycle_started_at.isoformat(),
         "cycle_slot_start": cycle_slot_start.isoformat(),

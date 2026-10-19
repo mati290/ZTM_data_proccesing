@@ -322,6 +322,7 @@ class SaveToBronzeTests(unittest.TestCase):
             run_once("test-key", s3)
 
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
+        self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["status"], "complete")
         self.assertIn("cycle_started_at", manifest)
         datetime.fromisoformat(manifest["cycle_started_at"])

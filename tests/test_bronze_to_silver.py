@@ -11,6 +11,7 @@ import duckdb
 from botocore.exceptions import ClientError
 
 import bronze_to_silver
+import ingest
 from bronze_to_silver import (
     QUALITY_SQL,
     REJECTED_SQL,
@@ -55,6 +56,96 @@ class CompletenessTests(unittest.TestCase):
             body.read.return_value = json.dumps({"status": status}).encode()
             client.get_object.return_value = {"Body": body}
         return client
+
+    def test_versioned_cycle_manifest_rejects_invalid_timestamps(self):
+        valid_manifest = {
+            "schema_version": 1,
+            "status": "complete",
+            "buses": 1,
+            "trams": 1,
+            "failed_sources": [],
+            "empty_sources": [],
+            "ingested_at": "2026-10-09T07:00:05+00:00",
+            "cycle_started_at": "2026-10-09T07:00:01+00:00",
+            "cycle_slot_start": "2026-10-09T07:00:00+00:00",
+        }
+
+        for field in (
+            "ingested_at",
+            "cycle_started_at",
+            "cycle_slot_start",
+        ):
+            for value in (
+                None,
+                123,
+                "not-a-timestamp",
+                "2026-10-09T07:00:00",
+            ):
+                with self.subTest(field=field, value=value):
+                    manifest = {**valid_manifest, field: value}
+
+                    with self.assertRaisesRegex(ValueError, field):
+                        bronze_to_silver.validate_cycle_manifest(manifest)
+
+    def test_ingestion_manifests_match_supported_schema(self):
+        cases = (
+            (1, 1, [], []),
+            (0, 1, ["bus"], []),
+            (1, 0, [], ["tram"]),
+            (0, 0, ["bus"], ["tram"]),
+        )
+        slot_start = datetime(2026, 10, 9, 7, tzinfo=timezone.utc)
+
+        for buses, trams, failed, empty in cases:
+            with self.subTest(buses=buses, trams=trams):
+                client = Mock()
+                ingest.write_cycle_manifest(
+                    client,
+                    buses,
+                    trams,
+                    failed,
+                    empty,
+                    cycle_started_at=slot_start,
+                    cycle_slot_start=slot_start,
+                )
+                manifest = json.loads(client.put_object.call_args.kwargs["Body"])
+
+                self.assertEqual(manifest["schema_version"], 1)
+                self.assertIsNone(bronze_to_silver.validate_cycle_manifest(manifest))
+
+    def test_versioned_cycle_manifest_requires_all_fields(self):
+        valid_manifest = {
+            "schema_version": 1,
+            "status": "complete",
+            "buses": 1,
+            "trams": 1,
+            "failed_sources": [],
+            "empty_sources": [],
+            "ingested_at": "2026-10-09T07:00:05+00:00",
+            "cycle_started_at": "2026-10-09T07:00:01+00:00",
+            "cycle_slot_start": "2026-10-09T07:00:00+00:00",
+        }
+
+        for field in valid_manifest:
+            if field == "schema_version":
+                continue
+            with self.subTest(missing=field):
+                manifest = valid_manifest.copy()
+                manifest.pop(field)
+
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    bronze_to_silver.validate_cycle_manifest(manifest)
+
+    def test_cycle_manifest_rejects_invalid_schema_version(self):
+        for version in (None, True, 0, -1, "1", 1.0, 2):
+            with self.subTest(version=version):
+                manifest = {
+                    "schema_version": version,
+                    "status": "complete",
+                }
+
+                with self.assertRaisesRegex(ValueError, "schema_version"):
+                    bronze_to_silver.validate_cycle_manifest(manifest)
 
     def test_cycle_manifest_accepts_consistent_source_lists(self):
         cases = (

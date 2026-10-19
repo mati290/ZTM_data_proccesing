@@ -737,6 +737,36 @@ def expected_slots_elapsed(
 
 
 def validate_cycle_manifest(manifest: dict) -> None:
+    if "schema_version" in manifest:
+        version = manifest["schema_version"]
+        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+            raise ValueError("Cycle manifest has an unsupported schema_version")
+        required_fields = {
+            "status",
+            "buses",
+            "trams",
+            "failed_sources",
+            "empty_sources",
+            "ingested_at",
+            "cycle_started_at",
+            "cycle_slot_start",
+        }
+        missing_fields = required_fields - manifest.keys()
+        if missing_fields:
+            raise ValueError(
+                f"Cycle manifest is missing required fields: {sorted(missing_fields)}"
+            )
+        for field in (
+            "ingested_at",
+            "cycle_started_at",
+            "cycle_slot_start",
+        ):
+            try:
+                timestamp = datetime.fromisoformat(manifest[field])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Cycle manifest has an invalid {field}") from exc
+            if timestamp.tzinfo is None:
+                raise ValueError(f"Cycle manifest {field} must be timezone-aware")
     status = manifest.get("status")
     if status not in ("complete", "partial"):
         raise ValueError("Cycle manifest has an invalid status")
