@@ -486,6 +486,7 @@ def write_silver_active_manifest(
         "artifacts": artifacts,
     }
     if source_inputs is not None:
+        validate_source_inputs(source_inputs, date_str, hour_str)
         manifest["source_inputs"] = source_inputs
     _s3_client().put_object(
         Bucket="silver",
@@ -565,6 +566,61 @@ def materialize_bronze_inputs(con, files: list[str]) -> None:
     )
 
 
+def validate_source_inputs(
+    source_inputs: list[dict],
+    date_str: str,
+    hour_str: str,
+) -> None:
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    partition = f"date={date_str}/hour={hour_str}"
+
+    if not isinstance(source_inputs, list):
+        raise TypeError("Silver source_inputs must be a list")
+
+    allowed_inputs = (
+        (f"vehicle_type=bus/{partition}/", ".jsonl"),
+        (f"vehicle_type=tram/{partition}/", ".jsonl"),
+        (f"_manifests/{partition}/", ".json"),
+    )
+    seen_keys: set[str] = set()
+
+    for item in source_inputs:
+        if not isinstance(item, dict):
+            raise TypeError("Silver source_inputs items must be JSON objects")
+
+        input_key = item.get("key")
+        if not isinstance(input_key, str) or not any(
+            input_key.startswith(prefix)
+            and input_key.endswith(suffix)
+            and len(input_key) > len(prefix) + len(suffix)
+            for prefix, suffix in allowed_inputs
+        ):
+            raise ValueError("Silver source_inputs has an invalid key")
+
+        if input_key in seen_keys:
+            raise ValueError("Silver source_inputs has a duplicate key")
+        seen_keys.add(input_key)
+
+        size = item.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError("Silver source_inputs has an invalid size")
+
+        etag = item.get("etag")
+        if not isinstance(etag, str) or not etag.strip():
+            raise ValueError("Silver source_inputs has an invalid etag")
+
+        try:
+            modified_at = datetime.fromisoformat(item.get("last_modified"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Silver source_inputs has an invalid last_modified"
+            ) from exc
+        if modified_at.tzinfo is None:
+            raise ValueError(
+                "Silver source_inputs last_modified must be timezone-aware"
+            )
+
+
 def read_silver_source_inputs(
     date_str: str, hour_str: str, s3_client=None
 ) -> list[dict] | None:
@@ -592,52 +648,7 @@ def read_silver_source_inputs(
         return None
 
     source_inputs = manifest["source_inputs"]
-    if not isinstance(source_inputs, list):
-        raise TypeError("Silver source_inputs must be a list")
-    allowed_inputs = (
-        (f"vehicle_type=bus/{partition}/", ".jsonl"),
-        (f"vehicle_type=tram/{partition}/", ".jsonl"),
-        (f"_manifests/{partition}/", ".json"),
-    )
-
-    seen_keys: set[str] = set()
-    for item in source_inputs:
-        if not isinstance(item, dict):
-            raise TypeError("Silver source_inputs items must be JSON objects")
-
-        input_key = item.get("key")
-        if not isinstance(input_key, str) or not any(
-            input_key.startswith(prefix)
-            and input_key.endswith(suffix)
-            and len(input_key) > len(prefix) + len(suffix)
-            for prefix, suffix in allowed_inputs
-        ):
-            raise ValueError("Silver source_inputs has an invalid key")
-
-        if input_key in seen_keys:
-            raise ValueError("Silver source_inputs has a duplicate key")
-        seen_keys.add(input_key)
-
-        size = item.get("size")
-        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-            raise ValueError("Silver source_inputs has an invalid size")
-
-        etag = item.get("etag")
-        if not isinstance(etag, str) or not etag.strip():
-            raise ValueError("Silver source_inputs has an invalid etag")
-
-        last_modified = item.get("last_modified")
-        try:
-            modified_at = datetime.fromisoformat(last_modified)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Silver source_inputs has an invalid last_modified"
-            ) from exc
-        if modified_at.tzinfo is None:
-            raise ValueError(
-                "Silver source_inputs last_modified must be timezone-aware"
-            )
-
+    validate_source_inputs(source_inputs, date_str, hour_str)
     return source_inputs
 
 

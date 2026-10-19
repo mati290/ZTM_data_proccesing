@@ -57,6 +57,79 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
+    def test_active_manifest_snapshot_round_trip(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        version_dir = f"s3://silver/_versions/{partition}/{publication_id}"
+        artifacts = {
+            "data": f"{version_dir}/data.parquet",
+            "quarantine": f"{version_dir}/quarantine.parquet",
+            "completeness": f"{version_dir}/_completeness.json",
+        }
+        valid_inputs = [
+            {
+                "key": f"vehicle_type=bus/{partition}/a.jsonl",
+                "etag": '"test-etag"',
+                "size": 123,
+                "last_modified": "2026-10-09T07:00:05+00:00",
+            }
+        ]
+
+        for source_inputs in ([], valid_inputs):
+            with self.subTest(count=len(source_inputs)):
+                client = Mock()
+                with patch(
+                    "bronze_to_silver._s3_client",
+                    return_value=client,
+                ):
+                    write_silver_active_manifest(
+                        "2026-10-09",
+                        "7",
+                        publication_id,
+                        artifacts,
+                        source_inputs=source_inputs,
+                    )
+
+                body = client.put_object.call_args.kwargs["Body"]
+                client.get_object.return_value = {
+                    "Body": Mock(read=Mock(return_value=body))
+                }
+                result = bronze_to_silver.read_silver_source_inputs(
+                    "2026-10-09", "7", client
+                )
+
+                self.assertEqual(result, source_inputs)
+
+    def test_active_manifest_rejects_invalid_snapshot_before_writing(self):
+        publication_id = "a" * 32
+        partition = "date=2026-10-09/hour=07"
+        version_dir = f"s3://silver/_versions/{partition}/{publication_id}"
+        artifacts = {
+            "data": f"{version_dir}/data.parquet",
+            "quarantine": f"{version_dir}/quarantine.parquet",
+            "completeness": f"{version_dir}/_completeness.json",
+        }
+        source_inputs = [
+            {
+                "key": f"vehicle_type=bus/{partition}/a.jsonl",
+                "etag": '"test-etag"',
+                "size": True,
+                "last_modified": "2026-10-09T07:00:05+00:00",
+            }
+        ]
+
+        with patch("bronze_to_silver._s3_client") as client_factory:
+            with self.assertRaisesRegex(ValueError, "source_inputs.*size"):
+                write_silver_active_manifest(
+                    "2026-10-09",
+                    "07",
+                    publication_id,
+                    artifacts,
+                    source_inputs=source_inputs,
+                )
+
+            client_factory.assert_not_called()
+
     def test_versioned_cycle_manifest_rejects_invalid_timestamps(self):
         valid_manifest = {
             "schema_version": 1,
