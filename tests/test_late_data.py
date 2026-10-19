@@ -24,7 +24,12 @@ class FakeS3:
         class Paginator:
             def paginate(self, Bucket, Prefix):
                 items = [
-                    {"Key": key, "LastModified": modified}
+                    {
+                        "Key": key,
+                        "LastModified": modified,
+                        "ETag": '"fixture-etag"',
+                        "Size": 123,
+                    }
                     for (bucket, key), modified in outer.objects.items()
                     if bucket == Bucket and key.startswith(Prefix)
                 ]
@@ -121,6 +126,135 @@ class BronzeInputSnapshotTests(unittest.TestCase):
         after = bronze_to_silver.capture_bronze_inputs("2026-01-15", "12", s3)
 
         self.assertNotEqual(before, after)
+
+    @staticmethod
+    def _read_inputs(source_inputs: list) -> list[dict] | None:
+        partition = "date=2026-01-15/hour=12"
+        s3 = FakeS3(
+            {
+                (
+                    "silver",
+                    f"vehicle_positions/{partition}/_active.json",
+                ): {
+                    "partition": partition,
+                    "source_inputs": source_inputs,
+                }
+            }
+        )
+        return bronze_to_silver.read_silver_source_inputs("2026-01-15", "12", s3)
+
+    def test_recorded_source_inputs_accept_valid_metadata(self):
+        items = [
+            {
+                "key": key,
+                "etag": '"opaque-etag-2"',
+                "size": 0,
+                "last_modified": T0.isoformat(),
+            }
+            for key in (
+                "vehicle_type=bus/date=2026-01-15/hour=12/a.jsonl",
+                "vehicle_type=tram/date=2026-01-15/hour=12/b.jsonl",
+                "_manifests/date=2026-01-15/hour=12/c.json",
+            )
+        ]
+
+        for source_inputs in ([], items):
+            with self.subTest(count=len(source_inputs)):
+                self.assertEqual(
+                    self._read_inputs(source_inputs),
+                    source_inputs,
+                )
+
+    def test_recorded_source_inputs_reject_invalid_metadata(self):
+        valid_item = {
+            "key": "vehicle_type=bus/date=2026-01-15/hour=12/a.jsonl",
+            "etag": '"fixture-etag"',
+            "size": 123,
+            "last_modified": T0.isoformat(),
+        }
+        cases = (
+            ("size", None),
+            ("size", True),
+            ("size", -1),
+            ("size", "123"),
+            ("etag", None),
+            ("etag", ""),
+            ("etag", 123),
+            ("last_modified", None),
+            ("last_modified", "not-a-timestamp"),
+            ("last_modified", "2026-01-15T12:30:00"),
+        )
+
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                item = {**valid_item, field: value}
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"source_inputs.*{field}",
+                ):
+                    self._read_inputs([item])
+
+    def test_recorded_source_inputs_reject_duplicate_keys(self):
+        item = {
+            "key": "vehicle_type=bus/date=2026-01-15/hour=12/a.jsonl",
+            "etag": '"fixture-etag"',
+            "size": 123,
+            "last_modified": T0.isoformat(),
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "source_inputs.*duplicate key",
+        ):
+            self._read_inputs([item, item.copy()])
+
+    def test_recorded_source_inputs_reject_invalid_keys(self):
+        invalid_keys = (
+            None,
+            123,
+            "",
+            "vehicle_type=bus/date=2026-01-15/hour=11/a.jsonl",
+            "vehicle_type=car/date=2026-01-15/hour=12/a.jsonl",
+            "_manifests/date=2026-01-15/hour=12/a.txt",
+            "unrelated/a.jsonl",
+        )
+
+        for key in invalid_keys:
+            with self.subTest(key=key):
+                item = {
+                    "key": key,
+                    "etag": '"fixture-etag"',
+                    "size": 123,
+                    "last_modified": T0.isoformat(),
+                }
+
+                with self.assertRaisesRegex(ValueError, "source_inputs.*key"):
+                    self._read_inputs([item])
+
+    def test_recorded_source_inputs_reject_non_object_items(self):
+        partition = "date=2026-01-15/hour=12"
+
+        for item in (None, [], 123, "a.jsonl", True):
+            with self.subTest(item=item):
+                manifest = {
+                    "partition": partition,
+                    "source_inputs": [item],
+                }
+                s3 = FakeS3(
+                    {
+                        (
+                            "silver",
+                            f"vehicle_positions/{partition}/_active.json",
+                        ): manifest
+                    }
+                )
+
+                with self.assertRaisesRegex(
+                    TypeError,
+                    "source_inputs items must be JSON objects",
+                ):
+                    bronze_to_silver.read_silver_source_inputs("2026-01-15", "12", s3)
 
 
 class StaleHourTests(unittest.TestCase):

@@ -56,6 +56,28 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
+    def test_completeness_marker_must_be_a_json_object(self):
+        for payload in ([], None, "complete", 123, True):
+            with self.subTest(payload=payload):
+                client = Mock()
+                client.get_object.return_value = {
+                    "Body": Mock(read=Mock(return_value=json.dumps(payload).encode()))
+                }
+
+                with (
+                    patch(
+                        "bronze_to_silver.resolve_silver_artifacts",
+                        return_value={
+                            "completeness": (
+                                "s3://silver/vehicle_positions/"
+                                "date=2026-10-09/hour=07/_completeness.json"
+                            )
+                        },
+                    ),
+                    self.assertRaisesRegex(TypeError, "JSON object"),
+                ):
+                    read_completeness_marker("2026-10-09", "07", client)
+
     def test_manifest_must_be_a_json_object(self):
         for payload in ([], None, "complete", 123):
             with self.subTest(payload=payload):

@@ -583,6 +583,49 @@ def read_silver_source_inputs(
     source_inputs = manifest["source_inputs"]
     if not isinstance(source_inputs, list):
         raise TypeError("Silver source_inputs must be a list")
+    allowed_inputs = (
+        (f"vehicle_type=bus/{partition}/", ".jsonl"),
+        (f"vehicle_type=tram/{partition}/", ".jsonl"),
+        (f"_manifests/{partition}/", ".json"),
+    )
+
+    seen_keys: set[str] = set()
+    for item in source_inputs:
+        if not isinstance(item, dict):
+            raise TypeError("Silver source_inputs items must be JSON objects")
+
+        input_key = item.get("key")
+        if not isinstance(input_key, str) or not any(
+            input_key.startswith(prefix)
+            and input_key.endswith(suffix)
+            and len(input_key) > len(prefix) + len(suffix)
+            for prefix, suffix in allowed_inputs
+        ):
+            raise ValueError("Silver source_inputs has an invalid key")
+
+        if input_key in seen_keys:
+            raise ValueError("Silver source_inputs has a duplicate key")
+        seen_keys.add(input_key)
+
+        size = item.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError("Silver source_inputs has an invalid size")
+
+        etag = item.get("etag")
+        if not isinstance(etag, str) or not etag.strip():
+            raise ValueError("Silver source_inputs has an invalid etag")
+
+        last_modified = item.get("last_modified")
+        try:
+            modified_at = datetime.fromisoformat(last_modified)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Silver source_inputs has an invalid last_modified"
+            ) from exc
+        if modified_at.tzinfo is None:
+            raise ValueError(
+                "Silver source_inputs last_modified must be timezone-aware"
+            )
 
     return source_inputs
 
@@ -839,7 +882,10 @@ def read_completeness_marker(date_str: str, hour_str: str, s3_client=None) -> di
             return {"status": "unknown"}
         raise
 
-    return json.loads(body)
+    marker = json.loads(body)
+    if not isinstance(marker, dict):
+        raise TypeError("Completeness marker must be a JSON object")
+    return marker
 
 
 def is_hour_complete(date_str: str, hour_str: str, s3_client=None) -> bool:
