@@ -736,6 +736,62 @@ def expected_slots_elapsed(
     )
 
 
+def validate_cycle_manifest(manifest: dict) -> None:
+    status = manifest.get("status")
+    if status not in ("complete", "partial"):
+        raise ValueError("Cycle manifest has an invalid status")
+
+    has_buses = "buses" in manifest
+    has_trams = "trams" in manifest
+    if has_buses != has_trams:
+        raise ValueError("Cycle manifest must contain both source counters")
+
+    if has_buses:
+        for field in ("buses", "trams"):
+            value = manifest[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Cycle manifest has an invalid {field} count")
+
+        expected_status = (
+            "complete" if manifest["buses"] > 0 and manifest["trams"] > 0 else "partial"
+        )
+        if status != expected_status:
+            raise ValueError("Cycle manifest status conflicts with source counts")
+
+    has_failed = "failed_sources" in manifest
+    has_empty = "empty_sources" in manifest
+    if not has_failed and not has_empty:
+        return
+    if has_failed != has_empty:
+        raise ValueError("Cycle manifest must contain both sources lists")
+
+    for field in ("failed_sources", "empty_sources"):
+        values = manifest[field]
+        if not isinstance(values, list) or any(
+            not isinstance(source, str) or source not in ("bus", "tram")
+            for source in values
+        ):
+            raise ValueError(f"Cycle manifest has invalid {field}")
+        if len(values) != len(set(values)):
+            raise ValueError(f"Cycle manifest has duplicate {field}")
+
+    failed = set(manifest["failed_sources"])
+    empty = set(manifest["empty_sources"])
+    if failed & empty:
+        raise ValueError("Cycle manifest sources lists overlap")
+
+    if has_buses:
+        expected_missing = {
+            source
+            for source, field in (("bus", "buses"), ("tram", "trams"))
+            if manifest[field] == 0
+        }
+        if failed | empty != expected_missing:
+            raise ValueError("Cycle manifest sources conflict with source counts")
+    elif status == "complete" and (failed or empty):
+        raise ValueError("Cycle manifest sources conflict with complete status")
+
+
 def assess_completeness(
     date_str: str,
     hour_str: str,
@@ -768,6 +824,7 @@ def assess_completeness(
         manifest = json.loads(body)
         if not isinstance(manifest, dict):
             raise TypeError("Cycle manifest must be a JSON object")
+        validate_cycle_manifest(manifest)
 
         if manifest.get("status") == "complete":
             complete += 1

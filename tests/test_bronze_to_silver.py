@@ -56,6 +56,129 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
+    def test_cycle_manifest_accepts_consistent_source_lists(self):
+        cases = (
+            ("complete", 1, 1, [], []),
+            ("partial", 0, 1, ["bus"], []),
+            ("partial", 1, 0, [], ["tram"]),
+            ("partial", 0, 0, ["bus"], ["tram"]),
+            ("partial", 0, 0, [], ["bus", "tram"]),
+        )
+
+        for status, buses, trams, failed, empty in cases:
+            with self.subTest(
+                status=status,
+                failed=failed,
+                empty=empty,
+            ):
+                manifest = {
+                    "status": status,
+                    "buses": buses,
+                    "trams": trams,
+                    "failed_sources": failed,
+                    "empty_sources": empty,
+                }
+
+                self.assertIsNone(bronze_to_silver.validate_cycle_manifest(manifest))
+
+    def test_cycle_manifest_rejects_invalid_source_lists(self):
+        cases = (
+            ("bus", []),
+            (None, []),
+            ([123], []),
+            (["car"], []),
+            (["bus", "bus"], []),
+            ([], ["bus", "bus"]),
+            (["bus"], ["bus"]),
+            (["tram"], ["bus"]),
+            ([], ["tram"]),
+            ([], []),
+        )
+
+        for failed, empty in cases:
+            with self.subTest(failed=failed, empty=empty):
+                manifest = {
+                    "status": "partial",
+                    "buses": 0,
+                    "trams": 1,
+                    "failed_sources": failed,
+                    "empty_sources": empty,
+                }
+
+                with self.assertRaisesRegex(ValueError, "sources"):
+                    bronze_to_silver.validate_cycle_manifest(manifest)
+
+    def test_cycle_manifest_rejects_invalid_source_counts(self):
+        for field in ("buses", "trams"):
+            for value in (None, True, -1, "1", 1.5):
+                with self.subTest(field=field, value=value):
+                    manifest = {
+                        "status": "partial",
+                        "buses": 0,
+                        "trams": 0,
+                    }
+                    manifest[field] = value
+
+                    with self.assertRaisesRegex(ValueError, "count"):
+                        bronze_to_silver.validate_cycle_manifest(manifest)
+
+        for field in ("buses", "trams"):
+            with self.subTest(missing=field):
+                manifest = {
+                    "status": "partial",
+                    "buses": 0,
+                    "trams": 0,
+                }
+                manifest.pop(field)
+
+                with self.assertRaisesRegex(ValueError, "counter"):
+                    bronze_to_silver.validate_cycle_manifest(manifest)
+
+    def test_cycle_manifest_accepts_valid_and_legacy_counts(self):
+        cases = (
+            {"status": "complete"},
+            {"status": "partial"},
+            {"status": "complete", "buses": 1, "trams": 1},
+            {"status": "partial", "buses": 0, "trams": 1},
+            {"status": "partial", "buses": 1, "trams": 0},
+            {"status": "partial", "buses": 0, "trams": 0},
+        )
+
+        for manifest in cases:
+            with self.subTest(manifest=manifest):
+                self.assertIsNone(bronze_to_silver.validate_cycle_manifest(manifest))
+
+    def test_cycle_manifest_status_must_match_source_counts(self):
+        cases = (
+            ("complete", 0, 1),
+            ("complete", 1, 0),
+            ("complete", 0, 0),
+            ("partial", 1, 1),
+        )
+
+        for status, buses, trams in cases:
+            with self.subTest(status=status, buses=buses, trams=trams):
+                manifest = {
+                    "status": status,
+                    "buses": buses,
+                    "trams": trams,
+                    "cycle_slot_start": "2026-10-09T07:00:00+00:00",
+                }
+                client = self._client([status])
+                client.get_object.side_effect = None
+                client.get_object.return_value = {
+                    "Body": Mock(read=Mock(return_value=json.dumps(manifest).encode()))
+                }
+
+                with self.assertRaisesRegex(ValueError, "status"):
+                    assess_completeness(
+                        "2026-10-09",
+                        "07",
+                        client,
+                        poll_interval_seconds=30,
+                        now_utc=datetime(2026, 10, 9, 8, tzinfo=timezone.utc),
+                    )
+
     def test_completeness_marker_must_be_a_json_object(self):
         for payload in ([], None, "complete", 123, True):
             with self.subTest(payload=payload):
