@@ -1,5 +1,9 @@
 ﻿# Kontrakt danych Gold
 
+Dokument opisuje implementację po commicie `45a2e61` oraz reguły dla jej
+konsumentów. Znane luki walidacji są wymienione na końcu; wymagania przyszłego
+dashboardu nie oznaczają, że dashboard jest już zaimplementowany.
+
 ## Cel i reguły wspólne
 
 Gold odpowiada na pytania biznesowe. Nie kopiuje wierszy Silver; agreguje je
@@ -55,8 +59,10 @@ Zadania godzinowe Airflow przetwarzają zakończone godziny.
 
 `complete` opisuje spełnienie progów pobierania, a nie gwarancję obserwacji
 wszystkich pojazdów. `unknown` nigdy nie jest traktowane jako `complete`.
-Błędy odczytu storage, niepoprawny marker lub sprzeczne liczniki nie są
-zamieniane na `unknown`: przerywają budowanie Gold.
+Błędy odczytu storage oraz wykryte błędy statusu, typów lub zakresów
+liczników przerywają budowanie Gold zamiast zwracać `unknown`. Aktualna
+walidacja nie obejmuje jednak wszystkich sprzeczności statusu z proporcjami
+slotów; ograniczenie to opisano na końcu.
 
 Wiersze z niekompletnych lub nieznanych godzin można zachować w Gold razem ze
 statusem, ale dashboardy nie mogą przedstawiać ich jako wiarygodnych wartości
@@ -64,6 +70,20 @@ bez oznaczenia. Widoki prezentujące wyłącznie wiarygodne metryki filtrują
 `hourly_data_quality.safe_for_dashboard = TRUE`, łącząc tabele dla tej samej
 godziny i publikacji Gold. Sam status `complete` nie potwierdza finalizacji
 ani spełnienia reguł jakości rekordów. Brak partycji Gold nie oznacza zera.
+
+## Wspólne kolumny wszystkich tabel
+
+Poniższe kolumny występują we wszystkich czterech tabelach; definicje dotyczą
+również publikacji diagnostycznej `hourly_data_quality`.
+
+| Kolumna | Typ | Znaczenie |
+|---|---|---|
+| `date` | `DATE` | Data UTC partycji cyklu pobierania |
+| `hour` | `TINYINT` | Godzina UTC partycji, zakres `0..23` |
+| `data_completeness_status` | `VARCHAR` | `complete`, `incomplete` albo `unknown` z markera Silver po dostępnych walidacjach |
+| `is_final` | `BOOLEAN` | Czas budowania wynosi co najmniej koniec godziny + 15 min; nie zamyka okna korekt |
+| `source_max_ingested_at` | `TIMESTAMPTZ` | Największy `ingested_at` użytego Silver; `NULL` przy braku lub pustym Silver; nie identyfikuje wersji |
+| `pipeline_run_at` | `TIMESTAMPTZ` | Wspólny czas UTC wykonania budowy Gold dla godziny |
 
 ## `hourly_network_metrics`
 
@@ -177,7 +197,7 @@ przetwarzaniem danych.
 | Źródło | Silver, kwarantanna i marker kompletności tej samej publikacji Silver; liczniki cykli i slotów pochodzą z markera, nie z ponownego listowania Bronze przez Gold |
 | Warunek publikacji | W pełnej publikacji jest zatwierdzany wspólnym manifestem razem z trzema tabelami metryk. Gdy Silver jest brakujący lub pusty, publikowana jest tylko diagnostyka jakości, po czym zadanie kończy się błędem |
 | Brak danych | Wygenerować rekord jakości z jawnym `silver_partition_status`; nie zastępować nieznanych liczników zerami |
-| Niekompletność | Zachować wszystkie dostępne liczniki, status kompletności i status runu. Nie nazywać takich metryk wiarygodną aktywnością sieci |
+| Niekompletność | Zachować dostępne liczniki i status kompletności. Status zadania pozostaje w Airflow, poza schematem tej tabeli. Nie nazywać takich metryk wiarygodną aktywnością sieci |
 
 | Kolumna | Definicja weryfikowalna w SQL |
 |---|---|
@@ -207,12 +227,17 @@ przetwarzaniem danych.
 
 Sama lista partycji Bronze, Silver i manifestów nie pozwala wykryć godziny,
 w której ingestion całkowicie nie działał: dla takiej godziny nie ma obiektu do
-odkrycia. Dlatego `hourly_data_quality` musi korzystać z oczekiwanych godzin i
-statusów Airflow. Jeżeli dostęp do metadanych Airflow nie zostanie włączony do
-Gold, brak wiersza jakości oznacza „brak informacji”, a nie zero pojazdów ani
+odkrycia. Obecny Gold nie pobiera statusów Airflow ani nie generuje pełnej osi
+oczekiwanych godzin. Zadania mogą publikować diagnostykę brakującego Silver,
+ale nie gwarantuje to wiersza jakości dla każdej luki. Konsument musi połączyć
+wyniki z oczekiwaną osią czasu, a stan wykonania sprawdzać w orkiestracji.
+Brak wiersza jakości oznacza „brak informacji”, a nie zero pojazdów ani
 brak aktywności.
 
 ## Reguły interpretacji dashboardu
+
+Są to wymagania dla przyszłego konsumenta; dashboard nie jest jeszcze
+częścią zaimplementowanego projektu.
 
 1. Dashboard domyślnie pokazuje wyłącznie godziny z
    `hourly_data_quality.safe_for_dashboard = TRUE`; pozostałe godziny
@@ -261,7 +286,6 @@ brak aktywności.
    zapisy projektowych DAG-ów; uruchomienia ręczne muszą przestrzegać tej
    samej zasady.
 
-
 ## Implementacja (`silver_to_gold.py`)
 
 - **Publikacja atomowa:** tabele `vehicle_activity_hourly`, `hourly_line_metrics`, `hourly_network_metrics` i `hourly_data_quality` są najpierw zapisywane w `s3://gold/_staging/`, a następnie walidowane pod kątem schematu i liczby wierszy. Po walidacji pliki trafiają do unikalnych, wersjonowanych ścieżek w `s3://gold/_versions/`. Dopiero po przygotowaniu wszystkich czterech tabel zapisywany jest manifest w `s3://gold/_commits/`, wskazujący URI opublikowanych plików i ich liczby wierszy. Konsument powinien odczytywać manifest i korzystać z URI, które wskazuje, zamiast zakładać stałe ścieżki plików.
@@ -271,3 +295,36 @@ brak aktywności.
 - **Walidacje:** schemat i zawartość Silver przed agregacją, schemat i liczba wierszy plików staging, spójność krzyżowa tabel oraz unikalność kluczy. Liczba kompletnych slotów nie może przekraczać liczby obecnych slotów ani manifestów complete; liczba obecnych slotów nie może przekraczać oczekiwanych slotów ani znanej liczby manifestów. Liczniki muszą być nieujemnymi liczbami całkowitymi; wartości logiczne są odrzucane. Proporcje Gold są wyliczane z liczników.
 - **Kompletność:** godziny ze statusem `incomplete` lub `unknown` są publikowane z jawnym `data_completeness_status`. Konsument powinien uwzględniać ten status oraz `safe_for_dashboard` i `is_final`, zamiast traktować samą obecność danych jako gwarancję ich gotowości.
 - **Zakres jakości:** jakość nie obejmuje statusu Airflow. Luki w godzinach należy wykrywać na podstawie orkiestracji i oczekiwanej osi czasu na dashboardzie.
+
+## Znane ograniczenia implementacji i planowane uzupełnienia
+
+Poniższe ograniczenia dotyczą stanu po `45a2e61`; nie są opisem już
+zaimplementowanych zabezpieczeń.
+
+- **Spójność statusu z licznikami:** `load_completeness` sprawdza typy,
+  zakresy i relacje liczników, lecz ufa statusowi markera bez ponownej oceny
+  progów 95%/90%. Marker `complete` z 1/120 slotów może przejść walidację,
+  a `safe_for_dashboard` może wtedy przyjąć `TRUE`. Dla prawidłowego markera
+  producent stosuje opisane progi; odrzucanie sprzecznych markerów jest
+  następną poprawką.
+- **Kontrola publikacji Gold:** wybór napraw sprawdza partycję manifestu,
+  `source_silver_uri` i finalizację, ale jeszcze nie kompletny zestaw tabel
+  ani istnienie wszystkich wskazanych plików. Zachowany manifest nie dowodzi,
+  że publikacja nadal jest czytelna po ręcznym usunięciu obiektu.
+- **Legacy:** stałe URI historycznego Silver nie wykrywa nadpisania jego
+  zawartości. Pełna tożsamość wersji dotyczy nowych publikacji wersjonowanych.
+- **Metadane i wejście:** brak wersji schematu manifestów oraz pełnej
+  walidacji elementów `source_inputs`, spójności pól manifestu cyklu
+  i powodów kwarantanny. Odczyt Bronze korzysta z wykrywania schematu JSON;
+  brak kolumn może zatrzymać transformację przed agregacją Gold.
+- **Interwał:** opisane liczby slotów dotyczą 30 s. Dowolne inne dodatnie
+  interwały są akceptowane przez konfigurację, lecz nie wszystkie odpowiadają
+  wzorowi oczekiwanych slotów. Manifesty nie utrwalają użytego interwału.
+- **Równoległość:** pool serializuje projektowe DAG-i, nie niezależne
+  uruchomienia ręczne. Gold rozwiązuje dane i marker w osobnych odczytach;
+  przełączenie aktywnej wersji przez innego writera może je rozdzielić.
+- **Naprawy i utrzymanie:** brak wszystkich danych Bronze nie uruchamia
+  porównania snapshotu; błąd podczas selekcji godzin może przerwać cały skan.
+  Automatyczne naprawy nie obejmują historii poza oknem 24 h. Retencja
+  wersji i osieroconych plików oraz kompletny runbook backfill pozostają
+  do wdrożenia. Nie usuwać wersji bez sprawdzenia referencji manifestów.

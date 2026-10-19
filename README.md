@@ -1,7 +1,7 @@
 ﻿# 🚋 Warsaw Transit Data Platform
 
 A data engineering project that continuously collects **real-time GPS positions
-of all Warsaw public transport vehicles** (ZTM buses and trams) from the
+of Warsaw public transport vehicles reported by the feed** (ZTM buses and trams) from the
 [UM Warszawa Open Data API](https://api.um.warszawa.pl) and stores them in an
 S3-compatible data lake. The implemented pipeline follows a **medallion
 architecture**: raw JSON Lines in bronze and cleaned, hourly Parquet in silver;
@@ -34,11 +34,11 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
 
 | Area | Technology |
 |---|---|
-| Language | Python 3.12 |
+| Runtime | Python 3.12 in ingestion/CI; Python 3.13 in the Airflow image |
 | Data source | UM Warszawa REST API |
 | Object storage | MinIO (S3-compatible), boto3 |
-| Orchestration | Apache Airflow 3 |
-| Transformation | DuckDB |
+| Orchestration | Apache Airflow 3.2.1 |
+| Transformation | DuckDB 1.2.2 |
 | Containerization | Docker, Docker Compose |
 | Data formats | JSON Lines (bronze), Parquet (silver), Hive-style partitioning |
 | Testing and linting | unittest, Ruff |
@@ -64,6 +64,9 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
    cp .env.example .env
    ```
    Keep your real API key and MinIO credentials in `.env`; never commit that file.
+   Fill in `AIRFLOW__CORE__FERNET_KEY` as well. Generate it with Python in an
+   environment containing `cryptography`, using the command in `.env.example`.
+   Keep `POLL_INTERVAL_SECONDS=30` for the documented slot calculations.
 
    If reusing an existing Airflow metadata volume, pause the three project DAGs
    before restarting the stack. The paused-at-creation setting below applies
@@ -107,155 +110,215 @@ The pipeline has not yet been deployed or validated end to end on AWS S3.
    ```
 
 To stop the services, run `docker compose down`. Bronze, Silver, and Gold
-objects are kept in the `minio_data` Docker volume.
+objects are kept in the `minio_data` Docker volume; Airflow metadata is kept
+in `airflow_metadata`. Do not add `-v` if you want to retain these volumes.
+This standalone Airflow configuration, including its admin authentication
+settings, is intended for local development.
 
-## Data layout (bronze layer)
+## Data layout and publication
 
+Bronze contains raw JSON Lines and one manifest for each cycle that reaches
+the manifest-write step:
+
+```text
+s3://bronze/vehicle_type=bus/date=YYYY-MM-DD/hour=HH/positions_<timestamp>_<uuid>.jsonl
+s3://bronze/vehicle_type=tram/date=YYYY-MM-DD/hour=HH/positions_<timestamp>_<uuid>.jsonl
+s3://bronze/_manifests/date=YYYY-MM-DD/hour=HH/cycle_<timestamp>_<uuid>.json
 ```
-s3://bronze/
-└── vehicle_type=bus/
-    └── date=2026-10-02/
-        └── hour=08/
-            └── positions_20261002T083205_<uuid>.jsonl
-└── vehicle_type=tram/
-    └── ...
-```
 
-Each line is one vehicle position, stored exactly as returned by the API,
-plus an `_ingested_at` metadata field:
+Each record preserves the API fields and adds `_ingested_at`, the actual
+write timestamp in UTC. New data files and the cycle manifest share the
+partition of the **UTC cycle slot**, even when collection crosses an hour
+or midnight. This is an ingestion-cycle partition, not a GPS event-time
+partition. Historical objects retain their original write-time partitions.
 
 ```json
 {"Lines": "180", "Lon": 21.01, "VehicleNumber": "1234", "Time": "2026-10-02 10:32:01", "Lat": 52.23, "Brigade": "3", "_ingested_at": "2026-10-02T08:32:05+00:00"}
 ```
 
-The Silver layer contains one Parquet file per processed hour:
+Silver prepares a new version before replacing its active manifest:
 
 ```text
-s3://silver/vehicle_positions/date=2026-10-02/hour=08/data.parquet
+s3://silver/vehicle_positions/date=YYYY-MM-DD/hour=HH/_active.json
+s3://silver/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/data.parquet
+s3://silver/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/quarantine.parquet
+s3://silver/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/_completeness.json
 ```
 
-Rejected records are written with a `rejection_reason` column under
-`s3://silver/quarantine/vehicle_positions/date=.../hour=.../data.parquet`.
-The raw Bronze objects remain unchanged and can be used to rebuild both outputs.
+Read `artifacts.data`, `artifacts.quarantine` and `artifacts.completeness`
+from `_active.json`. The manifest also records `source_inputs`: keys, ETags,
+sizes and modification times of the selected Bronze data and cycle manifests.
+If `_active.json` is absent, readers support the legacy fixed Silver paths.
+
+Gold publishes four tables:
+
+| Table | Grain |
+|---|---|
+| `vehicle_activity_hourly` | UTC partition hour, vehicle type, vehicle number |
+| `hourly_line_metrics` | UTC partition hour, vehicle type, line |
+| `hourly_network_metrics` | UTC partition hour |
+| `hourly_data_quality` | UTC partition hour |
+
+```text
+s3://gold/_commits/date=YYYY-MM-DD/hour=HH/manifest.json
+s3://gold/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/<table>/data.parquet
+s3://gold/_diagnostics/date=YYYY-MM-DD/hour=HH/manifest.json
+```
+
+The full commit manifest contains the source Silver URI, finality flag,
+and each table's URI and row count. Read the manifest once and use its
+listed files together. The commit manifest is the publication boundary;
+the quality row alone is not a commit signal. A failure before the commit
+preserves the previous manifest. Missing or empty Silver produces a separate
+quality diagnostic and a failed task, without replacing the full Gold commit.
+Both layers use `_staging/` for temporary outputs.
+
+See the [Gold data contract](docs/gold-data-contract.md) for column definitions
+and consumer rules.
+
+## Quality and completeness
+
+- Silver validates coordinates against the configured Warsaw bounding box,
+  vehicle identifiers, timestamps and GPS freshness (0 to 5 minutes).
+  Ambiguous/nonexistent Warsaw local times at DST transitions are rejected.
+- Valid observations are deduplicated within the partition by
+  `(vehicle_type, vehicle_number, gps_time_utc)`; the latest `_ingested_at`
+  wins, with additional ordering to resolve ties. Rejected records carry
+  `rejection_reason`; output row counts are reconciled before publication.
+- The default 30-second interval gives **120 expected slots per closed hour**.
+  `complete` requires at least **95% coverage (114 slots)** and at least
+  **90% complete slots among observed valid slots**. A slot is complete if
+  at least one of its manifests reports both nonempty sources.
+- Duplicate manifests do not increase slot coverage. Invalid, future,
+  misaligned or out-of-hour slots do not count. When slot metadata exists,
+  legacy manifests without a slot do not fill gaps. Only hours with no slot
+  fields use the legacy manifest-count assessment.
+- Raw manifest counts and unique slot counts are separate Gold metrics.
+  Slot counts are `NULL` for legacy manifests; missing information is not zero.
+  Missing manifests or a missing completeness marker yield `unknown`.
+- Incomplete and unknown hours may retain business metrics, with their status.
+  The intended default consumer filter is `safe_for_dashboard = TRUE`, joined
+  by partition within the same publication. Currently this requires status
+  `complete`, nonempty Silver, finality and known integrity rejection at most
+  5%. Duplicate and stale-GPS rejections are excluded from that integrity rate.
+  The marker-validation limitation below still applies.
+
+`active_vehicles` counts observed identifiers, not every vehicle actually in
+service. `active_seconds` is the span between a vehicle's first and last GPS
+observation, not measured working time. A missing hour is a gap, not zero.
+
+## Late data, recovery and finality
+
+The late-data DAG runs at minute 30 and scans closed hours in the last 24 hours.
+For new Silver publications it compares current Bronze object metadata with
+the recorded `source_inputs`, including cycle manifests. This detects arrivals
+that happened before Silver publication but after input selection. Selected
+data files are materialized once in DuckDB for quality, Silver and quarantine;
+completeness uses the selected manifest list.
+
+Changed inputs or missing required Silver artifacts trigger a Silver rebuild,
+followed by Gold. A missing Gold commit, a different source Silver URI, or
+pending finalization triggers Gold rebuilding without replacing fresh Silver.
+Legacy Silver without an input snapshot uses modification times as a fallback.
+
+`is_final` means that the build time is at least 15 minutes after the hour
+closes. It does **not** end the 24-hour correction window. Eligible nonfinal
+Gold is rebuilt on a later scan even without new Bronze data. The `:30`
+schedule means finalization need not happen exactly at `:15`.
+
+The project DAGs share a one-slot writer pool. Manual writers must also be
+serialized. Automatic repair does not cover arbitrary history beyond the
+window, and `catchup=False` does not create every missed historical DAG run.
+
+## Testing and CI
+
+For local development, use a virtual environment and the CI Ruff version:
+
+```bash
+python -m venv .venv
+# Activate .venv using the command appropriate to your shell.
+python -m pip install -r requirements.txt
+python -m pip install ruff==0.16.10
+python -m ruff check .
+python -m ruff format --check .
+python -B -m unittest discover -s tests -v
+```
+
+On Windows, `.\.venv\Scripts\python.exe` can be used directly instead of
+`python` to avoid accidentally using the system interpreter.
+
+CI runs linting, formatting and tests on Python 3.12. It also builds both
+images, checks DAG discovery and runs a Bronze → Silver → Gold smoke test
+against MinIO in the Airflow image. The six DAG-definition tests are skipped
+without Airflow; CI currently checks discovery but does not run those six
+tests inside the Airflow image.
+
+The smoke test requires dedicated test storage. It refuses an occupied test
+partition, locks cooperating smoke runs and cleans its test artifacts.
+The lock does not protect against unrelated writers; an interrupted process
+can leave a lock requiring inspection before manual removal.
 
 ## Design decisions
 
-- **Raw data in bronze is never modified.** Only an `_ingested_at` field is
-  added (the underscore marks fields added by the pipeline, not the source).
-  If a bug is found in later transformations, silver can always be rebuilt
-  from the original data.
-- **Ingestion timestamps and partitions are in UTC.** The API's `Time` field
-  is Warsaw local time without an explicit UTC offset. During the repeated hour
-  at the autumn DST transition, the source value alone cannot identify which
-  occurrence it means; the pipeline's time filter and quarantine preserve that
-  limitation instead of claiming perfect UTC reconstruction.
-- **Hive-style partitioning** (`key=value` folders by vehicle type, date and
-  hour) allows query engines like Spark, Athena or DuckDB to skip irrelevant
-  data (partition pruning).
-- **JSON Lines format** – one record per line, so files can be processed
-  line by line and in parallel without loading everything into memory.
-- **Validating API responses.** The API returns HTTP 200 even on errors and
-  puts an error message in `result` instead of a list. The pipeline detects
-  this and fails loudly instead of silently saving empty or invalid files.
-- **Retry with exponential backoff** (2 s, 4 s) for transient network and API
-  errors. A single failed cycle is logged and doesn't stop the long-running
-  process.
-- **Failures stay visible.** An empty Bronze partition is detected by listing
-  matching S3 objects. Storage/listing errors propagate and fail the Airflow
-  task instead of being reported as an empty hour. Records whose GPS `Time`
-  is more than 5 minutes older than `_ingested_at` (or later than it) are
-  rejected to quarantine; whole-hour completeness is tracked via ingestion
-  manifests and a `_completeness.json` marker.
-- **Secrets are kept out of logs.** Request errors are summarized by exception
-  type and HTTP status, without logging a request URL that may contain the API
-  key.
-- **Empty batches are skipped** to avoid creating empty files.
-- **Configuration via environment variables** (12-factor app). Secrets live
-  in `.env`, which is excluded from Git and from the Docker image
-  (`.dockerignore`).
-- **Image versioning.** Airflow uses an explicit image version. The free
-  Chainguard MinIO channel supplies `latest`; use a tested image digest before
-  deploying outside local development.
-- **Docker layer caching:** dependencies are installed before the code is
-- Nowe dane Bronze i manifest cyklu są przypisywane do partycji godziny UTC,
-  w której rozpoczyna się slot cyklu pobierania. Cykl przekraczający granicę
-  godziny lub północ zachowuje tę samą partycję dla autobusów, tramwajów
-  i manifestu. Pole `_ingested_at` nadal zawiera rzeczywisty czas zapisu
-  danych. Godzina partycji nie oznacza godziny zdarzenia GPS i może różnić
-  się od godziny `_ingested_at`. Historyczne obiekty zapisane według czasu
-  zapisu pozostają w dotychczasowych partycjach.
+- Preserve Bronze as append-only input so transformations can be replayed.
+- Keep polling slots and partitions in UTC; interpret source GPS time in
+  `Europe/Warsaw`, with explicit handling of ambiguous DST values.
+- Use DuckDB for hourly transformations and Parquet compaction at this scale.
+- Publish prepared versions through a single manifest instead of exposing a
+  partially replaced set of output files. Reruns replace the logical
+  publication; timestamps and physical version IDs may change.
+- Retry request failures with backoff and summarize API errors without logging
+  URLs containing the API key. Invalid payloads and empty sources are reported.
+- Keep credentials in `.env`, excluded from Git and Docker build context.
+  Airflow uses a version tag; the current MinIO image is pinned to a digest.
+- Install dependencies before copying application code to reuse Docker layers.
 
-## Known limitations
+## Known limitations and next fixes
 
-- Polling every 30 seconds produces thousands of small JSONL objects in
-  Bronze. The hourly Silver output compacts transformed records into Parquet,
-  but raw Bronze objects are not compacted or expired yet.
-- The local Airflow metadata database is now persisted in a Docker volume so
-  task history and DAG metadata survive container restarts. MinIO object data
-  remains in its own named volume as well.
-- Silver is partitioned by ingestion hour and deduplicated per hour only
-  (`vehicle_type`, `vehicle_number`, `gps_time_utc`, latest `_ingested_at`
-  wins). If the same GPS fix is ingested just before and just after an hour
-  boundary, it can appear in two consecutive Silver files. This is deliberate:
-  widening the window would change every quality/rejection query and break
-  per-hour count reconciliation. Gold is also built per Silver hour; therefore
-  a fix present in two adjacent Silver partitions can contribute to both hourly
-  results. Do not interpret the sum of hourly position counts as a globally
-  deduplicated event count.
-- Completeness: every ingestion cycle writes a manifest to
-  `s3://bronze/_manifests/date=/hour=/` (`complete` only if both bus and tram
-  were fetched). The Silver transform writes
-  `vehicle_positions/date=/hour=/_completeness.json` with status `complete`
-  (≥90% of cycles complete), `incomplete`, or `unknown` (no manifests, e.g.
-  data from before this feature). Silver is still published for incomplete
-  hours. Gold preserves metrics for incomplete and unknown hours but marks
-  their quality; dashboard consumers should use
-  `hourly_data_quality.safe_for_dashboard = TRUE` as the default filter and
-  visibly flag excluded hours. A missing completeness marker is treated as
-  `unknown`, not complete.
-- Late data: closed hours of the last 24 h are recomputed by the
-  `reprocess_late_data_hourly` DAG (`late_data.py`) when Bronze objects are
-  newer than the Silver partition, which also repairs gaps. Each Silver or Gold
-  output object is replaced atomically and reruns are idempotent; the four Gold
-  objects are not a single cross-table transaction, and the quality table is
-  published last. Older hours are frozen. Gold rows carry `pipeline_run_at`,
-  `source_max_ingested_at` and `is_final` (an hour is final 15 min after it
-  closes); `safe_for_dashboard` requires `is_final`. See
-  `docs/gold-data-contract.md`.
-- A successful API response with an empty result is logged and counted as a
-  degraded source window. Alerts are currently log-based; no external alert
-  destination is configured.
-- This is a local portfolio environment, not a production deployment. AWS S3
-  and cloud infrastructure are not yet configured.
+- **Marker trust:** Gold validates counter types and bounds but does not yet
+  reject every contradiction between `complete` and the slot ratios. A damaged
+  marker can incorrectly allow `safe_for_dashboard = TRUE`.
+- **Gold repair:** the scan checks commit presence, source URI and finality;
+  it does not yet verify that all committed Parquet objects still exist.
+  Overwritten legacy Silver at a fixed URI is also not a reliable version signal.
+- **Input contracts:** Bronze still uses inferred JSON schema. Missing columns
+  can fail transformation. Manifest schema versions and deeper validation of
+  input snapshots and quarantine reasons remain to be implemented.
+- **Polling configuration:** use the default 30 seconds. Arbitrary intervals
+  are accepted by configuration, but expected-slot calculations do not match
+  every interval aligned to the epoch. Historical interval changes are not
+  recorded in manifests.
+- **Health and alerts:** ingestion health scans historical manifests every
+  check; it needs a bounded lookup and better handling of malformed JSON.
+  Alerts are log-based, with no external destination configured.
+- **Storage:** small Bronze files, old versions and orphan outputs have no
+  retention policy. Cleanup in `finally` cannot run after every process kill.
+  Future retention must preserve files referenced by active manifests.
+- **Consistency:** metadata listing is not a transactional storage snapshot.
+  Bronze objects are assumed append-only; concurrent manual writers bypass
+  the Airflow pool. Full input deletion and errors during repair selection
+  need additional handling.
+- **Hourly semantics:** the same GPS fix can appear in adjacent partition
+  hours; hourly counts are not a globally deduplicated event count.
+- **Scope:** no implemented dashboard, production cloud deployment, external
+  alerting or production-scale benchmark. AWS S3 has not been validated end to end.
 
 ## Roadmap
 
-- [x] **Stage 1** – ZTM API ingestion to MinIO Bronze, Dockerized
-- [x] **Stage 2** – hourly Airflow and DuckDB transformation from Bronze to
-      partitioned Silver Parquet, with missing-Bronze detection (outage gaps
-      fail the run), per-record GPS freshness validation, quality metrics,
-      quarantine output, and deterministic deduplication
-- [x] **Stage 3 foundation** – unit tests, Ruff linting/format checks, and
-      GitHub Actions CI
-- [x] **Gold stage 1** – [Gold data contract](docs/gold-data-contract.md)
-      defines grains, keys, metric definitions, publication conditions, and
-      incomplete/missing-data behavior
-- [x] **Gold stages 2–4** – `silver_to_gold.py` builds four Gold tables
-      (per-object atomic publish, schema validation, idempotent) and runs as a
-      DAG task after Silver
-- [x] **Gold stage 5** – Airflow Silver → Gold DAG waits for the same-hour Silver
-      task; shared writer pool serializes partition writes
-- [x] **Gold stage 6** – late-data policy recomputes eligible closed hours from
-      the last 24 hours, with finality and source-ingestion metadata in Gold
-- [ ] **Next** – Gold dashboard with an expected-hour gap axis; consider dbt
-      when the models justify it
-- [ ] **Next** – add volume thresholds, external alerting, and integration
-      coverage for a more reliable deployment
-- [ ] **Could** – deploy to AWS S3 and provision infrastructure with Terraform
-- [ ] **Could** – expand dashboard options (for example, Metabase) after the
-      first Gold dashboard is in place
-- [ ] Kafka and Spark are intentionally deferred until a streaming-scale use
-      case justifies their operational cost.
+- [x] API ingestion, UTC cycle partitions and cycle manifests.
+- [x] Hourly Silver, quarantine, per-hour deduplication and completeness metrics.
+- [x] Four Gold tables, versioned publication and a documented data contract.
+- [x] Input snapshots, Gold recovery and finalization without new Bronze.
+- [x] Shared Airflow writer pool, unit tests, isolated smoke test and CI.
+- [ ] Tighten completeness validation and verify committed Gold artifacts.
+- [ ] Define Bronze schema, versioned metadata contracts and supported intervals.
+- [ ] Bound healthcheck cost; add backfill instructions, retention and alerts.
+- [ ] Run DAG tests in Airflow and retain recovery scenarios as repeatable tests.
+- [ ] Build a dashboard with an expected-hour axis and visible data gaps.
+- [ ] Measure a repeatable demo before considering AWS/Terraform deployment.
+
+Kafka, Spark and additional modeling tools remain optional; add them only when
+the workload justifies their operational cost.
 
 ## Data source
 
