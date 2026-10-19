@@ -44,6 +44,17 @@ class BronzeDataMissingError(FileNotFoundError):
     """Raised when an hourly Bronze partition contains no files."""
 
 
+QUARANTINE_REJECTION_REASONS = (
+    "invalid_coordinates",
+    "missing_vehicle_number",
+    "ambiguous_local_time",
+    "nonexistent_local_time",
+    "missing_or_invalid_timestamp",
+    "future_gps_time",
+    "stale_gps_time",
+    "duplicate",
+)
+
 BRONZE_JSON_COLUMNS = {
     "vehicle_type": "VARCHAR",
     "VehicleNumber": "VARCHAR",

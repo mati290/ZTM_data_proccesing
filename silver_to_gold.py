@@ -15,6 +15,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from bronze_to_silver import (
     MIN_COMPLETE_CYCLE_RATIO,
     MIN_CYCLE_COVERAGE_RATIO,
+    QUARANTINE_REJECTION_REASONS,
     _parse_s3_uri,
     _s3_client,
     copy_s3_object,
@@ -385,6 +386,30 @@ def load_quarantine_hour(con, quarantine_uri: str) -> None:
         raise ValueError(
             f"Could not read quarantine partition {quarantine_uri}: {exc}"
         ) from exc
+
+    reason_type = con.execute("DESCRIBE quarantine_hour").fetchone()[1]
+    if reason_type != "VARCHAR":
+        raise ValueError("Quarantine rejection_reason must have type VARCHAR")
+    unknown_reasons = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM quarantine_hour
+        WHERE rejection_reason NOT IN (SELECT unnest(?))
+        """,
+        [list(QUARANTINE_REJECTION_REASONS)],
+    ).fetchone()[0]
+    if unknown_reasons:
+        raise ValueError("Quarantine contains an unknown rejection_reason")
+    invalid_reasons = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM quarantine_hour
+        WHERE rejection_reason IS NULL
+           OR TRIM(CAST(rejection_reason AS VARCHAR)) = ''
+        """
+    ).fetchone()[0]
+    if invalid_reasons:
+        raise ValueError("Quarantine contains missing or empty rejection_reason")
 
 
 def build_metric_tables(

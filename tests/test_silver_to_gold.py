@@ -61,6 +61,82 @@ class GoldAggregationTests(unittest.TestCase):
         self.addCleanup(self.con.close)
         self.path = make_silver(self.tmp.name)
 
+    def test_quarantine_accepts_empty_and_known_reasons(self):
+        cases = ((), gold.QUARANTINE_REJECTION_REASONS)
+
+        for index, reasons in enumerate(cases):
+            with self.subTest(reasons=reasons):
+                path = (f"{self.tmp.name}/valid_quarantine_{index}.parquet").replace(
+                    "\\", "/"
+                )
+                self.con.execute(
+                    "CREATE OR REPLACE TEMP TABLE valid_quarantine "
+                    "(rejection_reason VARCHAR)"
+                )
+                for reason in reasons:
+                    self.con.execute(
+                        "INSERT INTO valid_quarantine VALUES (?)",
+                        [reason],
+                    )
+                self.con.execute(f"COPY valid_quarantine TO '{path}' (FORMAT parquet)")
+
+                gold.load_quarantine_hour(self.con, path)
+
+                self.assertCountEqual(
+                    self.con.execute(
+                        "SELECT rejection_reason FROM quarantine_hour"
+                    ).fetchall(),
+                    [(reason,) for reason in reasons],
+                )
+
+    def test_quarantine_rejects_invalid_rejection_reason(self):
+        cases = (
+            ("unexpected_reason", "VARCHAR"),
+            (" duplicate ", "VARCHAR"),
+            (123, "INTEGER"),
+        )
+
+        for index, (reason, column_type) in enumerate(cases):
+            with self.subTest(reason=reason):
+                path = (f"{self.tmp.name}/invalid_reason_{index}.parquet").replace(
+                    "\\", "/"
+                )
+                self.con.execute(
+                    "CREATE OR REPLACE TEMP TABLE invalid_quarantine "
+                    f"(rejection_reason {column_type})"
+                )
+                self.con.execute(
+                    "INSERT INTO invalid_quarantine VALUES (?)",
+                    [reason],
+                )
+                self.con.execute(
+                    f"COPY invalid_quarantine TO '{path}' (FORMAT parquet)"
+                )
+
+                with self.assertRaisesRegex(ValueError, "rejection_reason"):
+                    gold.load_quarantine_hour(self.con, path)
+
+    def test_quarantine_rejects_missing_rejection_reason(self):
+        for index, reason in enumerate((None, "", "   ")):
+            with self.subTest(reason=reason):
+                path = (f"{self.tmp.name}/quarantine_{index}.parquet").replace(
+                    "\\", "/"
+                )
+                self.con.execute(
+                    "CREATE OR REPLACE TEMP TABLE invalid_quarantine "
+                    "(rejection_reason VARCHAR)"
+                )
+                self.con.execute(
+                    "INSERT INTO invalid_quarantine VALUES (?)",
+                    [reason],
+                )
+                self.con.execute(
+                    f"COPY invalid_quarantine TO '{path}' (FORMAT parquet)"
+                )
+
+                with self.assertRaisesRegex(ValueError, "rejection_reason"):
+                    gold.load_quarantine_hour(self.con, path)
+
     def test_quality_distinguishes_slot_and_manifest_metrics(self):
         silver_rows = build_all(self.con, self.path)
         marker = {
