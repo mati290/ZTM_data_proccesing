@@ -348,8 +348,18 @@ def load_silver_hour(con, silver_uri: str) -> int:
             COUNT(*) FILTER (
                 WHERE vehicle_number IS NULL OR TRIM(vehicle_number) = ''
             ),
-            COUNT(*) FILTER (WHERE gps_time_utc IS NULL),
-            COUNT(*) FILTER (WHERE lat IS NULL OR lon IS NULL),
+            COUNT(*) FILTER (
+                WHERE gps_time_utc IS NULL
+                   OR ingested_at IS NULL
+                   OR gps_time_utc > ingested_at
+                   OR ingested_at - gps_time_utc > INTERVAL 5 MINUTE
+            ),
+            COUNT(*) FILTER (
+                WHERE lat IS NULL
+                   OR lon IS NULL
+                   OR lat NOT BETWEEN 51.9 AND 52.6
+                   OR lon NOT BETWEEN 20.5 AND 21.6
+            ),
             COUNT(*) - (
                 SELECT COUNT(*) FROM (
                     SELECT DISTINCT vehicle_type, vehicle_number, gps_time_utc
@@ -362,8 +372,8 @@ def load_silver_hour(con, silver_uri: str) -> int:
     problems = {
         "unexpected_vehicle_type": bad_types,
         "missing_vehicle_number": bad_vehicles,
-        "missing_gps_time": bad_times,
-        "missing_coordinates": bad_coords,
+        "invalid_required_timestamp": bad_times,
+        "invalid_coordinates": bad_coords,
         "duplicate_observations": duplicates,
     }
     problems = {name: count for name, count in problems.items() if count}

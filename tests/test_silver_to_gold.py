@@ -1212,6 +1212,88 @@ class GoldSilverContractTests(LocalPipelineTestCase):
             self.build()
         self.assertEqual(self.published(), [])
 
+    def test_invalid_gps_age_is_rejected(self):
+        cases = (
+            ("future", "gps_time_utc - INTERVAL 1 SECOND"),
+            ("stale", "gps_time_utc + INTERVAL 301 SECOND"),
+        )
+
+        for name, ingestion_time in cases:
+            with self.subTest(case=name):
+                self.assert_rejected_without_publication(
+                    SILVER_SQL + f"; UPDATE src SET ingested_at = {ingestion_time}"
+                )
+
+    def test_gps_age_boundaries_are_accepted(self):
+        self.silver = make_silver(
+            self.tmp.name,
+            SILVER_SQL
+            + """
+            ; UPDATE src
+            SET ingested_at = CASE
+                WHEN vehicle_type = 'bus' THEN gps_time_utc
+                ELSE gps_time_utc + INTERVAL 5 MINUTE
+            END
+            """,
+        )
+
+        self.build()
+
+        rows = self.con.execute("SELECT COUNT(*) FROM silver_hour").fetchone()[0]
+        self.assertEqual(rows, 6)
+        self.assertTrue(self.published())
+
+    def test_nonfinite_coordinates_are_rejected(self):
+        for column in ("lat", "lon"):
+            for value in ("NaN", "Infinity", "-Infinity"):
+                with self.subTest(column=column, value=value):
+                    self.assert_rejected_without_publication(
+                        SILVER_SQL
+                        + f"; UPDATE src SET {column} = CAST('{value}' AS DOUBLE)"
+                    )
+
+    def test_missing_ingestion_time_is_rejected(self):
+        self.assert_rejected_without_publication(
+            SILVER_SQL + "; UPDATE src SET ingested_at = NULL"
+        )
+
+    def test_coordinates_on_allowed_boundaries_are_accepted(self):
+        self.silver = make_silver(
+            self.tmp.name,
+            SILVER_SQL
+            + """
+            ; UPDATE src
+            SET lat = CASE
+                    WHEN vehicle_type = 'bus' THEN 51.9
+                    ELSE 52.6
+                END,
+                lon = CASE
+                    WHEN vehicle_type = 'bus' THEN 20.5
+                    ELSE 21.6
+                END
+            """,
+        )
+
+        self.build()
+
+        rows = self.con.execute("SELECT COUNT(*) FROM silver_hour").fetchone()[0]
+        self.assertEqual(rows, 6)
+        self.assertTrue(self.published())
+
+    def test_coordinates_outside_allowed_area_are_rejected(self):
+        cases = (
+            ("lat", 51.8),
+            ("lat", 52.7),
+            ("lon", 20.4),
+            ("lon", 21.7),
+        )
+
+        for column, value in cases:
+            with self.subTest(column=column, value=value):
+                self.assert_rejected_without_publication(
+                    SILVER_SQL + f"; UPDATE src SET {column} = {value}"
+                )
+
     def test_missing_column_is_rejected(self):
         self.assert_rejected_without_publication(
             "CREATE TABLE src AS SELECT vehicle_type, vehicle_number, line, "
