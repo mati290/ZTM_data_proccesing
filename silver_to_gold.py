@@ -749,8 +749,8 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     uris = partition_uris(date_str, hour_str, s3_client=s3_client)
 
     completeness = load_completeness(date_str, hour_str, s3_client)
-    silver_present = s3_object_exists(uris["silver"])
-    quarantine_present = s3_object_exists(uris["quarantine"])
+    silver_present = s3_object_exists(uris["silver"], s3_client=s3_client)
+    quarantine_present = s3_object_exists(uris["quarantine"], s3_client=s3_client)
     legacy_key = f"vehicle_positions/{uris['partition']}/data.parquet"
     if silver_present and uris["silver"] == f"s3://silver/{legacy_key}":
         source_client = s3_client or _s3_client()

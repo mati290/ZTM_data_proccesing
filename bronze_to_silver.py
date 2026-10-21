@@ -518,10 +518,13 @@ def delete_s3_object(s3_uri: str) -> None:
     _s3_client().delete_object(Bucket=bucket, Key=key)
 
 
-def s3_object_exists(s3_uri: str) -> bool:
+def s3_object_exists(s3_uri: str, s3_client=None) -> bool:
     bucket, key = _parse_s3_uri(s3_uri)
+    if s3_client is None:
+        s3_client = _s3_client()
+
     try:
-        _s3_client().head_object(Bucket=bucket, Key=key)
+        s3_client.head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if status == 404 or exc.response.get("Error", {}).get("Code") in {
@@ -531,6 +534,7 @@ def s3_object_exists(s3_uri: str) -> bool:
         }:
             return False
         raise
+
     return True
 
 

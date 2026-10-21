@@ -532,6 +532,36 @@ class BuildGoldHourTests(unittest.TestCase):
         self.con.execute("SET TimeZone='UTC'")
         self.addCleanup(self.con.close)
 
+    def test_build_passes_s3_client_to_existence_check(self):
+        s3 = Mock()
+        silver_uri = "s3://silver/test/data.parquet"
+        stop_after_check = RuntimeError("Stop at existence check")
+
+        with (
+            patch.object(
+                gold,
+                "partition_uris",
+                return_value={"silver": silver_uri},
+            ),
+            patch.object(gold, "load_completeness", return_value={}),
+            patch.object(
+                gold,
+                "s3_object_exists",
+                side_effect=stop_after_check,
+            ) as exists,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            gold.build_gold_hour(
+                self.con,
+                "2026-01-15",
+                "12",
+                RUN_AT,
+                s3_client=s3,
+            )
+
+        self.assertIs(raised.exception, stop_after_check)
+        exists.assert_called_once_with(silver_uri, s3_client=s3)
+
     def test_build_passes_s3_client_to_partition_resolution(self):
         s3 = Mock()
         stop_after_resolution = RuntimeError("Stop after partition resolution")
@@ -614,7 +644,9 @@ class BuildGoldHourTests(unittest.TestCase):
             patch("silver_to_gold.write_diagnostic_manifest"),
             patch(
                 "silver_to_gold.s3_object_exists",
-                side_effect=lambda uri: silver and "quarantine" not in uri,
+                side_effect=lambda uri, s3_client=None: (
+                    silver and "quarantine" not in uri
+                ),
             ),
             patch("silver_to_gold.partition_uris", side_effect=fake_uris),
             patch(
@@ -847,7 +879,10 @@ class LocalPipelineTestCase(unittest.TestCase):
                 patch("silver_to_gold.read_completeness_marker", return_value=marker)
             )
             stack.enter_context(
-                patch("silver_to_gold.s3_object_exists", side_effect=os.path.exists)
+                patch(
+                    "silver_to_gold.s3_object_exists",
+                    side_effect=lambda uri, s3_client=None: os.path.exists(uri),
+                )
             )
             stack.enter_context(
                 patch("silver_to_gold.partition_uris", side_effect=self.local_uris)
