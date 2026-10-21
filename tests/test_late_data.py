@@ -911,6 +911,36 @@ class ReprocessTests(unittest.TestCase):
             result = late_data.reprocess_late_data(con=None)
         self.assertEqual(result["recomputed"], [])
 
+    def test_recompute_passes_s3_client_to_gold(self):
+        con = Mock()
+        s3 = Mock()
+        expected = {"status": "complete"}
+
+        with (
+            patch.object(late_data, "is_hour_stale", return_value=False),
+            patch.object(
+                late_data.silver_to_gold,
+                "build_gold_hour",
+                return_value=expected,
+            ) as build_gold,
+        ):
+            result = late_data.recompute_hour(
+                con,
+                "2026-01-15",
+                "12",
+                run_at=NOW,
+                s3_client=s3,
+            )
+
+        self.assertIs(result, expected)
+        build_gold.assert_called_once_with(
+            con,
+            "2026-01-15",
+            "12",
+            NOW,
+            s3_client=s3,
+        )
+
     def test_close_failure_after_success_is_reported(self):
         con = Mock()
         close_error = duckdb.Error("Simulated close failure")
@@ -999,11 +1029,12 @@ class ReprocessTests(unittest.TestCase):
             )
 
         transform.assert_called_once_with(con, "2026-01-15", "12", overwrite=True)
-        build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW)
+        build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW, s3_client=s3)
         con.close.assert_not_called()
 
     def test_gold_repair_does_not_rebuild_fresh_silver(self):
         con = Mock()
+        s3 = MagicMock()
         expected = {"status": "complete", "rows": {}}
 
         with (
@@ -1027,11 +1058,11 @@ class ReprocessTests(unittest.TestCase):
                 "2026-01-15",
                 "12",
                 run_at=NOW,
-                s3_client=MagicMock(),
+                s3_client=s3,
             )
 
         transform.assert_not_called()
-        build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW)
+        build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW, s3_client=s3)
         self.assertEqual(result, expected)
 
     def test_missing_bronze_stops_repair_before_gold_publication(self):
@@ -1081,7 +1112,7 @@ class ReprocessTests(unittest.TestCase):
         before_grace = NOW.replace(minute=14)
         after_grace = NOW.replace(minute=15)
 
-        def publish_gold(connection, date_str, hour_str, run_at):
+        def publish_gold(connection, date_str, hour_str, run_at, s3_client=None):
             self.assertEqual(run_at, after_grace)
             manifest["is_final"] = late_data.silver_to_gold.is_hour_final(
                 date_str, hour_str, run_at
@@ -1210,7 +1241,7 @@ class ReprocessTests(unittest.TestCase):
             operations.mock_calls,
             [
                 call.silver(con, "2026-01-15", "12", overwrite=True),
-                call.gold(con, "2026-01-15", "12", NOW),
+                call.gold(con, "2026-01-15", "12", NOW, s3_client=s3),
             ],
         )
         self.assertEqual(result, expected)
