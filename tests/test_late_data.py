@@ -268,6 +268,34 @@ class StaleHourTests(unittest.TestCase):
         )
         self.assertEqual(result, [("2026-01-15", "12")])
 
+    def test_window_requires_integer_before_storage_access(self):
+        for window_hours in (True, False, 1.5, "24", None):
+            with self.subTest(window_hours=window_hours):
+                s3 = Mock()
+
+                with self.assertRaisesRegex(TypeError, "window_hours"):
+                    late_data.find_stale_hours(
+                        now=NOW,
+                        window_hours=window_hours,
+                        s3_client=s3,
+                    )
+
+                self.assertEqual(s3.mock_calls, [])
+
+    def test_nonpositive_window_is_rejected_before_storage_access(self):
+        for window_hours in (0, -1):
+            with self.subTest(window_hours=window_hours):
+                s3 = Mock()
+
+                with self.assertRaisesRegex(ValueError, "window_hours"):
+                    late_data.find_stale_hours(
+                        now=NOW,
+                        window_hours=window_hours,
+                        s3_client=s3,
+                    )
+
+                self.assertEqual(s3.mock_calls, [])
+
     def test_input_change_before_silver_publication_requires_rebuild(self):
         partition = "date=2026-01-15/hour=12"
         publication_id = "a" * 32

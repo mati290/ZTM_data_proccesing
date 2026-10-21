@@ -194,6 +194,11 @@ def is_gold_stale(
 def find_stale_hours(
     now=None, window_hours=CORRECTION_WINDOW_HOURS, s3_client=None
 ) -> list[tuple[str, str]]:
+    if isinstance(window_hours, bool) or not isinstance(window_hours, int):
+        raise TypeError("window_hours must be an integer")
+    if window_hours <= 0:
+        raise ValueError("window_hours must be a positive integer")
+
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     s3_client = s3_client or bronze_to_silver._s3_client()
     current_hour = now.replace(minute=0, second=0, microsecond=0)
