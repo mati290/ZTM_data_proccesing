@@ -31,6 +31,31 @@ class GetSlotStartTests(unittest.TestCase):
             datetime(2026, 10, 8, 12, 0, 30, tzinfo=timezone.utc),
         )
 
+    def test_slot_helpers_reject_naive_timestamp(self):
+        timestamp = datetime(2026, 10, 8, 12, 0, 47, tzinfo=timezone.utc).replace(
+            tzinfo=None
+        )
+
+        for helper in (get_slot_start, seconds_until_next_slot):
+            with (
+                self.subTest(helper=helper.__name__),
+                self.assertRaisesRegex(ValueError, "timezone-aware"),
+            ):
+                helper(timestamp, 30)
+
+    def test_slot_helpers_normalize_timestamp_to_utc(self):
+        timestamp = datetime.fromisoformat("2026-10-08T14:00:47+02:00")
+
+        slot = get_slot_start(timestamp, 30)
+        delay = seconds_until_next_slot(timestamp, 30)
+
+        self.assertEqual(
+            slot,
+            datetime(2026, 10, 8, 12, 0, 30, tzinfo=timezone.utc),
+        )
+        self.assertIs(slot.tzinfo, timezone.utc)
+        self.assertAlmostEqual(delay, 13)
+
     def test_keeps_exact_slot_boundary(self):
         timestamp = datetime(2026, 10, 8, 12, 1, 0, tzinfo=timezone.utc)
 

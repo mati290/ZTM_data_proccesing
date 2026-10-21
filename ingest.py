@@ -276,6 +276,8 @@ def seconds_until_next_slot(timestamp, interval_seconds):
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
 
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
     timestamp = timestamp.astimezone(timezone.utc)
     epoch_seconds = timestamp.timestamp()
     next_slot = (int(epoch_seconds // interval_seconds) + 1) * interval_seconds
@@ -287,6 +289,8 @@ def get_slot_start(timestamp, interval_seconds):
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
 
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
     timestamp = timestamp.astimezone(timezone.utc)
     epoch_seconds = timestamp.timestamp()
     slot_epoch = int(epoch_seconds // interval_seconds) * interval_seconds
