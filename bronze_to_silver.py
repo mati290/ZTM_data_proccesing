@@ -513,9 +513,12 @@ def _s3_client():
     )
 
 
-def delete_s3_object(s3_uri: str) -> None:
+def delete_s3_object(s3_uri: str, s3_client=None) -> None:
     bucket, key = _parse_s3_uri(s3_uri)
-    _s3_client().delete_object(Bucket=bucket, Key=key)
+    if s3_client is None:
+        s3_client = _s3_client()
+
+    s3_client.delete_object(Bucket=bucket, Key=key)
 
 
 def s3_object_exists(s3_uri: str, s3_client=None) -> bool:

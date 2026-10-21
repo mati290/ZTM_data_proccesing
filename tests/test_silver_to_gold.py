@@ -836,7 +836,7 @@ class PublishTests(unittest.TestCase):
         with (
             patch.object(gold, "validate_staged_file"),
             patch.object(gold, "copy_s3_object") as copy_object,
-            patch.object(gold, "delete_s3_object"),
+            patch.object(gold, "delete_s3_object") as delete_object,
         ):
             counts = gold.publish_tables(
                 con,
@@ -849,6 +849,10 @@ class PublishTests(unittest.TestCase):
         copy_object.assert_called_once_with(
             staging_uri,
             output_uri,
+            s3_client=s3,
+        )
+        delete_object.assert_called_once_with(
+            staging_uri,
             s3_client=s3,
         )
 
@@ -970,7 +974,7 @@ class LocalPipelineTestCase(unittest.TestCase):
         shutil.copyfile(src, dst)
 
     @staticmethod
-    def fake_delete(uri):
+    def fake_delete(uri, s3_client=None):
         if os.path.exists(uri):
             os.remove(uri)
 

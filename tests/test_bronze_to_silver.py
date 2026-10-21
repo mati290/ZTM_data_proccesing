@@ -2061,6 +2061,21 @@ class SilverTempObjectTests(unittest.TestCase):
             Key="vehicle_positions/_staging/test.parquet.pending",
         )
 
+    def test_delete_s3_object_uses_supplied_client(self):
+        s3 = Mock()
+
+        with patch("bronze_to_silver._s3_client") as client_factory:
+            delete_s3_object(
+                "s3://gold/_staging/test/data.parquet.pending",
+                s3_client=s3,
+            )
+
+        s3.delete_object.assert_called_once_with(
+            Bucket="gold",
+            Key="_staging/test/data.parquet.pending",
+        )
+        client_factory.assert_not_called()
+
     def test_delete_s3_object_rejects_non_s3_uri(self):
         with self.assertRaises(ValueError):
             delete_s3_object("file:///tmp/test.parquet")

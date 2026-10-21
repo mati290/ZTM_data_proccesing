@@ -753,7 +753,10 @@ def publish_tables(con, tables, uris: dict, s3_client=None) -> dict:
     finally:
         for table in tables:
             try:
-                delete_s3_object(staging[table])
+                delete_s3_object(
+                    staging[table],
+                    s3_client=s3_client,
+                )
             except (BotoCoreError, ClientError) as exc:
                 logger.warning(
                     "Could not remove temporary Gold object %s: %s",
