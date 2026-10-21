@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, Mock, call, patch
 
+import duckdb
 from botocore.exceptions import ClientError
 
 import bronze_to_silver
@@ -909,6 +910,66 @@ class ReprocessTests(unittest.TestCase):
         with patch.object(late_data, "find_stale_hours", return_value=[]):
             result = late_data.reprocess_late_data(con=None)
         self.assertEqual(result["recomputed"], [])
+
+    def test_close_failure_after_success_is_reported(self):
+        con = Mock()
+        close_error = duckdb.Error("Simulated close failure")
+        con.close.side_effect = close_error
+
+        with (
+            patch.object(
+                late_data,
+                "find_stale_hours",
+                return_value=[("2026-01-15", "12")],
+            ),
+            patch.object(
+                late_data.silver_to_gold,
+                "get_connection",
+                return_value=con,
+            ),
+            patch.object(
+                late_data,
+                "recompute_hour",
+                return_value={"status": "complete"},
+            ) as recompute,
+            self.assertLogs(late_data.logger, level="ERROR"),
+            self.assertRaises(duckdb.Error) as raised,
+        ):
+            late_data.reprocess_late_data(now=NOW)
+
+        self.assertIs(raised.exception, close_error)
+        recompute.assert_called_once()
+        con.close.assert_called_once_with()
+
+    def test_close_failure_does_not_hide_repair_failure(self):
+        con = Mock()
+        con.close.side_effect = duckdb.Error("Simulated close failure")
+
+        with (
+            patch.object(
+                late_data,
+                "find_stale_hours",
+                return_value=[("2026-01-15", "12")],
+            ),
+            patch.object(
+                late_data.silver_to_gold,
+                "get_connection",
+                return_value=con,
+            ),
+            patch.object(
+                late_data,
+                "recompute_hour",
+                side_effect=ValueError("Simulated repair failure"),
+            ),
+            self.assertLogs(late_data.logger, level="ERROR"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Late-data recompute failed.*2026-01-15 12",
+            ),
+        ):
+            late_data.reprocess_late_data(now=NOW)
+
+        con.close.assert_called_once_with()
 
     def test_scan_failure_allows_other_repairs_but_run_fails(self):
         con = Mock()

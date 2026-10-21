@@ -14,6 +14,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
+import duckdb
 from botocore.exceptions import BotoCoreError
 
 import bronze_to_silver
@@ -268,6 +269,7 @@ def reprocess_late_data(
     owns_connection = con is None
     con = con or silver_to_gold.get_connection()
     recomputed, failed = [], []
+    close_error = None
     try:
         for date_str, hour_str in stale:
             try:
@@ -286,10 +288,17 @@ def reprocess_late_data(
                 failed.append(f"{date_str} {hour_str}")
     finally:
         if owns_connection:
-            con.close()
+            try:
+                con.close()
+            except duckdb.Error as exc:
+                close_error = exc
+                logger.exception("Could not close late-data connection")
 
     if failed:
         raise RuntimeError(f"Late-data recompute failed for hours: {failed}")
+    if close_error is not None:
+        raise close_error
+
     return {"recomputed": recomputed, "failed": failed}
 
 
