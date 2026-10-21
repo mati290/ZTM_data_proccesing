@@ -32,6 +32,25 @@ class IngestionHealthTests(unittest.TestCase):
             )
         }
 
+    def test_non_object_manifest_is_unhealthy(self):
+        for payload in ([], None, "complete", 123, True):
+            with self.subTest(payload=payload):
+                self.set_manifest(30)
+                self.s3.get_object.return_value = {
+                    "Body": Mock(
+                        read=Mock(return_value=json.dumps(payload).encode("utf-8"))
+                    )
+                }
+
+                healthy, message = check_ingestion_health(
+                    self.s3,
+                    max_age_seconds=120,
+                    now=self.now,
+                )
+
+                self.assertFalse(healthy)
+                self.assertIn("manifest", message.lower())
+
     def test_fresh_manifest_is_healthy(self):
         self.set_manifest(30)
 

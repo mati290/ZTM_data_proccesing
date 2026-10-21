@@ -53,6 +53,9 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
             body = body.decode("utf-8")
 
         manifest = json.loads(body)
+        if not isinstance(manifest, dict):
+            return False, "Latest Bronze manifest must be a JSON object"
+
         status = manifest.get("status")
 
         if status != "complete":
