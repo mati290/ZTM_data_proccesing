@@ -1102,6 +1102,32 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
         invalid_gps_time,
         after,
     ) = con.execute(quality_sql).fetchone()
+    if before > 0 and after == 0:
+        diagnostic_file = (
+            f"s3://silver/_diagnostics/{partition}/{publication_id}/quarantine.parquet"
+        )
+        diagnostic_sql = sql_from_materialized_input(REJECTED_SQL)
+        con.execute(f"COPY ({diagnostic_sql}) TO '{diagnostic_file}' (FORMAT parquet)")
+
+        diagnostic_count = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet("
+            f"'{diagnostic_file}', hive_partitioning = false)"
+        ).fetchone()[0]
+
+        if diagnostic_count != before:
+            raise ValueError(
+                f"Diagnostic quarantine validation failed for {date_str} "
+                f"hour {hour_str}: expected {before} rows, "
+                f"got {diagnostic_count}"
+            )
+
+        logger.error(
+            "%s hour %s: all %s Bronze records rejected; quarantine saved to %s",
+            date_str,
+            hour_str,
+            before,
+            diagnostic_file,
+        )
     validate_output_quality(date_str, hour_str, before, after)
 
     sql = sql_from_materialized_input(TRANSFORM_SQL)

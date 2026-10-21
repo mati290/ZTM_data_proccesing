@@ -1179,6 +1179,56 @@ class BronzeToSilverSqlTests(unittest.TestCase):
         self.connection = duckdb.connect()
         self.connection.execute("SET TimeZone = 'UTC';")
 
+    def test_all_rejected_transform_writes_readable_diagnostic_parquet(self):
+        bronze_to_silver.materialize_bronze_inputs(self.connection, [self.bronze_path])
+        self.connection.execute("UPDATE bronze_input SET Lat = '0'")
+        expected_count = self.connection.execute(
+            "SELECT COUNT(*) FROM bronze_input"
+        ).fetchone()[0]
+        self.assertGreater(expected_count, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = (Path(directory) / "quarantine.parquet").as_posix()
+            diagnostic_uri = (
+                "s3://silver/_diagnostics/date=2026-10-09/hour=07/"
+                + "a" * 32
+                + "/quarantine.parquet"
+            )
+
+            def execute(sql):
+                if sql.startswith("SELECT file FROM glob("):
+                    result = Mock()
+                    result.fetchone.return_value = (self.bronze_path,)
+                    return result
+                return self.connection.execute(sql.replace(diagnostic_uri, output_path))
+
+            connection = Mock()
+            connection.execute.side_effect = execute
+
+            with (
+                patch(
+                    "bronze_to_silver.uuid.uuid4",
+                    return_value=Mock(hex="a" * 32),
+                ),
+                patch(
+                    "bronze_to_silver.capture_bronze_inputs",
+                    return_value=[],
+                ),
+                patch("bronze_to_silver.materialize_bronze_inputs"),
+                patch("bronze_to_silver.write_silver_active_manifest") as activate,
+                self.assertRaisesRegex(ValueError, "No valid Silver rows"),
+            ):
+                transform_hour(connection, "2026-10-09", "07", s3_client=Mock())
+
+            rows = self.connection.execute(
+                "SELECT rejection_reason, COUNT(*) "
+                f"FROM read_parquet('{output_path}') "
+                "GROUP BY rejection_reason"
+            ).fetchall()
+
+            self.assertEqual(rows, [("invalid_coordinates", expected_count)])
+            activate.assert_not_called()
+
     def test_explicit_schema_preserves_hive_type_and_identifiers(self):
         record = {
             "VehicleNumber": "0012",
@@ -1472,6 +1522,63 @@ class TransformHourTests(unittest.TestCase):
             (1,),
         ]
         return connection
+
+    def test_all_rejected_quarantine_row_count_is_validated(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.side_effect = [
+            ("bronze-file.jsonl",),
+            (2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            (1,),
+        ]
+
+        with (
+            patch("bronze_to_silver.write_silver_active_manifest") as activate,
+            self.assertRaisesRegex(
+                ValueError,
+                "Diagnostic quarantine validation failed.*expected 2 rows.*got 1",
+            ),
+        ):
+            transform_hour(
+                connection,
+                "2026-10-09",
+                "07",
+                s3_client=Mock(),
+            )
+
+        activate.assert_not_called()
+        self.write_marker_mock.assert_not_called()
+
+    def test_all_rejected_rows_are_saved_without_activating_silver(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.side_effect = [
+            ("bronze-file.jsonl",),
+            (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            (1,),
+        ]
+
+        with (
+            patch("bronze_to_silver.write_silver_active_manifest") as activate,
+            self.assertRaisesRegex(ValueError, "No valid Silver rows"),
+        ):
+            transform_hour(
+                connection,
+                "2026-10-09",
+                "07",
+                s3_client=Mock(),
+            )
+
+        copy_statements = [
+            operation.args[0]
+            for operation in connection.execute.call_args_list
+            if operation.args[0].startswith("COPY ")
+        ]
+        self.assertTrue(
+            any(
+                "/_diagnostics/" in sql and "quarantine.parquet" in sql
+                for sql in copy_statements
+            )
+        )
+        activate.assert_not_called()
 
     def test_overwrite_guard_uses_supplied_s3_client(self):
         connection = self._happy_path_connection()
