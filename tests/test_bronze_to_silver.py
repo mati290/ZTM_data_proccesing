@@ -57,6 +57,47 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
+    def test_elapsed_slots_follow_epoch_boundaries(self):
+        hour_start = datetime(2026, 10, 9, 7, tzinfo=timezone.utc)
+        start_epoch = int(hour_start.timestamp())
+        interval = 31
+
+        for elapsed in (0, 1, 15, 30, 31, 62, 3599):
+            with self.subTest(elapsed=elapsed):
+                expected = sum(
+                    (start_epoch + second) % interval == 0
+                    for second in range(elapsed + 1)
+                )
+                now = datetime.fromtimestamp(
+                    start_epoch + elapsed,
+                    tz=timezone.utc,
+                )
+
+                actual = bronze_to_silver.expected_slots_elapsed(
+                    "2026-10-09", "07", now, interval
+                )
+
+                self.assertEqual(actual, expected)
+
+    def test_expected_slots_follow_epoch_alignment(self):
+        hour_start = datetime(2026, 10, 9, 7, tzinfo=timezone.utc)
+        start_epoch = int(hour_start.timestamp())
+
+        for interval in (7, 31):
+            with self.subTest(interval=interval):
+                expected = sum(
+                    (start_epoch + second) % interval == 0 for second in range(3600)
+                )
+
+                actual = bronze_to_silver.expected_slots_elapsed(
+                    "2026-10-09",
+                    "07",
+                    datetime(2026, 10, 9, 8, tzinfo=timezone.utc),
+                    interval,
+                )
+
+                self.assertEqual(actual, expected)
+
     def test_active_manifest_snapshot_round_trip(self):
         publication_id = "a" * 32
         partition = "date=2026-10-09/hour=07"

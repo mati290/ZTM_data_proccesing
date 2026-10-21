@@ -732,19 +732,20 @@ def expected_slots_elapsed(
         raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
 
     hour_start = datetime.fromisoformat(f"{date_str}T{hour_str}:00:00+00:00")
-    hour_end = hour_start.replace(minute=59, second=59) + timedelta(seconds=1)
+    hour_end = hour_start + timedelta(hours=1)
     now_utc = now_utc.astimezone(timezone.utc)
 
     if now_utc < hour_start:
         return 0
 
-    elapsed_until = min(now_utc, hour_end)
-    elapsed_seconds = (elapsed_until - hour_start).total_seconds()
+    start_epoch = int(hour_start.timestamp())
+    end_epoch = int(hour_end.timestamp())
 
-    return min(
-        math.ceil(3600 / poll_interval_seconds),
-        math.floor(elapsed_seconds / poll_interval_seconds) + 1,
-    )
+    first_slot = (start_epoch + poll_interval_seconds - 1) // poll_interval_seconds
+    last_second = min(math.floor(now_utc.timestamp()), end_epoch - 1)
+    last_slot = last_second // poll_interval_seconds
+
+    return max(0, last_slot - first_slot + 1)
 
 
 def validate_cycle_manifest(manifest: dict) -> None:
