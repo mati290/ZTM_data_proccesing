@@ -1,10 +1,14 @@
+import logging
 from datetime import timedelta
 
+import duckdb
 import pendulum
 from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 from airflow.sdk import dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowSkipException
 from airflow.timetables.interval import CronDataIntervalTimetable
+
+logger = logging.getLogger(__name__)
 
 
 @dag(
@@ -44,6 +48,7 @@ def silver_to_gold_hourly():
         hour_str = interval_start.strftime("%H")
 
         connection = silver_to_gold.get_connection()
+        close_error = None
         try:
             result = silver_to_gold.build_gold_hour(connection, date_str, hour_str)
         except silver_to_gold.SilverDataMissingError as exc:
@@ -51,8 +56,14 @@ def silver_to_gold_hourly():
                 raise AirflowSkipException(str(exc)) from exc
             raise
         finally:
-            connection.close()
+            try:
+                connection.close()
+            except duckdb.Error as exc:
+                close_error = exc
+                logger.error("Could not close Silver-to-Gold task connection")
 
+        if close_error is not None:
+            raise close_error
         print(
             f"Gold {date_str} hour {hour_str}: completeness={result['status']}, "
             f"rows={result['rows']}"

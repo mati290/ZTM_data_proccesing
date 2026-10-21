@@ -21,6 +21,58 @@ class DagDefinitionTests(unittest.TestCase):
     def test_dags_import_without_errors(self):
         self.assertEqual(self.bag.import_errors, {})
 
+    def test_gold_task_cleanup_after_success(self):
+        import silver_to_gold
+
+        task_function = (
+            self.bag.dags["silver_to_gold_hourly"]
+            .get_task("build_gold")
+            .python_callable
+        )
+
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails):
+                interval_start = Mock()
+                interval_start.in_timezone.return_value = interval_start
+                interval_start.strftime.side_effect = ["2026-01-15", "12"]
+
+                connection = Mock()
+                close_error = duckdb.Error("Simulated close failure")
+                if close_fails:
+                    connection.close.side_effect = close_error
+
+                expected = {"status": "complete", "rows": {}}
+
+                with (
+                    patch.dict(
+                        task_function.__globals__,
+                        {
+                            "get_current_context": Mock(
+                                return_value={"data_interval_start": interval_start}
+                            )
+                        },
+                    ),
+                    patch.object(
+                        silver_to_gold,
+                        "get_connection",
+                        return_value=connection,
+                    ),
+                    patch.object(
+                        silver_to_gold,
+                        "build_gold_hour",
+                        return_value=expected,
+                    ) as build_gold,
+                ):
+                    if close_fails:
+                        with self.assertRaises(duckdb.Error) as raised:
+                            task_function()
+                        self.assertIs(raised.exception, close_error)
+                    else:
+                        self.assertIs(task_function(), expected)
+
+                build_gold.assert_called_once_with(connection, "2026-01-15", "12")
+                connection.close.assert_called_once_with()
+
     def test_gold_dag_waits_for_silver_then_builds(self):
         dag = self.bag.get_dag("silver_to_gold_hourly")
         sensor = dag.get_task("wait_for_silver")
@@ -31,6 +83,46 @@ class DagDefinitionTests(unittest.TestCase):
         self.assertEqual(
             dag.get_task("build_gold").upstream_task_ids, {"wait_for_silver"}
         )
+
+    def test_gold_task_close_failure_preserves_build_failure(self):
+        import silver_to_gold
+
+        dag = self.bag.dags["silver_to_gold_hourly"]
+        task_function = dag.get_task("build_gold").python_callable
+
+        interval_start = Mock()
+        interval_start.in_timezone.return_value = interval_start
+        interval_start.strftime.side_effect = ["2026-01-15", "12"]
+
+        connection = Mock()
+        build_error = ValueError("Simulated Gold failure")
+        connection.close.side_effect = duckdb.Error("Simulated close failure")
+
+        with (
+            patch.dict(
+                task_function.__globals__,
+                {
+                    "get_current_context": lambda: {
+                        "data_interval_start": interval_start
+                    }
+                },
+            ),
+            patch.object(
+                silver_to_gold,
+                "get_connection",
+                return_value=connection,
+            ),
+            patch.object(
+                silver_to_gold,
+                "build_gold_hour",
+                side_effect=build_error,
+            ),
+            self.assertRaises(ValueError) as raised,
+        ):
+            task_function()
+
+        self.assertIs(raised.exception, build_error)
+        connection.close.assert_called_once_with()
 
     def test_silver_task_reports_close_failure_after_success(self):
         import bronze_to_silver
