@@ -8,7 +8,7 @@ Projekt portfolio z inżynierii danych: przekształca migawki pozycji GPS warsza
 
 **Na jakie pytania odpowiada:** ile identyfikatorów pojazdów zaobserwowano w godzinie, jakie linie pojawiły się w danych i czy pobieranie oraz przetwarzanie dostarczyły materiał do analizy. Nie mierzy punktualności względem rozkładu ani wszystkich pojazdów faktycznie kursujących.
 
-**Stan:** pipeline i testy automatyczne są zaimplementowane. Przygotowano i przetestowano wdrożenie na pojedynczym serwerze Oracle ARM. Odbiór długiego działania, zabezpieczenia produkcyjne i dashboard pozostają w toku. Projekt nie udostępnia jeszcze publicznego dashboardu ani usługi z gwarancją dostępności.
+**Stan:** pipeline i testy automatyczne są zaimplementowane. Wdrożenie na pojedynczym serwerze działa obecnie w Google Cloud w Warszawie, po wcześniejszym teście Oracle ARM. Rzeczywiste dane dotarły do Silver i Gold, ale błędy połączenia z zewnętrznym API przerwały zbieranie; odbiór pełnej godziny i długiego działania pozostaje otwarty. Zabezpieczenia produkcyjne i dashboard są w toku. Projekt nie udostępnia jeszcze publicznego dashboardu ani usługi z gwarancją dostępności.
 
 **Szybki start:** [demo bez klucza API](#demo-bez-klucza-api-ztm) · [zbieranie prawdziwych danych](#zbieranie-prawdziwych-danych) · [kontrakt danych](docs/gold-data-contract.md) · [ograniczenia](#ograniczenia-i-kolejne-kroki)
 
@@ -188,8 +188,10 @@ W Windows zamiast `python` można wskazać `.\.venv\Scripts\python.exe`. Bez lok
 
 ## Ograniczenia i kolejne kroki
 
-- **Utrzymanie:** kopie poza serwerem z próbą restore, retencja logów/danych, alarmy końcowego Gold i test odzyskania hosta nie są jeszcze wdrożone. Wolumen Dockera nie jest backupem poza VM; samo unhealthy nie uruchamia restartu Compose.
-- **Wdrożenie:** Oracle ARM to kontrolowany test jednego hosta. Odbiór produkcyjny wymaga PostgreSQL, limitów zasobów/czasu dobranych po pomiarach oraz odtwarzalnego deployu/rollbacku. Panele są prywatne; publiczny dostęp/TLS i dashboard pozostają przed nami.
+Compose ogranicza logi stdout/stderr każdego kontenera do 3 plików po 10 MB (około 90 MB łącznie dla trzech usług). Zmiana wymaga odtworzenia kontenerów; zwykły restart nie wystarczy. Osobne pliki logów zadań w wolumenie Airflow nie są objęte tym limitem i nadal wymagają retencji.
+
+- **Utrzymanie:** automatyczne kopie poza serwerem z próbą restore, retencja plików logów Airflow i danych, alarmy końcowego Gold i test odzyskania hosta pozostają otwarte. Istnieje zweryfikowane jednorazowe archiwum migracyjne; nie zastępuje ono cyklicznych backupów. Wolumen Dockera nie jest backupem poza VM; samo unhealthy nie uruchamia restartu Compose. Przy błędach źródeł kolektor wydłuża przerwy do 60/120/240/300 sekund, respektuje HTTP 429 Retry-After i nie ponawia trwałych błędów 4xx wewnątrz pojedynczego pobrania.
+- **Wdrożenie:** Google Cloud w Warszawie to kontrolowany test jednego hosta finansowany czasowym kredytem próbnym. Odbiór produkcyjny wymaga PostgreSQL, limitów zasobów/czasu dobranych po pomiarach oraz odtwarzalnego deployu/rollbacku. Panele są prywatne; publiczny dostęp/TLS i dashboard pozostają przed nami.
 - **Naprawy:** domyślne okno to 24 h, nie cała historia. Zmienione lub usunięte wcześniej użyte wejście Bronze blokuje przebudowę do czasu odtworzenia. Obiekty surowe pozostają niezmienne; retencja musi zachować wejścia do korekt.
 - **Znaczenie metryk:** zaobserwowane pojazdy to nie pełna flota. Nie sumuj godzinowych distinctów jako unikalnych pojazdów dnia. `active_seconds` nie oznacza czasu jazdy. Ten sam GPS może wystąpić w sąsiednich partycjach pobierania.
 - **Zgodność:** testowano MinIO, nie pełną integrację AWS S3. Zimne połączenia instalują/ładują DuckDB `httpfs`; to nadal zależność wdrożeniowa.

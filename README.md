@@ -8,7 +8,7 @@ A data engineering portfolio project that turns Warsaw bus and tram GPS snapshot
 
 **What it answers:** how many vehicle identifiers were observed per hour, which lines were represented, and whether collection and processing produced data suitable for analysis. It does not measure timetable punctuality or every vehicle actually in service.
 
-**Status:** the pipeline and automated tests are implemented. A single-server Oracle ARM deployment has been prepared and tested; long-running operational acceptance, production hardening and a dashboard remain work in progress. There is no public dashboard or guaranteed-availability service.
+**Status:** the pipeline and automated tests are implemented. The single-server deployment now runs in Google Cloud Warsaw, following an earlier Oracle ARM test. Real data reached Silver and Gold, but upstream API connectivity failures have interrupted collection; full-hour and long-running acceptance remain open. Production hardening and a dashboard are work in progress. There is no public dashboard or guaranteed-availability service.
 
 **Start here:** [run a demo without an API key](#demo-without-a-ztm-api-key) · [collect live data](#collect-live-data) · [data contract](docs/gold-data-contract.en.md) · [limitations](#limitations-and-next-steps)
 
@@ -188,8 +188,10 @@ On Windows you can use `.\.venv\Scripts\python.exe` instead of `python`. Local t
 
 ## Limitations and next steps
 
-- **Operations:** external backups/restore, log/data retention, end-to-end Gold alerts and tested host recovery are not yet implemented. A Docker volume is not an off-host backup; `unhealthy` alone does not trigger a Compose restart.
-- **Deployment:** the Oracle ARM setup is a controlled single-host test. Production acceptance requires PostgreSQL metadata, measured resource/time limits and repeatable deployment/rollback. Panels remain private; public authentication/TLS and a dashboard are future work.
+Compose rotates each container's stdout/stderr logs across 3 files of 10 MB each (approximately 90 MB for the three services). Existing containers must be recreated to apply this configuration; restarting them is insufficient. Airflow task log files in its volume are separate and still require a retention policy.
+
+- **Operations:** automated off-host backups/restore, Airflow file-log and data retention, end-to-end Gold alerts and tested host recovery remain open. A verified one-time migration archive exists; it does not replace scheduled backups. A Docker volume is not an off-host backup; `unhealthy` alone does not trigger a Compose restart. During source failures, collection backs off for 60/120/240/300 seconds, honors HTTP 429 `Retry-After`, and does not retry permanent 4xx errors within a fetch.
+- **Deployment:** Google Cloud Warsaw is a controlled single-host test funded by time-limited trial credits. Production acceptance requires PostgreSQL metadata, measured resource/time limits and repeatable deployment/rollback. Panels remain private; public authentication/TLS and a dashboard are future work.
 - **Recovery:** default repair covers 24 hours, not arbitrary history. Changed or deleted previously used Bronze objects block rebuilding until restored. Keep raw objects immutable and retain the inputs required by corrections.
 - **Semantics:** observed vehicles are not a fleet census. Do not sum hourly distinct counts into daily uniques. `active_seconds` is an observation span, not driving time. GPS observations can recur across adjacent collection partitions.
 - **Compatibility:** S3 compatibility was tested with MinIO, not end to end on AWS S3. Cold connections install/load DuckDB `httpfs`; this remains a deployment dependency.

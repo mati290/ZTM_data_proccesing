@@ -1,5 +1,10 @@
 ﻿services:
   minio:
+    logging: &container-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # The Chainguard public registry provides the free `latest` channel.
     # Pin this to a digest before using the stack outside local development.
     image: cgr.dev/chainguard/minio@sha256:0f95aa412a12351a95bb43c3b54b66440eb0aa022bb3f3458942678a489e915b
@@ -15,6 +20,7 @@
     restart: unless-stopped
 
   ingestion:
+    logging: *container-logging
     build: .
     environment:
       ZTM_API_KEY: ${ZTM_API_KEY:?set ZTM_API_KEY in .env}
@@ -33,6 +39,7 @@
       retries: 3
       start_period: 60s
   airflow:
+    logging: *container-logging
     build:
       context: .
       dockerfile: airflow/Dockerfile

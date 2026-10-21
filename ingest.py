@@ -1,10 +1,12 @@
 import json
 import logging
+import math
 import os
 import signal
 import time
 import uuid
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import boto3
 import requests
@@ -36,7 +38,35 @@ def _safe_error_summary(error: Exception) -> str:
     return type(error).__name__
 
 
-def fetch_positions(vehicle_type, api_key, max_attempts=3):
+def retry_after_seconds(value: str | None) -> float:
+    """Parse the server cooldown; malformed headers use a conservative default."""
+    try:
+        delay = float(value)
+        if math.isfinite(delay) and delay >= 0:
+            return delay
+    except (TypeError, ValueError):
+        pass
+    try:
+        deadline = parsedate_to_datetime(value)
+        if deadline.tzinfo is not None:
+            return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return 60.0
+
+
+def failure_cooldown_seconds(failed_cycles: int) -> int:
+    """Reduce API traffic during outages without changing the UTC slot contract."""
+    if failed_cycles <= 0:
+        return 0
+    return min(300, 60 * 2 ** min(failed_cycles - 1, 3))
+
+
+def fetch_positions(
+    vehicle_type: int, api_key: str, max_attempts: int = 3
+) -> list[dict]:
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
     params = {
         "resource_id": "f2e5503e-927d-4ad3-9500-4ab9e55deb59",
         "apikey": api_key,
@@ -63,6 +93,16 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
             )
             raise
         except requests.RequestException as e:
+            response = e.response
+            status = response.status_code if response is not None else None
+            if status is not None and 400 <= status < 500 and status not in {408, 429}:
+                logger.error("Non-retryable API error: %s", _safe_error_summary(e))
+                raise
+            if status == 429:
+                # Honor the server delay even on the last attempt, before the next source.
+                delay = retry_after_seconds(response.headers.get("Retry-After"))
+                logger.warning("API rate limit; waiting %.1f seconds", delay)
+                time.sleep(delay)
             if attempt == max_attempts:
                 logger.error(
                     f"All {max_attempts} attempts failed for vehicle type {vehicle_type}: {_safe_error_summary(e)}"
@@ -71,7 +111,8 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
             logger.warning(
                 f"Attempt {attempt}/{max_attempts} failed for vehicle type {vehicle_type}: {_safe_error_summary(e)}"
             )
-            time.sleep(2**attempt)
+            if status != 429:
+                time.sleep(2**attempt)
     raise RuntimeError(f"Failed to fetch positions for vehicle type {vehicle_type}")
 
 
@@ -352,10 +393,13 @@ def main():
     logger.info(f"Starting main loop with interval {interval} seconds")
     signal.signal(signal.SIGTERM, _handle_sigterm)
     degraded_cycles = 0
+    failed_cycles = 0
     while True:
         degraded = True
+        source_failed = True
         try:
             result = run_once(api_key, s3)
+            source_failed = bool(result["failed_sources"])
             degraded = bool(result["failed_sources"] or result["empty_sources"])
             logger.info(
                 "Ingestion cycle finished: status=%s buses=%s trams=%s total=%s",
@@ -376,6 +420,7 @@ def main():
                 _safe_error_summary(error),
             )
         degraded_cycles = degraded_cycles + 1 if degraded else 0
+        failed_cycles = failed_cycles + 1 if source_failed else 0
         if degraded_cycles == alert_threshold:
             logger.critical(
                 "ALERT: ingestion degraded for %s consecutive cycles", degraded_cycles
@@ -384,6 +429,10 @@ def main():
             datetime.now(timezone.utc),
             interval,
         )
+        cooldown = failure_cooldown_seconds(failed_cycles)
+        if cooldown:
+            logger.warning("API/source failures: waiting at least %s seconds", cooldown)
+            sleep_seconds = max(sleep_seconds, cooldown)
         time.sleep(sleep_seconds)
 
 

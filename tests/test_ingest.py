@@ -10,10 +10,12 @@ from ingest import (
     ZTMApiError,
     ensure_bucket,
     ensure_bucket_with_retry,
+    failure_cooldown_seconds,
     fetch_positions,
     get_poll_interval_seconds,
     get_slot_start,
     main,
+    retry_after_seconds,
     run_once,
     save_to_bronze,
     seconds_until_next_slot,
@@ -25,6 +27,60 @@ def saved_source(_s3, _records, label, *, cycle_slot_start):
         "key": f"vehicle_type={label}/date={cycle_slot_start:%Y-%m-%d}/hour={cycle_slot_start:%H}/test.jsonl",
         "size": 1,
     }
+
+
+class ApiCooldownTests(unittest.TestCase):
+    def test_cooldown_grows_and_is_capped(self):
+        self.assertEqual(
+            [failure_cooldown_seconds(n) for n in (0, 1, 2, 3, 4, 10000)],
+            [0, 60, 120, 240, 300, 300],
+        )
+
+    def test_retry_after_invalid_values_use_default(self):
+        for value in (None, "garbage", "-1", "nan", "inf"):
+            with self.subTest(value=value):
+                self.assertEqual(retry_after_seconds(value), 60)
+
+    def test_retry_after_http_date(self):
+        now = datetime(2026, 10, 21, 20, 0, tzinfo=timezone.utc)
+        with patch("ingest.datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            self.assertEqual(retry_after_seconds("Wed, 21 Oct 2026 20:02:00 GMT"), 120)
+            self.assertEqual(retry_after_seconds("Wed, 21 Oct 2026 19:00:00 GMT"), 0)
+
+    def test_main_reduces_traffic_and_resets_after_recovery(self):
+        failed = {
+            "buses": 0,
+            "trams": 0,
+            "total": 0,
+            "failed_sources": ["bus", "tram"],
+            "empty_sources": [],
+        }
+        healthy = {
+            "buses": 1,
+            "trams": 1,
+            "total": 2,
+            "failed_sources": [],
+            "empty_sources": [],
+        }
+        with (
+            patch.dict(
+                "os.environ", {"ZTM_API_KEY": "test-key", "POLL_INTERVAL_SECONDS": "30"}
+            ),
+            patch("ingest.load_dotenv"),
+            patch("ingest.boto3.client"),
+            patch("ingest.ensure_bucket_with_retry"),
+            patch("ingest.run_once", side_effect=[failed, failed, healthy, failed]),
+            patch("ingest.seconds_until_next_slot", return_value=17),
+            patch(
+                "ingest.time.sleep", side_effect=[None, None, None, KeyboardInterrupt]
+            ) as sleep,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main()
+        self.assertEqual(
+            sleep.call_args_list, [call(60), call(120), call(17), call(60)]
+        )
 
 
 class GetSlotStartTests(unittest.TestCase):
@@ -234,7 +290,63 @@ class SaveToBronzeTests(unittest.TestCase):
 
         output = "\n".join(captured.output)
         self.assertNotIn(api_key, output)
-        self.assertEqual(output.count("HTTPError (status=401)"), 2)
+        self.assertEqual(output.count("HTTPError (status=401)"), 1)
+
+    def test_permanent_http_errors_are_not_retried(self):
+        for status in (400, 401, 403, 404):
+            response = Mock(status_code=status)
+            with (
+                self.subTest(status=status),
+                patch(
+                    "ingest.requests.get", side_effect=HTTPError(response=response)
+                ) as request,
+                patch("ingest.time.sleep") as sleep,
+                self.assertRaises(HTTPError),
+            ):
+                fetch_positions(1, "test-key")
+            request.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_rate_limit_honors_retry_after_before_retry(self):
+        limited = Mock(status_code=429, headers={"Retry-After": "90"})
+        success = Mock()
+        success.json.return_value = {"result": []}
+        with (
+            patch(
+                "ingest.requests.get",
+                side_effect=[HTTPError(response=limited), success],
+            ),
+            patch("ingest.time.sleep") as sleep,
+        ):
+            self.assertEqual(fetch_positions(1, "test-key"), [])
+        sleep.assert_called_once_with(90.0)
+
+    def test_rate_limit_honors_retry_after_on_last_attempt(self):
+        limited = Mock(status_code=429, headers={"Retry-After": "120"})
+        with (
+            patch("ingest.requests.get", side_effect=HTTPError(response=limited)),
+            patch("ingest.time.sleep") as sleep,
+            self.assertRaises(HTTPError),
+        ):
+            fetch_positions(1, "test-key", max_attempts=1)
+        sleep.assert_called_once_with(120.0)
+
+    def test_transient_http_errors_still_retry(self):
+        for status in (408, 500, 502, 503, 504):
+            response = Mock(status_code=status)
+            success = Mock()
+            success.json.return_value = {"result": []}
+            with (
+                self.subTest(status=status),
+                patch(
+                    "ingest.requests.get",
+                    side_effect=[HTTPError(response=response), success],
+                ) as request,
+                patch("ingest.time.sleep") as sleep,
+            ):
+                self.assertEqual(fetch_positions(1, "test-key"), [])
+            self.assertEqual(request.call_count, 2)
+            sleep.assert_called_once_with(2)
 
     def test_fetch_positions_retries_after_timeout(self):
         response = Mock()
