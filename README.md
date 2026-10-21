@@ -1,242 +1,180 @@
-﻿# 🚋 Warsaw Transit Data Platform
+# Warsaw Transit Data Pipeline
 
-A data engineering project that continuously collects **real-time GPS positions
-of Warsaw public transport vehicles reported by the feed** (ZTM buses and trams) from the
-[UM Warszawa Open Data API](https://api.um.warszawa.pl) and stores them in an
-S3-compatible data lake. The implemented pipeline follows a **medallion
-architecture**: raw JSON Lines in bronze and cleaned, hourly Parquet in silver;
-hourly business and data-quality metrics in gold.
+**[English](README.md) · [Polski](README.pl.md)**
 
-> 🚧 Work in progress – ingestion, hourly Bronze → Silver and Silver → Gold
-> pipelines, late-data recomputation, tests, and GitHub Actions CI are implemented.
-> A dashboard and production cloud deployment remain future work; see the
-> [roadmap](#roadmap).
+[![CI](https://github.com/mati290/ZTM_data_proccesing/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mati290/ZTM_data_proccesing/actions/workflows/ci.yml)
+
+A data engineering portfolio project that turns Warsaw bus and tram GPS snapshots into validated, hourly analytics. It combines **Python, Airflow, DuckDB, MinIO and Parquet**, with explicit data-quality rules and recoverable publications.
+
+**What it answers:** how many vehicle identifiers were observed per hour, which lines were represented, and whether collection and processing produced data suitable for analysis. It does not measure timetable punctuality or every vehicle actually in service.
+
+**Status:** the pipeline and automated tests are implemented. A single-server Oracle ARM deployment has been prepared and tested; long-running operational acceptance, production hardening and a dashboard remain work in progress. There is no public dashboard or guaranteed-availability service.
+
+**Start here:** [run a demo without an API key](#demo-without-a-ztm-api-key) · [collect live data](#collect-live-data) · [data contract](docs/gold-data-contract.en.md) · [limitations](#limitations-and-next-steps)
+
+## A quick tour for reviewers
+
+| Review area | Where to look | What to verify |
+|---|---|---|
+| API collection | [ingest.py](ingest.py), [ingestion_contract.py](ingestion_contract.py) | Retries, UTC polling slots, source-linked v2 manifests, safe error summaries |
+| Data cleaning | [bronze_to_silver.py](bronze_to_silver.py) | Explicit JSON schema, GPS age/DST checks, quarantine, hourly deduplication |
+| Analytics | [silver_to_gold.py](silver_to_gold.py) | Four Gold tables, key/schema checks, cross-table reconciliation |
+| Recovery | [late_data.py](late_data.py), [dags/](dags/) | Input snapshots, missing artifacts, Gold-only repair and finalization |
+| Verification | [tests/](tests/), [CI workflow](.github/workflows/ci.yml) | Unit tests, container tests and real MinIO recovery scenarios |
+
+The engineering focus is **trustworthy results when collection is incomplete or a write fails**, rather than adding distributed tools before the workload needs them.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    API[ZTM API] -->|every 30 seconds| Ingest[Python ingestion container]
-    Ingest -->|raw JSON Lines| Bronze[MinIO Bronze bucket]
-    Bronze -->|completed UTC hour| SilverDAG[Airflow Bronze to Silver DAG]
-    SilverDAG -->|DuckDB transform| Silver[MinIO Silver bucket]
-    Silver -->|same-hour partition| GoldDAG[Airflow Silver to Gold DAG]
-    GoldDAG -->|hourly metrics and data quality| Gold[MinIO Gold bucket]
-    Bronze -. late arrivals in last 24 h .-> LateDAG[Airflow late-data DAG]
-    LateDAG -->|recompute Silver and Gold| Silver
-    LateDAG --> Gold
+    API[Warsaw Open Data API] -->|30 s| I[Python ingestion]
+    I --> B[Bronze: JSONL + cycle manifests]
+    B --> S[DuckDB: validation + deduplication]
+    S --> SP[Silver: Parquet + quarantine + completeness]
+    SP --> G[DuckDB: hourly aggregates]
+    G --> GP[Gold: four tables + commit manifest]
+    A[Airflow: hourly DAGs + shared writer pool] -.-> S
+    A -.-> G
+    R[Hourly repair: previous 24 h] -.-> SP
+    R -.-> GP
 ```
 
-Locally the data lake runs on **MinIO**, which provides an S3-compatible API.
-The pipeline has not yet been deployed or validated end to end on AWS S3.
+MinIO provides S3-compatible object storage. Airflow schedules transformations for completed UTC hours; all three writer tasks share a one-slot pool. The repair DAG runs at minute `30`, checks the previous 24 closed hours, and rebuilds only the required layers.
 
-## Tech stack
-
-| Area | Technology |
+| Component | Version / role |
 |---|---|
-| Runtime | Python 3.12 in ingestion/CI; Python 3.13 in the Airflow image |
-| Data source | UM Warszawa REST API |
-| Object storage | MinIO (S3-compatible), boto3 |
-| Orchestration | Apache Airflow 3.2.1 |
-| Transformation | DuckDB 1.2.2 |
-| Containerization | Docker, Docker Compose |
-| Data formats | JSON Lines (bronze), Parquet (silver), Hive-style partitioning |
-| Testing and linting | unittest, Ruff |
-| CI | GitHub Actions |
+| Python | 3.12 in ingestion/CI; 3.13 in the Airflow image |
+| Apache Airflow | 3.2.1; orchestration and retries |
+| DuckDB | 1.2.2; SQL transformations and Parquet |
+| MinIO / boto3 | S3-compatible storage and object operations |
+| Docker Compose | Local and single-host execution |
+| unittest / Ruff / GitHub Actions | Regression, integration and quality checks |
 
-## How to run
+## Demo without a ZTM API key
 
-### Prerequisites
+This path uses **synthetic fixtures in a separate `ztm-demo` Docker project**. It never starts the real ingestion process or calls the ZTM API. No local Python installation is needed; Docker with the Compose plugin is required. The first build downloads images and dependencies, so it is not an offline demo.
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- A free API key from [api.um.warszawa.pl](https://api.um.warszawa.pl) (register an account)
+1. Clone the repository and enter its root:
 
-### Steps
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/mati290/ZTM_data_proccesing.git
-   cd ZTM_data_proccesing
-   ```
-
-2. Create your `.env` file from the template and fill in the values:
-   ```bash
-   cp .env.example .env
-   ```
-   Keep your real API key and MinIO credentials in `.env`; never commit that file.
-   Fill in `AIRFLOW__CORE__FERNET_KEY` as well. Generate it with Python in an
-   environment containing `cryptography`, using the command in `.env.example`.
-   Keep `POLL_INTERVAL_SECONDS=30` for the documented slot calculations.
-
-   If reusing an existing Airflow metadata volume, pause the three project DAGs
-   before restarting the stack. The paused-at-creation setting below applies
-   only to DAGs Airflow discovers for the first time.
-
-3. Build and start the local stack:
-   ```bash
-   docker compose up -d --build
-   ```
-
-   Compose starts MinIO, the ingestion container, and Airflow. Ingestion creates
-   the `bronze`, `silver`, and `gold` buckets if they do not exist. Newly
-   discovered Airflow DAGs are paused by default so they cannot run before the
-   required pool is configured.
-
-4. Create the Airflow pool that serializes writes to Silver and Gold:
-   ```bash
-   docker compose exec airflow airflow pools set ztm_silver_gold_writer 1 "Serializes Silver and Gold writes"
-   ```
-
-5. Open the Airflow UI at http://localhost:8080 and unpause the
-   `bronze_to_silver_hourly`, `silver_to_gold_hourly`, and
-   `reprocess_late_data_hourly` DAGs. The first two share an hourly schedule:
-   Bronze → Silver processes a completed UTC hour, then Silver → Gold waits
-   for that hour's Silver task and builds the four Gold tables. The late-data
-   DAG runs hourly at minute 30 and recomputes eligible closed hours from the
-   last 24 hours. Gold fails on a schema mismatch or missing Silver; task
-   retries and published row counts/status are visible in Airflow.
-
-   An hour with no Bronze data *after* ingestion has started (an outage)
-   **fails** the Silver run after retries so the gap remains visible; once
-   Bronze data is available again, clear the failed run in the UI to reprocess
-   it. Hours before the first Bronze object are skipped. Hourly catchup is
-   disabled, so the DAGs do not automatically create runs for every missed
-   interval since their `start_date`; existing historical runs are not deleted.
-   MinIO's console is at http://localhost:9001.
-
-6. Check ingestion logs:
-   ```bash
-   docker compose logs -f ingestion
-   ```
-
-To stop the services, run `docker compose down`. Bronze, Silver, and Gold
-objects are kept in the `minio_data` Docker volume; Airflow metadata is kept
-in `airflow_metadata`. Do not add `-v` if you want to retain these volumes.
-This standalone Airflow configuration, including its admin authentication
-settings, is intended for local development.
-
-## Data layout and publication
-
-Bronze contains raw JSON Lines and one manifest for each cycle that reaches
-the manifest-write step:
-
-```text
-s3://bronze/vehicle_type=bus/date=YYYY-MM-DD/hour=HH/positions_<timestamp>_<uuid>.jsonl
-s3://bronze/vehicle_type=tram/date=YYYY-MM-DD/hour=HH/positions_<timestamp>_<uuid>.jsonl
-s3://bronze/_manifests/date=YYYY-MM-DD/hour=HH/cycle_<timestamp>_<uuid>.json
+```sh
+git clone https://github.com/mati290/ZTM_data_proccesing.git
+cd ZTM_data_proccesing
 ```
 
-Each record preserves the API fields and adds `_ingested_at`, the actual
-write timestamp in UTC. New data files and the cycle manifest share the
-partition of the **UTC cycle slot**, even when collection crosses an hour
-or midnight. This is an ingestion-cycle partition, not a GPS event-time
-partition. Historical objects retain their original write-time partitions.
-
-```json
-{"Lines": "180", "Lon": 21.01, "VehicleNumber": "1234", "Time": "2026-10-02 10:32:01", "Lat": 52.23, "Brigade": "3", "_ingested_at": "2026-10-02T08:32:05+00:00"}
-```
-
-Silver prepares a new version before replacing its active manifest:
-
-```text
-s3://silver/vehicle_positions/date=YYYY-MM-DD/hour=HH/_active.json
-s3://silver/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/data.parquet
-s3://silver/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/quarantine.parquet
-s3://silver/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/_completeness.json
-```
-
-Read `artifacts.data`, `artifacts.quarantine` and `artifacts.completeness`
-from `_active.json`. The manifest also records `source_inputs`: keys, ETags,
-sizes and modification times of the selected Bronze data and cycle manifests.
-If `_active.json` is absent, readers support the legacy fixed Silver paths.
-
-Gold publishes four tables:
-
-| Table | Grain |
-|---|---|
-| `vehicle_activity_hourly` | UTC partition hour, vehicle type, vehicle number |
-| `hourly_line_metrics` | UTC partition hour, vehicle type, line |
-| `hourly_network_metrics` | UTC partition hour |
-| `hourly_data_quality` | UTC partition hour |
-
-```text
-s3://gold/_commits/date=YYYY-MM-DD/hour=HH/manifest.json
-s3://gold/_versions/date=YYYY-MM-DD/hour=HH/<publication_id>/<table>/data.parquet
-s3://gold/_diagnostics/date=YYYY-MM-DD/hour=HH/manifest.json
-```
-
-The full commit manifest contains the source Silver URI, finality flag,
-and each table's URI and row count. Read the manifest once and use its
-listed files together. The commit manifest is the publication boundary;
-the quality row alone is not a commit signal. A failure before the commit
-preserves the previous manifest. Missing or empty Silver produces a separate
-quality diagnostic and a failed task, without replacing the full Gold commit.
-Both layers use `_staging/` for temporary outputs.
-
-See the [Gold data contract](docs/gold-data-contract.md) for column definitions
-and consumer rules.
-
-## Quality and completeness
-
-- Silver validates coordinates against the configured Warsaw bounding box,
-  vehicle identifiers, timestamps and GPS freshness (0 to 5 minutes).
-  Ambiguous/nonexistent Warsaw local times at DST transitions are rejected.
-- Valid observations are deduplicated within the partition by
-  `(vehicle_type, vehicle_number, gps_time_utc)`; the latest `_ingested_at`
-  wins, with additional ordering to resolve ties. Rejected records carry
-  `rejection_reason`; output row counts are reconciled before publication.
-- The default 30-second interval gives **120 expected slots per closed hour**.
-  `complete` requires at least **95% coverage (114 slots)** and at least
-  **90% complete slots among observed valid slots**. A slot is complete if
-  at least one of its manifests reports both nonempty sources.
-- Duplicate manifests do not increase slot coverage. Invalid, future,
-  misaligned or out-of-hour slots do not count. When slot metadata exists,
-  legacy manifests without a slot do not fill gaps. Only hours with no slot
-  fields use the legacy manifest-count assessment.
-- Raw manifest counts and unique slot counts are separate Gold metrics.
-  Slot counts are `NULL` for legacy manifests; missing information is not zero.
-  Missing manifests or a missing completeness marker yield `unknown`.
-- Incomplete and unknown hours may retain business metrics, with their status.
-  The intended default consumer filter is `safe_for_dashboard = TRUE`, joined
-  by partition within the same publication. Currently this requires status
-  `complete`, nonempty Silver, finality and known integrity rejection at most
-  5%. Duplicate and stale-GPS rejections are excluded from that integrity rate.
-  The marker-validation limitation below still applies.
-
-`active_vehicles` counts observed identifiers, not every vehicle actually in
-service. `active_seconds` is the span between a vehicle's first and last GPS
-observation, not measured working time. A missing hour is a gap, not zero.
-
-## Late data, recovery and finality
-
-The late-data DAG runs at minute 30 and scans closed hours in the last 24 hours.
-For new Silver publications it compares current Bronze object metadata with
-the recorded `source_inputs`, including cycle manifests. This detects arrivals
-that happened before Silver publication but after input selection. Selected
-data files are materialized once in DuckDB for quality, Silver and quarantine;
-completeness uses the selected manifest list.
-
-Changed inputs or missing required Silver artifacts trigger a Silver rebuild,
-followed by Gold. A missing Gold commit, a different source Silver URI, or
-pending finalization triggers Gold rebuilding without replacing fresh Silver.
-Legacy Silver without an input snapshot uses modification times as a fallback.
-
-`is_final` means that the build time is at least 15 minutes after the hour
-closes. It does **not** end the 24-hour correction window. Eligible nonfinal
-Gold is rebuilt on a later scan even without new Bronze data. The `:30`
-schedule means finalization need not happen exactly at `:15`.
-
-The project DAGs share a one-slot writer pool. Manual writers must also be
-serialized. Automatic repair does not cover arbitrary history beyond the
-window, and `catchup=False` does not create every missed historical DAG run.
-
-## Testing and CI
-
-For local development, use a virtual environment and the CI Ruff version:
+2. In a **separate terminal**, set these demo-only values using the block for your shell. These public placeholders are not deployment credentials. Environment variables override `.env`; close this terminal before using a live environment.
 
 ```bash
+# Bash / Linux / macOS
+export ZTM_API_KEY=demo-not-used
+export MINIO_USER=demo-user
+export MINIO_PASSWORD=demo-password
+export AIRFLOW__CORE__FERNET_KEY=MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+```
+
+```powershell
+# Windows PowerShell
+$env:ZTM_API_KEY = "demo-not-used"
+$env:MINIO_USER = "demo-user"
+$env:MINIO_PASSWORD = "demo-password"
+$env:AIRFLOW__CORE__FERNET_KEY = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+```
+
+3. Run the demo from the repository root. The following commands work in Bash and PowerShell:
+
+```sh
+docker compose -p ztm-demo build ingestion airflow
+docker compose -p ztm-demo up -d minio
+docker compose -p ztm-demo run --rm -T --no-deps -v "${PWD}/tests:/tmp/ztm-tests:ro" airflow python -B /tmp/ztm-tests/smoke_e2e.py
+docker compose -p ztm-demo run --rm -T --no-deps -v "${PWD}/tests:/tmp/ztm-tests:ro" airflow python -B /tmp/ztm-tests/pipeline_e2e.py
+```
+
+The scripts create fixtures, run Bronze → Silver → Gold, check results, and clean their test objects. Successful recovery checks finish with `PIPELINE E2E OK`. Scenarios cover incomplete/complete hours, copy and commit failures, retries, finalization, duplicate slots, lost inputs and all-rejected quarantine. See [smoke_e2e.py](tests/smoke_e2e.py) and [pipeline_e2e.py](tests/pipeline_e2e.py).
+
+**Expected:** no business data remains in the demo after successful cleanup. This is an automated demonstration, not a populated dashboard. Port `9000`/`9001` must be free on your computer. Never point these scripts at real application storage.
+
+Optional full test suite in the Airflow image, using the same demo terminal:
+
+```sh
+docker compose -p ztm-demo run --rm -T --no-deps -v "${PWD}/tests:/opt/airflow/src/tests:ro" -v "${PWD}/dags:/opt/airflow/src/dags:ro" -v "${PWD}/analysis:/opt/airflow/src/analysis:ro" -v "${PWD}/ingest.py:/opt/airflow/src/ingest.py:ro" -v "${PWD}/check_ingestion_health.py:/opt/airflow/src/check_ingestion_health.py:ro" -w /opt/airflow/src airflow python -B -m unittest discover -s tests -v
+```
+
+Remove only this disposable demo environment when finished:
+
+```sh
+docker compose -p ztm-demo down --volumes
+```
+
+`--volumes` deletes the demo volumes. Do not use it against an environment whose data you want to preserve. Interrupted smoke runs can leave a lock or fixtures; inspect them before retrying or removing a lock.
+
+## Collect live data
+
+Use a new terminal without the demo overrides. You need Docker Compose and your own key from [Warsaw Open Data](https://api.um.warszawa.pl).
+
+1. Copy `.env.example` to `.env` (`cp .env.example .env` in Bash, `Copy-Item .env.example .env` in PowerShell). Fill in `ZTM_API_KEY`, `MINIO_USER` and `MINIO_PASSWORD` (at least eight characters). Keep the file private and out of Git.
+2. Generate a Fernet key without installing Python locally:
+
+```sh
+docker run --rm --entrypoint python apache/airflow:3.2.1 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Put the generated value in `AIRFLOW__CORE__FERNET_KEY` in `.env`. This command only generates a key; it does not start the application. Docker may download the Airflow image on first use.
+
+3. Keep `POLL_INTERVAL_SECONDS=30` for the baseline configuration, then start:
+
+```sh
+docker compose up -d --build
+docker compose ps
+```
+
+Ingestion creates `bronze`, `silver` and `gold` automatically. Wait for Airflow to become healthy before running its CLI commands. On a reused metadata volume, pause the existing DAGs before upgrading; paused-at-creation only applies to new DAGs.
+
+4. Create the required pool and enable the three DAGs:
+
+```sh
+docker compose exec -T airflow airflow pools set ztm_silver_gold_writer 1 "Serializes Silver and Gold writes"
+docker compose exec -T airflow airflow dags unpause bronze_to_silver_hourly
+docker compose exec -T airflow airflow dags unpause silver_to_gold_hourly
+docker compose exec -T airflow airflow dags unpause reprocess_late_data_hourly
+```
+
+5. Inspect [Airflow](http://localhost:8080), [MinIO](http://localhost:9001) and `docker compose logs --tail=50 ingestion`. MinIO uses your `.env` credentials. With the local all-admin Airflow configuration, the UI is not a public authentication boundary. Do not publish raw standalone startup logs: they may contain generated login details.
+
+**When results appear:** collection writes Bronze immediately. Hourly DAGs process the preceding closed UTC hour. An hour first becomes eligible for `is_final` 15 minutes after closing; the repair schedule normally finalizes it at minute `30`. Starting mid-hour can leave that first hour incomplete. A missing hour is a visible gap, not zero activity.
+
+Stop with `docker compose down` to retain the data and metadata volumes. Manual rebuilds must respect the same single-writer rule as DAG tasks. The local Compose profile uses Airflow standalone/SQLite and is a development/test configuration.
+
+## Data products and correctness
+
+| Gold table | Grain | Example use |
+|---|---|---|
+| `hourly_network_metrics` | UTC collection hour | Observed vehicles, bus/tram split, position events |
+| `hourly_line_metrics` | Hour × vehicle type × line | Compare observed line activity |
+| `vehicle_activity_hourly` | Hour × vehicle type × vehicle number | Observation span, lines and coordinate bounds |
+| `hourly_data_quality` | Hour | Slot coverage, rejections, finality and current safety policy |
+
+Bronze is partitioned by the **UTC polling slot**, not GPS event time. Source GPS timestamps are interpreted in `Europe/Warsaw`; invalid, ambiguous and nonexistent local times are quarantined. Valid GPS age is 0–5 minutes, and deduplication uses `(vehicle_type, vehicle_number, gps_time_utc)` within one partition hour.
+
+At 30-second polling, a closed hour expects 120 slots. `complete` requires at least 95% coverage and 90% complete slots among observed slots. Repeated manifests do not inflate unique-slot coverage. Manifest counts and slot counts remain separate metrics.
+
+Publication entry points:
+
+```text
+silver/vehicle_positions/date=YYYY-MM-DD/hour=HH/_active.json
+gold/_commits/date=YYYY-MM-DD/hour=HH/manifest.json
+```
+
+Each points to a prepared, versioned publication. Read a Gold commit **once** and use the exact table URIs together. Do not glob all `_versions` files: that would include superseded outputs. Missing/empty Silver diagnostics do not replace a full Gold commit. Legacy layouts remain supported with additional identity and consistency checks.
+
+`safe_for_dashboard` is a **defined policy, not a completeness guarantee**. It requires sufficient evidence, complete status, nonempty Silver, finality and integrity rejections ≤5%. Duplicates and stale GPS are excluded from that integrity rate; a high stale-GPS share therefore needs separate interpretation. `is_final` does not close the correction window. See the [full data contract](docs/gold-data-contract.en.md).
+
+## Tests and validation status
+
+For local Python development:
+
+```sh
 python -m venv .venv
-# Activate .venv using the command appropriate to your shell.
+# Activate the environment for your shell, then:
 python -m pip install -r requirements.txt
 python -m pip install ruff==0.16.10
 python -m ruff check .
@@ -244,83 +182,20 @@ python -m ruff format --check .
 python -B -m unittest discover -s tests -v
 ```
 
-On Windows, `.\.venv\Scripts\python.exe` can be used directly instead of
-`python` to avoid accidentally using the system interpreter.
+On Windows you can use `.\.venv\Scripts\python.exe` instead of `python`. Local tests without Airflow intentionally skip the DAG tests; the container path above runs them too.
 
-CI runs linting, formatting and tests on Python 3.12. It also builds both
-images, checks DAG discovery and runs a Bronze → Silver → Gold smoke test
-against MinIO in the Airflow image. The six DAG-definition tests are skipped
-without Airflow; CI currently checks discovery but does not run those six
-tests inside the Airflow image.
+**Validation snapshot, 21 October 2026:** 322 tests passed inside Airflow on Linux ARM64 without skips; smoke and recovery integration scenarios also passed. Local tests passed with ten Airflow tests skipped. These are functional results, not a throughput benchmark or proof of 24/7 availability. CI builds the images, checks DAG discovery, runs the full suite inside Airflow and executes both MinIO integration scripts. See [CI runs](https://github.com/mati290/ZTM_data_proccesing/actions).
 
-The smoke test requires dedicated test storage. It refuses an occupied test
-partition, locks cooperating smoke runs and cleans its test artifacts.
-The lock does not protect against unrelated writers; an interrupted process
-can leave a lock requiring inspection before manual removal.
+## Limitations and next steps
 
-## Design decisions
+- **Operations:** external backups/restore, log/data retention, end-to-end Gold alerts and tested host recovery are not yet implemented. A Docker volume is not an off-host backup; `unhealthy` alone does not trigger a Compose restart.
+- **Deployment:** the Oracle ARM setup is a controlled single-host test. Production acceptance requires PostgreSQL metadata, measured resource/time limits and repeatable deployment/rollback. Panels remain private; public authentication/TLS and a dashboard are future work.
+- **Recovery:** default repair covers 24 hours, not arbitrary history. Changed or deleted previously used Bronze objects block rebuilding until restored. Keep raw objects immutable and retain the inputs required by corrections.
+- **Semantics:** observed vehicles are not a fleet census. Do not sum hourly distinct counts into daily uniques. `active_seconds` is an observation span, not driving time. GPS observations can recur across adjacent collection partitions.
+- **Compatibility:** S3 compatibility was tested with MinIO, not end to end on AWS S3. Cold connections install/load DuckDB `httpfs`; this remains a deployment dependency.
 
-- Preserve Bronze as append-only input so transformations can be replayed.
-- Keep polling slots and partitions in UTC; interpret source GPS time in
-  `Europe/Warsaw`, with explicit handling of ambiguous DST values.
-- Use DuckDB for hourly transformations and Parquet compaction at this scale.
-- Publish prepared versions through a single manifest instead of exposing a
-  partially replaced set of output files. Reruns replace the logical
-  publication; timestamps and physical version IDs may change.
-- Retry request failures with backoff and summarize API errors without logging
-  URLs containing the API key. Invalid payloads and empty sources are reported.
-- Keep credentials in `.env`, excluded from Git and Docker build context.
-  Airflow uses a version tag; the current MinIO image is pinned to a digest.
-- Install dependencies before copying application code to reuse Docker layers.
+Next milestones: **first real collection → backup/monitoring → production profile and recovery → 24–48 h acceptance → committed-Gold reader → dashboard → public release**. No additional Kafka/Spark/Kubernetes infrastructure is required for the current scope.
 
-## Known limitations and next fixes
+## Source and attribution
 
-- **Marker trust:** Gold validates counter types and bounds but does not yet
-  reject every contradiction between `complete` and the slot ratios. A damaged
-  marker can incorrectly allow `safe_for_dashboard = TRUE`.
-- **Gold repair:** the scan checks commit presence, source URI and finality;
-  it does not yet verify that all committed Parquet objects still exist.
-  Overwritten legacy Silver at a fixed URI is also not a reliable version signal.
-- **Input contracts:** Bronze still uses inferred JSON schema. Missing columns
-  can fail transformation. Manifest schema versions and deeper validation of
-  input snapshots and quarantine reasons remain to be implemented.
-- **Polling configuration:** use the default 30 seconds. Arbitrary intervals
-  are accepted by configuration, but expected-slot calculations do not match
-  every interval aligned to the epoch. Historical interval changes are not
-  recorded in manifests.
-- **Health and alerts:** ingestion health scans historical manifests every
-  check; it needs a bounded lookup and better handling of malformed JSON.
-  Alerts are log-based, with no external destination configured.
-- **Storage:** small Bronze files, old versions and orphan outputs have no
-  retention policy. Cleanup in `finally` cannot run after every process kill.
-  Future retention must preserve files referenced by active manifests.
-- **Consistency:** metadata listing is not a transactional storage snapshot.
-  Bronze objects are assumed append-only; concurrent manual writers bypass
-  the Airflow pool. Full input deletion and errors during repair selection
-  need additional handling.
-- **Hourly semantics:** the same GPS fix can appear in adjacent partition
-  hours; hourly counts are not a globally deduplicated event count.
-- **Scope:** no implemented dashboard, production cloud deployment, external
-  alerting or production-scale benchmark. AWS S3 has not been validated end to end.
-
-## Roadmap
-
-- [x] API ingestion, UTC cycle partitions and cycle manifests.
-- [x] Hourly Silver, quarantine, per-hour deduplication and completeness metrics.
-- [x] Four Gold tables, versioned publication and a documented data contract.
-- [x] Input snapshots, Gold recovery and finalization without new Bronze.
-- [x] Shared Airflow writer pool, unit tests, isolated smoke test and CI.
-- [ ] Tighten completeness validation and verify committed Gold artifacts.
-- [ ] Define Bronze schema, versioned metadata contracts and supported intervals.
-- [ ] Bound healthcheck cost; add backfill instructions, retention and alerts.
-- [ ] Run DAG tests in Airflow and retain recovery scenarios as repeatable tests.
-- [ ] Build a dashboard with an expected-hour axis and visible data gaps.
-- [ ] Measure a repeatable demo before considering AWS/Terraform deployment.
-
-Kafka, Spark and additional modeling tools remain optional; add them only when
-the workload justifies their operational cost.
-
-## Data source
-
-Data provided by Miasto Stołeczne Warszawa via
-[api.um.warszawa.pl](https://api.um.warszawa.pl).
+Source data: Miasto Stołeczne Warszawa, [UM Warszawa Open Data API](https://api.um.warszawa.pl). GPS snapshots describe what the upstream feed reports; availability and coverage depend on that source. No API keys, server addresses or private deployment credentials are required to review this repository.
