@@ -1970,6 +1970,26 @@ class SilverS3HelperTests(unittest.TestCase):
             CopySource={"Bucket": "silver", "Key": "a/_staging/x.pending"},
         )
 
+    def test_copy_s3_object_uses_supplied_client(self):
+        s3 = Mock()
+
+        with patch("bronze_to_silver._s3_client") as client_factory:
+            copy_s3_object(
+                "s3://silver/source/data.parquet",
+                "s3://gold/destination/data.parquet",
+                s3_client=s3,
+            )
+
+        s3.copy_object.assert_called_once_with(
+            Bucket="gold",
+            Key="destination/data.parquet",
+            CopySource={
+                "Bucket": "silver",
+                "Key": "source/data.parquet",
+            },
+        )
+        client_factory.assert_not_called()
+
     def test_s3_object_exists_uses_supplied_client(self):
         s3 = Mock()
 

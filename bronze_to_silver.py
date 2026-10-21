@@ -538,11 +538,18 @@ def s3_object_exists(s3_uri: str, s3_client=None) -> bool:
     return True
 
 
-def copy_s3_object(source_uri: str, destination_uri: str) -> None:
+def copy_s3_object(
+    source_uri: str,
+    destination_uri: str,
+    s3_client=None,
+) -> None:
     """Server-side copy: the destination is replaced in a single operation."""
     source_bucket, source_key = _parse_s3_uri(source_uri)
     destination_bucket, destination_key = _parse_s3_uri(destination_uri)
-    _s3_client().copy_object(
+    if s3_client is None:
+        s3_client = _s3_client()
+
+    s3_client.copy_object(
         Bucket=destination_bucket,
         Key=destination_key,
         CopySource={"Bucket": source_bucket, "Key": source_key},

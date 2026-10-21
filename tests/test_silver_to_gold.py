@@ -609,7 +609,7 @@ class BuildGoldHourTests(unittest.TestCase):
         ):
             self.run_build(path=silver_uri)
 
-    def run_build(self, status="complete", silver=True, path=None):
+    def run_build(self, status="complete", silver=True, path=None, s3_client=None):
         marker = {"status": status, "cycles": 60, "complete_cycles": 60}
         silver_path = path or self.path
 
@@ -651,16 +651,34 @@ class BuildGoldHourTests(unittest.TestCase):
             patch("silver_to_gold.partition_uris", side_effect=fake_uris),
             patch(
                 "silver_to_gold.publish_tables",
-                side_effect=lambda con, tables, uris: {t: 1 for t in tables},
+                side_effect=lambda con, tables, uris, s3_client=None: {
+                    t: 1 for t in tables
+                },
             ) as publish,
         ):
             try:
-                result = gold.build_gold_hour(self.con, "2026-01-15", "12", RUN_AT)
+                result = gold.build_gold_hour(
+                    self.con,
+                    "2026-01-15",
+                    "12",
+                    RUN_AT,
+                    s3_client=s3_client,
+                )
             except Exception:
                 self.publish_calls = [c.args[1] for c in publish.call_args_list]
                 raise
         self.publish_calls = [c.args[1] for c in publish.call_args_list]
+        self.publish_clients = [
+            call.kwargs.get("s3_client") for call in publish.call_args_list
+        ]
         return result
+
+    def test_build_passes_s3_client_to_publication(self):
+        s3 = Mock()
+
+        self.run_build(s3_client=s3)
+
+        self.assertEqual(self.publish_clients, [s3])
 
     def test_complete_hour_publishes_all_tables_quality_last(self):
         result = self.run_build()
@@ -727,6 +745,37 @@ class PublishTests(unittest.TestCase):
             self.assertTrue(uris["staging"][table].endswith(".parquet.pending"))
             self.assertIn("/_staging/", uris["staging"][table])
             self.assertIn(uris["publication_id"], uris["staging"][table])
+
+    def test_publish_tables_passes_s3_client_to_copy(self):
+        con = Mock()
+        con.execute.return_value.fetchone.return_value = (1,)
+        s3 = Mock()
+        table = "hourly_data_quality"
+        staging_uri = "s3://gold/_staging/test/quality.parquet.pending"
+        output_uri = "s3://gold/_versions/test/quality.parquet"
+        uris = {
+            "staging": {table: staging_uri},
+            "gold": {table: output_uri},
+        }
+
+        with (
+            patch.object(gold, "validate_staged_file"),
+            patch.object(gold, "copy_s3_object") as copy_object,
+            patch.object(gold, "delete_s3_object"),
+        ):
+            counts = gold.publish_tables(
+                con,
+                (table,),
+                uris,
+                s3_client=s3,
+            )
+
+        self.assertEqual(counts, {table: 1})
+        copy_object.assert_called_once_with(
+            staging_uri,
+            output_uri,
+            s3_client=s3,
+        )
 
     def test_partition_uris_uses_supplied_s3_client(self):
         s3 = Mock()
@@ -841,7 +890,7 @@ class LocalPipelineTestCase(unittest.TestCase):
         }
 
     @staticmethod
-    def fake_copy(src, dst):
+    def fake_copy(src, dst, s3_client=None):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(src, dst)
 
@@ -1268,11 +1317,11 @@ class GoldProcessTests(LocalPipelineTestCase):
 
         calls = []
 
-        def fail_on_second_copy(src, dst):
+        def fail_on_second_copy(src, dst, s3_client=None):
             calls.append(dst)
             if len(calls) == 2:
                 raise RuntimeError("forced publish failure")
-            self.fake_copy(src, dst)
+            self.fake_copy(src, dst, s3_client=s3_client)
 
         # Change run_at so the next publication contains different metadata.
         next_run_at = RUN_AT + timedelta(seconds=1)

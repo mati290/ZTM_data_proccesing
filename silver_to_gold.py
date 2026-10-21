@@ -684,7 +684,7 @@ def validate_staged_file(con, table: str, staged_uri: str, expected_rows: int):
         )
 
 
-def publish_tables(con, tables, uris: dict) -> dict:
+def publish_tables(con, tables, uris: dict, s3_client=None) -> dict:
     """Stage and validate all files before committing a complete Gold publication."""
     staging = uris["staging"]
     row_counts = {}
@@ -705,7 +705,11 @@ def publish_tables(con, tables, uris: dict) -> dict:
 
         # 2. Copy validated files to unique, versioned destinations.
         for table in tables:
-            copy_s3_object(staging[table], uris["gold"][table])
+            copy_s3_object(
+                staging[table],
+                uris["gold"][table],
+                s3_client=s3_client,
+            )
 
         # 3. Commit only a complete publication.
         if tuple(tables) == GOLD_TABLES:
@@ -780,7 +784,7 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     if not silver_rows:
         # Publish diagnostics separately; never replace the full Gold commit.
         diagnostic_tables = ("hourly_data_quality",)
-        row_counts = publish_tables(con, diagnostic_tables, uris)
+        row_counts = publish_tables(con, diagnostic_tables, uris, s3_client=s3_client)
         diagnostic_manifest = {
             "publication_id": uris["publication_id"],
             "partition": uris["partition"],
@@ -808,7 +812,7 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
 
     build_metric_tables(con, date_str, hour_str, completeness["status"], run_at)
     validate_gold_tables(con, GOLD_TABLES)
-    row_counts = publish_tables(con, GOLD_TABLES, uris)
+    row_counts = publish_tables(con, GOLD_TABLES, uris, s3_client=s3_client)
 
     if completeness["status"] != "complete":
         logger.warning(
