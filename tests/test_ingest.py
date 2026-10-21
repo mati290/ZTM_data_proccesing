@@ -20,6 +20,13 @@ from ingest import (
 )
 
 
+def saved_source(_s3, _records, label, *, cycle_slot_start):
+    return {
+        "key": f"vehicle_type={label}/date={cycle_slot_start:%Y-%m-%d}/hour={cycle_slot_start:%H}/test.jsonl",
+        "size": 1,
+    }
+
+
 class GetSlotStartTests(unittest.TestCase):
     def test_aligns_timestamp_to_utc_slot(self):
         timestamp = datetime(2026, 10, 8, 12, 0, 47, tzinfo=timezone.utc)
@@ -246,7 +253,7 @@ class SaveToBronzeTests(unittest.TestCase):
     def test_run_once_reports_empty_successful_api_responses(self):
         with (
             patch("ingest.fetch_positions", side_effect=[[], []]),
-            patch("ingest.save_to_bronze") as save_mock,
+            patch("ingest.save_to_bronze", side_effect=saved_source) as save_mock,
         ):
             result = run_once("test-key", Mock())
 
@@ -268,7 +275,7 @@ class SaveToBronzeTests(unittest.TestCase):
                 "ingest.fetch_positions",
                 side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]],
             ),
-            patch("ingest.save_to_bronze") as save_mock,
+            patch("ingest.save_to_bronze", side_effect=saved_source) as save_mock,
         ):
             result = run_once("test-key", Mock())
 
@@ -289,7 +296,7 @@ class SaveToBronzeTests(unittest.TestCase):
         s3 = Mock()
         with (
             patch("ingest.fetch_positions", side_effect=[bus_records, Timeout()]),
-            patch("ingest.save_to_bronze") as save_mock,
+            patch("ingest.save_to_bronze", side_effect=saved_source) as save_mock,
         ):
             result = run_once("test-key", s3)
 
@@ -330,7 +337,7 @@ class SaveToBronzeTests(unittest.TestCase):
                     [{"VehicleNumber": "2"}],
                 ],
             ),
-            patch("ingest.save_to_bronze"),
+            patch("ingest.save_to_bronze", side_effect=saved_source),
             self.assertRaises(ClientError),
         ):
             run_once("test-key", s3)
@@ -342,12 +349,12 @@ class SaveToBronzeTests(unittest.TestCase):
                 "ingest.fetch_positions",
                 side_effect=[[{"VehicleNumber": "1"}], [{"VehicleNumber": "2"}]],
             ),
-            patch("ingest.save_to_bronze"),
+            patch("ingest.save_to_bronze", side_effect=saved_source),
         ):
             run_once("test-key", s3)
 
         manifest = json.loads(s3.put_object.call_args.kwargs["Body"])
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["status"], "complete")
         self.assertIn("cycle_started_at", manifest)
         datetime.fromisoformat(manifest["cycle_started_at"])

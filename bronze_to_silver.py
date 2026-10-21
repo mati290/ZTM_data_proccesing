@@ -13,6 +13,8 @@ import duckdb
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
+from ingestion_contract import validate_cycle_manifest
+
 logging.Formatter.converter = time.gmtime
 logging.basicConfig(
     level=logging.INFO,
@@ -777,92 +779,6 @@ def expected_slots_elapsed(
     return max(0, last_slot - first_slot + 1)
 
 
-def validate_cycle_manifest(manifest: dict) -> None:
-    if "schema_version" in manifest:
-        version = manifest["schema_version"]
-        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
-            raise ValueError("Cycle manifest has an unsupported schema_version")
-        required_fields = {
-            "status",
-            "buses",
-            "trams",
-            "failed_sources",
-            "empty_sources",
-            "ingested_at",
-            "cycle_started_at",
-            "cycle_slot_start",
-        }
-        missing_fields = required_fields - manifest.keys()
-        if missing_fields:
-            raise ValueError(
-                f"Cycle manifest is missing required fields: {sorted(missing_fields)}"
-            )
-        for field in (
-            "ingested_at",
-            "cycle_started_at",
-            "cycle_slot_start",
-        ):
-            try:
-                timestamp = datetime.fromisoformat(manifest[field])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Cycle manifest has an invalid {field}") from exc
-            if timestamp.tzinfo is None:
-                raise ValueError(f"Cycle manifest {field} must be timezone-aware")
-    status = manifest.get("status")
-    if status not in ("complete", "partial"):
-        raise ValueError("Cycle manifest has an invalid status")
-
-    has_buses = "buses" in manifest
-    has_trams = "trams" in manifest
-    if has_buses != has_trams:
-        raise ValueError("Cycle manifest must contain both source counters")
-
-    if has_buses:
-        for field in ("buses", "trams"):
-            value = manifest[field]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"Cycle manifest has an invalid {field} count")
-
-        expected_status = (
-            "complete" if manifest["buses"] > 0 and manifest["trams"] > 0 else "partial"
-        )
-        if status != expected_status:
-            raise ValueError("Cycle manifest status conflicts with source counts")
-
-    has_failed = "failed_sources" in manifest
-    has_empty = "empty_sources" in manifest
-    if not has_failed and not has_empty:
-        return
-    if has_failed != has_empty:
-        raise ValueError("Cycle manifest must contain both sources lists")
-
-    for field in ("failed_sources", "empty_sources"):
-        values = manifest[field]
-        if not isinstance(values, list) or any(
-            not isinstance(source, str) or source not in ("bus", "tram")
-            for source in values
-        ):
-            raise ValueError(f"Cycle manifest has invalid {field}")
-        if len(values) != len(set(values)):
-            raise ValueError(f"Cycle manifest has duplicate {field}")
-
-    failed = set(manifest["failed_sources"])
-    empty = set(manifest["empty_sources"])
-    if failed & empty:
-        raise ValueError("Cycle manifest sources lists overlap")
-
-    if has_buses:
-        expected_missing = {
-            source
-            for source, field in (("bus", "buses"), ("tram", "trams"))
-            if manifest[field] == 0
-        }
-        if failed | empty != expected_missing:
-            raise ValueError("Cycle manifest sources conflict with source counts")
-    elif status == "complete" and (failed or empty):
-        raise ValueError("Cycle manifest sources conflict with complete status")
-
-
 def assess_completeness(
     date_str: str,
     hour_str: str,
@@ -894,6 +810,9 @@ def assess_completeness(
         ]
 
     complete = 0
+    recorded_intervals: set[int] = set()
+    manifest_sources = []
+    legacy_slot_policy = False
     slot_statuses: dict[str, list[bool]] = {}
     has_slot_metadata = False
     for key in keys:
@@ -902,6 +821,15 @@ def assess_completeness(
         if not isinstance(manifest, dict):
             raise TypeError("Cycle manifest must be a JSON object")
         validate_cycle_manifest(manifest)
+        if manifest.get("schema_version") == 2:
+            recorded_intervals.add(manifest["poll_interval_seconds"])
+            manifest_sources.extend(
+                source
+                for source in manifest["source_objects"].values()
+                if source is not None
+            )
+        elif "cycle_slot_start" in manifest:
+            legacy_slot_policy = True
 
         if manifest.get("status") == "complete":
             complete += 1
@@ -916,8 +844,42 @@ def assess_completeness(
             )
 
     total = len(keys)
-    if poll_interval_seconds is None:
-        poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+    if len(recorded_intervals) > 1 or (
+        legacy_slot_policy and recorded_intervals and recorded_intervals != {30}
+    ):
+        raise ValueError("Mixed poll intervals in one hour require explicit migration")
+    if recorded_intervals:
+        recorded_interval = next(iter(recorded_intervals))
+        if (
+            poll_interval_seconds is not None
+            and poll_interval_seconds != recorded_interval
+        ):
+            raise ValueError("Requested poll interval conflicts with recorded interval")
+        poll_interval_seconds = recorded_interval
+    elif poll_interval_seconds is None:
+        # Historical manifests were produced with the documented 30-second policy.
+        # Changing today's environment must not silently reinterpret history.
+        poll_interval_seconds = 30
+
+    if manifest_sources:
+        available = {
+            obj["key"]: obj
+            for obj in (
+                source_inputs
+                if source_inputs is not None
+                else capture_bronze_inputs(date_str, hour_str, s3_client)
+            )
+        }
+        for source in manifest_sources:
+            current = available.get(source["key"])
+            if current is None or any(
+                source.get(field) != current.get(field)
+                for field in ("size", "etag")
+                if field in source
+            ):
+                raise ValueError(
+                    f"Bronze source object missing or changed: {source['key']}"
+                )
 
     expected_cycles = expected_slots_elapsed(
         date_str,
@@ -1014,13 +976,17 @@ def write_completeness_marker(
     )
 
 
-def read_completeness_marker(date_str: str, hour_str: str, s3_client=None) -> dict:
+def read_completeness_marker(
+    date_str: str, hour_str: str, s3_client=None, *, marker_uri: str | None = None
+) -> dict:
     """Read the active completeness marker, with legacy-path fallback."""
     date_str, hour_str = validate_partition(date_str, hour_str)
     s3_client = s3_client or _s3_client()
 
-    artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client)
-    bucket, key = _parse_s3_uri(artifacts["completeness"])
+    if marker_uri is None:
+        artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client)
+        marker_uri = artifacts["completeness"]
+    bucket, key = _parse_s3_uri(marker_uri)
 
     try:
         body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -1086,6 +1052,15 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
         )
 
     source_inputs = capture_bronze_inputs(date_str, hour_str, s3_client=s3_client)
+    recorded_inputs = read_silver_source_inputs(date_str, hour_str, s3_client)
+    if recorded_inputs is not None:
+        current_by_key = {obj["key"]: obj for obj in source_inputs}
+        for recorded in recorded_inputs:
+            if current_by_key.get(recorded["key"]) != recorded:
+                raise ValueError(
+                    "Previously published Bronze input was removed or changed: "
+                    f"{recorded['key']}; restore the input before rebuilding"
+                )
     data_files = [
         f"s3://bronze/{obj['key']}"
         for obj in source_inputs
@@ -1106,6 +1081,10 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
         invalid_gps_time,
         after,
     ) = con.execute(quality_sql).fetchone()
+    if before == 0:
+        raise BronzeDataMissingError(
+            "Bronze files contain no records; refusing publication"
+        )
     if before > 0 and after == 0:
         diagnostic_file = (
             f"s3://silver/_diagnostics/{partition}/{publication_id}/quarantine.parquet"

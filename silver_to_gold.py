@@ -161,6 +161,7 @@ def partition_uris(date_str: str, hour_str: str, s3_client=None) -> dict:
     return {
         "silver": silver_artifacts["data"],
         "quarantine": silver_artifacts["quarantine"],
+        "completeness": silver_artifacts.get("completeness"),
         "gold": {
             table: (
                 f"s3://gold/_versions/{partition}/{publication_id}/{table}/data.parquet"
@@ -235,13 +236,20 @@ def _non_negative_int(marker: dict, field: str):
     return value
 
 
-def load_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
+def load_completeness(
+    date_str: str, hour_str: str, s3_client=None, *, marker_uri: str | None = None
+) -> dict:
     """Read and validate the Silver completeness marker.
 
     A missing marker yields status 'unknown' with unknown (None) counters, which
     is distinct from a real marker that reports zero cycles.
     """
-    marker = read_completeness_marker(date_str, hour_str, s3_client)
+    if marker_uri is None:
+        marker = read_completeness_marker(date_str, hour_str, s3_client)
+    else:
+        marker = read_completeness_marker(
+            date_str, hour_str, s3_client, marker_uri=marker_uri
+        )
     status = marker.get("status")
     if status not in COMPLETENESS_STATUSES:
         raise ValueError(f"Completeness marker has invalid status: {status!r}")
@@ -264,6 +272,12 @@ def load_completeness(date_str: str, hour_str: str, s3_client=None) -> dict:
 
     if (observed_slots is None) != (complete_slots is None):
         raise ValueError("Completeness marker must have both slot counters or none")
+
+    if status == "complete" and observed_slots is None:
+        if not cycles or complete_cycles / cycles < MIN_COMPLETE_CYCLE_RATIO:
+            raise ValueError("Complete legacy marker lacks sufficient complete cycles")
+        if not expected_cycles or cycles / expected_cycles < MIN_CYCLE_COVERAGE_RATIO:
+            raise ValueError("Complete legacy marker lacks sufficient cycle coverage")
 
     if observed_slots is not None:
         if expected_cycles is None:
@@ -565,8 +579,21 @@ def build_quality_table(
         if silver_rows is not None
         else f"CAST(NULL AS {TSTZ})"
     )
+    expected = completeness.get("expected_cycles")
+    observed = completeness.get("observed_slots")
+    complete = completeness.get("complete_slots")
+    if observed is None:
+        observed, complete = cycles, complete_cycles
+    complete_evidence = bool(
+        expected
+        and observed
+        and complete is not None
+        and observed / expected >= MIN_CYCLE_COVERAGE_RATIO
+        and complete / observed >= MIN_COMPLETE_CYCLE_RATIO
+    )
     safe = (
         f"{'TRUE' if completeness['status'] == 'complete' else 'FALSE'} "
+        f"AND {'TRUE' if complete_evidence else 'FALSE'} "
         f"AND {final} "
         f"AND {'TRUE' if silver_rows else 'FALSE'} "
         "AND integrity_rejection_pct IS NOT NULL "
@@ -735,6 +762,7 @@ def publish_tables(con, tables, uris: dict, s3_client=None) -> dict:
                 "partition": uris["partition"],
                 "source_silver_uri": uris["silver"],
                 "source_silver_etag": uris.get("source_silver_etag"),
+                "source_silver_identity": uris.get("source_silver_identity"),
                 "is_final": is_final,
                 "tables": {
                     table: {
@@ -767,6 +795,31 @@ def publish_tables(con, tables, uris: dict, s3_client=None) -> dict:
     return row_counts
 
 
+def silver_artifact_identity(artifacts: dict, s3_client) -> dict:
+    """Fingerprint every mutable legacy input, including absent optional files."""
+    identity = {}
+    for name in ("data", "quarantine", "completeness"):
+        uri = artifacts.get(name)
+        if uri is None:
+            identity[name] = None
+            continue
+        bucket, key = _parse_s3_uri(uri)
+        try:
+            metadata = s3_client.head_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("NoSuchKey", "404", "NotFound") or status == 404:
+                identity[name] = None
+                continue
+            raise
+        etag = metadata.get("ETag")
+        if not isinstance(etag, str) or not etag:
+            raise ValueError(f"Legacy Silver {name} object is missing a valid ETag")
+        identity[name] = etag
+    return identity
+
+
 def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dict:
     """Build and publish all Gold tables for one UTC hour; safe to re-run."""
     date_str, hour_str = validate_partition(date_str, hour_str)
@@ -776,24 +829,45 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     run_at = run_at.astimezone(timezone.utc)
     uris = partition_uris(date_str, hour_str, s3_client=s3_client)
 
-    completeness = load_completeness(date_str, hour_str, s3_client)
     silver_present = s3_object_exists(uris["silver"], s3_client=s3_client)
     quarantine_present = s3_object_exists(uris["quarantine"], s3_client=s3_client)
     legacy_key = f"vehicle_positions/{uris['partition']}/data.parquet"
     if silver_present and uris["silver"] == f"s3://silver/{legacy_key}":
         source_client = s3_client or _s3_client()
-        source_metadata = source_client.head_object(
-            Bucket="silver",
-            Key=legacy_key,
+        identity = silver_artifact_identity(
+            {
+                "data": uris["silver"],
+                "quarantine": uris["quarantine"],
+                "completeness": uris.get("completeness"),
+            },
+            source_client,
         )
-        source_etag = source_metadata.get("ETag")
+        uris["source_silver_identity"] = identity
+        source_etag = identity["data"]
         if not isinstance(source_etag, str) or not source_etag:
             raise ValueError("Legacy Silver object is missing a valid ETag")
         uris["source_silver_etag"] = source_etag
 
+    completeness = load_completeness(
+        date_str, hour_str, s3_client, marker_uri=uris.get("completeness")
+    )
+
     silver_rows = load_silver_hour(con, uris["silver"]) if silver_present else None
     if quarantine_present:
         load_quarantine_hour(con, uris["quarantine"])
+    if "source_silver_identity" in uris:
+        current_identity = silver_artifact_identity(
+            {
+                "data": uris["silver"],
+                "quarantine": uris["quarantine"],
+                "completeness": uris.get("completeness"),
+            },
+            source_client,
+        )
+        if current_identity != uris["source_silver_identity"]:
+            raise ValueError(
+                "Legacy Silver inputs changed while reading; retry the build"
+            )
 
     build_quality_table(
         con,

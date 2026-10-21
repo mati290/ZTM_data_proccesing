@@ -12,6 +12,8 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
+from ingestion_contract import validate_cycle_manifest
+
 logging.Formatter.converter = time.gmtime
 logging.basicConfig(
     level=logging.INFO,
@@ -75,14 +77,14 @@ def fetch_positions(vehicle_type, api_key, max_attempts=3):
 
 def save_to_bronze(
     s3, records, vehicle_label, cycle_slot_start: datetime | None = None
-):
+) -> dict | None:
     if not records:
         logger.warning(f"No records fetched for vehicle type {vehicle_label}")
         return
 
     ingested_at = datetime.now(timezone.utc)
     partition_time = cycle_slot_start or ingested_at
-    if partition_time.tzinfo is None:
+    if partition_time.tzinfo is None or partition_time.utcoffset() is None:
         raise ValueError("cycle_slot_start must be timezone-aware")
     partition_time = partition_time.astimezone(timezone.utc)
 
@@ -104,9 +106,14 @@ def save_to_bronze(
 
     body = "\n".join(lines)
 
-    s3.put_object(Bucket="bronze", Key=key, Body=body.encode("utf-8"))
+    encoded = body.encode("utf-8")
+    response = s3.put_object(Bucket="bronze", Key=key, Body=encoded)
 
     logger.info(f"Zapisano {len(records)} rekordów do s3://bronze/{key}")
+    metadata = {"key": key, "size": len(encoded)}
+    if isinstance(response.get("ETag"), str) and response["ETag"]:
+        metadata["etag"] = response["ETag"]
+    return metadata
 
 
 def ensure_bucket(s3, buckets=("bronze", "silver", "gold")):
@@ -163,7 +170,9 @@ def write_cycle_manifest(
     empty_sources,
     cycle_started_at,
     cycle_slot_start,
-):
+    source_objects: dict | None = None,
+    poll_interval_seconds: int | None = None,
+) -> None:
     """Record whether a cycle fetched both sources, so Silver can flag partial hours."""
     now = datetime.now(timezone.utc)
     complete = bus_count > 0 and tram_count > 0
@@ -178,6 +187,13 @@ def write_cycle_manifest(
         "failed_sources": failed_sources,
         "empty_sources": empty_sources,
     }
+    if source_objects is not None:
+        manifest.update(
+            schema_version=2,
+            source_objects=source_objects,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+    validate_cycle_manifest(manifest)
     partition_time = cycle_slot_start.astimezone(timezone.utc)
     key = (
         f"_manifests/date={partition_time.strftime('%Y-%m-%d')}/"
@@ -236,10 +252,15 @@ def run_once(api_key, s3):
         "Fetched %s buses and %s trams (%s total)", len(buses), len(trams), total
     )
 
+    source_objects = {"bus": None, "tram": None}
     if buses:
-        save_to_bronze(s3, buses, "bus", cycle_slot_start=cycle_slot_start)
+        source_objects["bus"] = save_to_bronze(
+            s3, buses, "bus", cycle_slot_start=cycle_slot_start
+        )
     if trams:
-        save_to_bronze(s3, trams, "tram", cycle_slot_start=cycle_slot_start)
+        source_objects["tram"] = save_to_bronze(
+            s3, trams, "tram", cycle_slot_start=cycle_slot_start
+        )
 
     write_cycle_manifest(
         s3,
@@ -249,6 +270,8 @@ def run_once(api_key, s3):
         empty_sources,
         cycle_started_at,
         cycle_slot_start,
+        source_objects=source_objects,
+        poll_interval_seconds=poll_interval_seconds,
     )
 
     return {

@@ -299,7 +299,7 @@ class CompletenessTests(unittest.TestCase):
                     bronze_to_silver.validate_cycle_manifest(manifest)
 
     def test_cycle_manifest_rejects_invalid_schema_version(self):
-        for version in (None, True, 0, -1, "1", 1.0, 2):
+        for version in (None, True, 0, -1, "1", 1.0, 999):
             with self.subTest(version=version):
                 manifest = {
                     "schema_version": version,
@@ -1263,6 +1263,7 @@ class BronzeToSilverSqlTests(unittest.TestCase):
                     return_value=[],
                 ),
                 patch("bronze_to_silver.materialize_bronze_inputs"),
+                patch("bronze_to_silver.read_silver_source_inputs", return_value=None),
                 patch("bronze_to_silver.write_silver_active_manifest") as activate,
                 self.assertRaisesRegex(ValueError, "No valid Silver rows"),
             ):
@@ -1538,6 +1539,7 @@ class BronzeToSilverSqlTests(unittest.TestCase):
 
 class TransformHourTests(unittest.TestCase):
     def setUp(self):
+        patch("bronze_to_silver.read_silver_source_inputs", return_value=None).start()
         self.completeness = {"status": "complete", "cycles": 10, "complete_cycles": 10}
         self.assess_mock = patch(
             "bronze_to_silver.assess_completeness", return_value=self.completeness

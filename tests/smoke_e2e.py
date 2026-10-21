@@ -14,9 +14,11 @@ confirming that no smoke test is running and inspecting leftover test data.
 import json
 import os
 import sys
+import time
 
 import boto3
 import duckdb
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 sys.path.insert(0, "/opt/airflow/src")
@@ -79,6 +81,7 @@ def test_partition_prefixes(date_str: str, hour_str: str) -> list[tuple[str, str
         ),
         ("silver", f"_versions/date={date_str}/hour={hour_str}/"),
         ("silver", f"_staging/date={date_str}/hour={hour_str}/"),
+        ("silver", f"_diagnostics/date={date_str}/hour={hour_str}/"),
         ("gold", f"_versions/date={date_str}/hour={hour_str}/"),
         ("gold", f"_staging/date={date_str}/hour={hour_str}/"),
         ("gold", f"_commits/date={date_str}/hour={hour_str}/"),
@@ -99,22 +102,41 @@ def assert_test_partition_empty(s3, date_str: str, hour_str: str):
             )
 
 
-def main():
+def wait_for_storage(s3, timeout_seconds: float = 60) -> set[str]:
+    """Bound startup retries; authentication failures must fail immediately."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            return {bucket["Name"] for bucket in s3.list_buckets()["Buckets"]}
+        except (BotoCoreError, ClientError) as exc:
+            if isinstance(exc, ClientError):
+                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if status not in (429, 500, 502, 503, 504):
+                    raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "MinIO did not become ready before the deadline"
+                ) from exc
+            time.sleep(1)
+
+
+def main(run_test=None):
     s3 = boto3.client(
         "s3",
         endpoint_url=os.environ["S3_ENDPOINT_URL"],
         aws_access_key_id=os.environ["MINIO_USER"],
         aws_secret_access_key=os.environ["MINIO_PASSWORD"],
+        config=Config(connect_timeout=2, read_timeout=2, retries={"max_attempts": 0}),
     )
 
-    existing = {b["Name"] for b in s3.list_buckets()["Buckets"]}
+    existing = wait_for_storage(s3)
     for bucket in ("bronze", "silver", "gold"):
         if bucket not in existing:
             s3.create_bucket(Bucket=bucket)
 
     acquire_smoke_lock(s3)
     try:
-        run_smoke_test(s3)
+        (run_test or run_smoke_test)(s3)
     finally:
         primary_error = sys.exc_info()[1]
         try:
@@ -129,16 +151,19 @@ def main():
                 raise
 
 
-def run_smoke_test(s3) -> None:
+def run_smoke_test(s3, scenario=None) -> None:
     assert_test_partition_empty(s3, DATE, HOUR)
 
     con = None
     try:
+        con = bronze_to_silver.get_connection()
+        if scenario is not None:
+            scenario(con, s3)
+            return
         key = f"vehicle_type=bus/date={DATE}/hour={HOUR}/smoke.jsonl"
         body = "\n".join(json.dumps(r) for r in build_records())
         s3.put_object(Bucket="bronze", Key=key, Body=body.encode())
 
-        con = bronze_to_silver.get_connection()
         bronze_to_silver.transform_hour(con, DATE, HOUR)
 
         import silver_to_gold

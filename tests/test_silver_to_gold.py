@@ -43,6 +43,7 @@ def build_all(con, path, status="complete", cycles=(60, 60), reasons=("b", "a", 
         "status": status,
         "cycles": cycles[0],
         "complete_cycles": cycles[1],
+        "expected_cycles": cycles[0],
     }
     con.execute(
         "CREATE OR REPLACE TEMP TABLE quarantine_hour (rejection_reason VARCHAR)"
@@ -625,7 +626,7 @@ class BuildGoldHourTests(unittest.TestCase):
 
         def load_after_capture(connection, uri):
             self.assertEqual(uri, silver_uri)
-            s3.head_object.assert_called_once_with(
+            s3.head_object.assert_any_call(
                 Bucket="silver",
                 Key=silver_key,
             )
@@ -643,7 +644,12 @@ class BuildGoldHourTests(unittest.TestCase):
     def run_build(
         self, status="complete", silver=True, path=None, s3_client=None, run_at=RUN_AT
     ):
-        marker = {"status": status, "cycles": 60, "complete_cycles": 60}
+        marker = {
+            "status": status,
+            "cycles": 60,
+            "complete_cycles": 60,
+            "expected_cycles": 60,
+        }
         silver_path = path or self.path
 
         def fake_uris(date_str, hour_str, s3_client=None):
@@ -1021,7 +1027,12 @@ class LocalPipelineTestCase(unittest.TestCase):
 
     def build(self, run_at=RUN_AT, validate=None, copy_fn=None, manifest_fn=None):
         os.makedirs(f"{self.root}/staging", exist_ok=True)
-        marker = {"status": self.status, "cycles": 60, "complete_cycles": 60}
+        marker = {
+            "status": self.status,
+            "cycles": 60,
+            "complete_cycles": 60,
+            "expected_cycles": 60,
+        }
         with contextlib.ExitStack() as stack:
             stack.enter_context(
                 patch(

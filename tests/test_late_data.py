@@ -571,6 +571,11 @@ def gold_manifest(silver_uri: str, is_final: bool = True) -> dict:
         "publication_id": publication_id,
         "partition": partition,
         "source_silver_uri": silver_uri,
+        "source_silver_identity": {
+            "data": '"fixture-etag"',
+            "quarantine": '"fixture-etag"',
+            "completeness": '"fixture-etag"',
+        },
         "source_silver_etag": (
             '"fixture-etag"'
             if silver_uri.startswith("s3://silver/vehicle_positions/")
@@ -641,6 +646,7 @@ class StaleGoldTests(unittest.TestCase):
         silver_key = "vehicle_positions/date=2026-01-15/hour=12/data.parquet"
         silver_uri = f"s3://silver/{silver_key}"
         manifest = gold_manifest(silver_uri)
+        manifest["source_silver_identity"].update(quarantine=None, completeness=None)
         objects = gold_publication_objects(manifest)
         objects[("silver", silver_key)] = NOW
         s3 = FakeS3(objects)

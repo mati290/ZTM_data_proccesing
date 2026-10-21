@@ -68,15 +68,24 @@ jobs:
       - name: Verify the Airflow image includes transformation dependencies
         run: docker compose run --rm --no-deps airflow python -c "import bronze_to_silver, silver_to_gold"
 
-      - name: Run DAG and healthcheck tests inside Airflow
+      - name: Run full test suite inside Airflow
         run: |
           docker compose run --rm -T --no-deps \
             -v "$PWD/tests:/opt/airflow/src/tests:ro" \
             -v "$PWD/dags:/opt/airflow/src/dags:ro" \
+            -v "$PWD/ingest.py:/opt/airflow/src/ingest.py:ro" \
+            -v "$PWD/check_ingestion_health.py:/opt/airflow/src/check_ingestion_health.py:ro" \
             -w /opt/airflow/src \
-            airflow python -B -m unittest tests.test_dags tests.test_airflow_health -v
+            airflow python -B -m unittest discover -s tests -v
       - name: End-to-end smoke test (MinIO -> Silver on production DuckDB)
         run: |
           docker compose up -d minio
-          sleep 10
-          docker compose run --rm --no-deps -v "$PWD/tests/smoke_e2e.py:/tmp/smoke_e2e.py" airflow python /tmp/smoke_e2e.py
+          docker compose run --rm -T --no-deps -v "$PWD/tests/smoke_e2e.py:/tmp/smoke_e2e.py:ro" airflow python -B /tmp/smoke_e2e.py
+      - name: Recovery, completeness and finalization integration tests
+        run: |
+          docker compose run --rm -T --no-deps \
+            -v "$PWD/tests:/tmp/ztm-tests:ro" \
+            airflow python -B /tmp/ztm-tests/pipeline_e2e.py
+      - name: Container diagnostics after failure
+        if: failure()
+        run: docker compose logs --no-color --tail=150

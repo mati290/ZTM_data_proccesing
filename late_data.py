@@ -116,6 +116,10 @@ def is_gold_stale(
 ) -> bool:
     """Check whether Gold references the currently active Silver data."""
     date_str, hour_str = validate_partition(date_str, hour_str)
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.astimezone(timezone.utc)
     artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
     manifest_uri = silver_to_gold.publication_manifest_uri(date_str, hour_str)
     bucket, key = _parse_s3_uri(manifest_uri)
@@ -145,22 +149,12 @@ def is_gold_stale(
         if not isinstance(recorded_etag, str) or not recorded_etag:
             return True
 
-        try:
-            source_metadata = s3_client.head_object(
-                Bucket="silver",
-                Key=legacy_key,
-            )
-        except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code")
-            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
-                return True
-            raise
-
-        current_etag = source_metadata.get("ETag")
-        if not isinstance(current_etag, str) or not current_etag:
-            raise ValueError("Legacy Silver object is missing a valid ETag")
-        if recorded_etag != current_etag:
+        identity = manifest.get("source_silver_identity")
+        if not isinstance(identity, dict):
+            # Existing legacy commits are rebuilt once to record all input identities.
+            return True
+        current_identity = silver_to_gold.silver_artifact_identity(artifacts, s3_client)
+        if current_identity["data"] != recorded_etag or identity != current_identity:
             return True
     tables = manifest.get("tables")
     if not isinstance(tables, dict):
@@ -194,10 +188,6 @@ def is_gold_stale(
             if error_code in ("NoSuchKey", "404", "NotFound") or status == 404:
                 return True
             raise
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        raise ValueError("now must be timezone-aware")
-
     return manifest.get("is_final") is not True and silver_to_gold.is_hour_final(
         date_str, hour_str, now
     )
@@ -268,8 +258,8 @@ def recompute_hour(con, date_str, hour_str, run_at=None, s3_client=None):
 def reprocess_late_data(
     now=None, window_hours=CORRECTION_WINDOW_HOURS, s3_client=None, con=None
 ) -> dict:
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     now = now.astimezone(timezone.utc)
     stale = find_stale_hours(now, window_hours, s3_client)

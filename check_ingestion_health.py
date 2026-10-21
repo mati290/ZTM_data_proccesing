@@ -8,6 +8,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from ingestion_contract import validate_cycle_manifest
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_AGE_SECONDS = 120
@@ -28,14 +30,20 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
         paginator = s3.get_paginator("list_objects_v2")
         latest = None
 
-        first_date = min(
-            (now - timedelta(seconds=max_age_seconds)).date(),
-            (now - timedelta(days=1)).date(),
-        )
-        scan_date = now.date()
+        # The normal two-minute check needs at most two hourly prefixes.
+        # Longer custom windows use daily pagination instead of many hourly calls.
+        hourly = max_age_seconds <= 3600
+        step = timedelta(hours=1) if hourly else timedelta(days=1)
+        start = now - timedelta(seconds=max_age_seconds)
+        boundary = {"minute": 0, "second": 0, "microsecond": 0}
+        if not hourly:
+            boundary["hour"] = 0
+        scan_time, first_time = now.replace(**boundary), start.replace(**boundary)
 
-        while scan_date >= first_date:
-            prefix = f"{MANIFEST_PREFIX}date={scan_date.isoformat()}/"
+        while scan_time >= first_time:
+            prefix = f"{MANIFEST_PREFIX}date={scan_time:%Y-%m-%d}/"
+            if hourly:
+                prefix += f"hour={scan_time:%H}/"
             for page in paginator.paginate(
                 Bucket="bronze",
                 Prefix=prefix,
@@ -45,7 +53,7 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
                     if latest is None or modified > latest["LastModified"]:
                         latest = obj
 
-            scan_date -= timedelta(days=1)
+            scan_time -= step
 
         if latest is None:
             return False, "No Bronze cycle manifests found"
@@ -68,6 +76,8 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
         manifest = json.loads(body)
         if not isinstance(manifest, dict):
             return False, "Latest Bronze manifest must be a JSON object"
+
+        validate_cycle_manifest(manifest)
 
         status = manifest.get("status")
 
@@ -104,9 +114,9 @@ def main():
         aws_access_key_id=os.getenv("MINIO_USER"),
         aws_secret_access_key=os.getenv("MINIO_PASSWORD"),
         config=Config(
-            connect_timeout=5,
-            read_timeout=15,
-            retries={"mode": "standard", "max_attempts": 3},
+            connect_timeout=2,
+            read_timeout=3,
+            retries={"mode": "standard", "max_attempts": 0},
         ),
     )
 

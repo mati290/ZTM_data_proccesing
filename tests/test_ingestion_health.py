@@ -25,7 +25,7 @@ class IngestionHealthTests(unittest.TestCase):
         self.assertIn("timezone-aware", message)
         self.assertEqual(self.s3.mock_calls, [])
 
-    def test_check_uses_utc_dates_for_offset_timestamp(self):
+    def test_check_uses_utc_hours_for_offset_timestamp(self):
         self.now = datetime(2026, 10, 13, 23, 59, 30, tzinfo=timezone.utc)
         self.set_manifest(30)
         local_now = self.now.astimezone(timezone(timedelta(hours=2)))
@@ -44,8 +44,7 @@ class IngestionHealthTests(unittest.TestCase):
         self.assertEqual(
             prefixes,
             {
-                "_manifests/date=2026-10-13/",
-                "_manifests/date=2026-10-12/",
+                "_manifests/date=2026-10-13/hour=23/",
             },
         )
 
@@ -91,13 +90,13 @@ class IngestionHealthTests(unittest.TestCase):
             )
         }
 
-    def test_scan_is_limited_to_recent_utc_dates(self):
+    def test_scan_is_limited_to_recent_utc_hours_across_midnight(self):
         self.now = datetime(2026, 10, 14, 0, 0, 30, tzinfo=timezone.utc)
         key = "_manifests/date=2026-10-13/hour=23/cycle_test.json"
 
         def list_partition(*, Bucket, Prefix):
             self.assertEqual(Bucket, "bronze")
-            if Prefix == "_manifests/date=2026-10-13/":
+            if Prefix == "_manifests/date=2026-10-13/hour=23/":
                 return [
                     {
                         "Contents": [
@@ -124,8 +123,8 @@ class IngestionHealthTests(unittest.TestCase):
         self.assertEqual(
             prefixes,
             {
-                "_manifests/date=2026-10-14/",
-                "_manifests/date=2026-10-13/",
+                "_manifests/date=2026-10-14/hour=00/",
+                "_manifests/date=2026-10-13/hour=23/",
             },
         )
         self.assertEqual(self.paginator.paginate.call_count, 2)

@@ -55,6 +55,7 @@
       - ./bronze_to_silver.py:/opt/airflow/src/bronze_to_silver.py
       - ./silver_to_gold.py:/opt/airflow/src/silver_to_gold.py
       - ./late_data.py:/opt/airflow/src/late_data.py
+      - ./ingestion_contract.py:/opt/airflow/src/ingestion_contract.py:ro
       - airflow_metadata:/opt/airflow
       - ./check_airflow_health.py:/opt/airflow/src/check_airflow_health.py:ro
     healthcheck:
