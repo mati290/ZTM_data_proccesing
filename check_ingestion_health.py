@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.config import Config
@@ -19,20 +19,30 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
     if max_age_seconds <= 0:
         return False, "INGESTION_MAX_MANIFEST_AGE_SECONDS must be positive"
 
-    now = now or datetime.now(timezone.utc)
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
     try:
         paginator = s3.get_paginator("list_objects_v2")
         latest = None
 
-        for page in paginator.paginate(
-            Bucket="bronze",
-            Prefix=MANIFEST_PREFIX,
-        ):
-            for obj in page.get("Contents", []):
-                modified = obj["LastModified"]
-                if latest is None or modified > latest["LastModified"]:
-                    latest = obj
+        first_date = min(
+            (now - timedelta(seconds=max_age_seconds)).date(),
+            (now - timedelta(days=1)).date(),
+        )
+        scan_date = now.date()
+
+        while scan_date >= first_date:
+            prefix = f"{MANIFEST_PREFIX}date={scan_date.isoformat()}/"
+            for page in paginator.paginate(
+                Bucket="bronze",
+                Prefix=prefix,
+            ):
+                for obj in page.get("Contents", []):
+                    modified = obj["LastModified"]
+                    if latest is None or modified > latest["LastModified"]:
+                        latest = obj
+
+            scan_date -= timedelta(days=1)
 
         if latest is None:
             return False, "No Bronze cycle manifests found"

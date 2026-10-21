@@ -14,6 +14,30 @@ class IngestionHealthTests(unittest.TestCase):
         self.s3 = Mock()
         self.paginator = self.s3.get_paginator.return_value
 
+    def test_scan_covers_longer_freshness_window(self):
+        self.paginator.paginate.return_value = [{"Contents": []}]
+
+        healthy, _ = check_ingestion_health(
+            self.s3,
+            max_age_seconds=48 * 60 * 60,
+            now=self.now,
+        )
+
+        self.assertFalse(healthy)
+        prefixes = {
+            call.kwargs["Prefix"] for call in self.paginator.paginate.call_args_list
+        }
+        self.assertEqual(
+            prefixes,
+            {
+                "_manifests/date=2026-10-13/",
+                "_manifests/date=2026-10-12/",
+                "_manifests/date=2026-10-11/",
+            },
+        )
+        self.assertEqual(self.paginator.paginate.call_count, 3)
+        self.s3.get_object.assert_not_called()
+
     def set_manifest(self, age_seconds, status="complete"):
         self.paginator.paginate.return_value = [
             {
@@ -31,6 +55,46 @@ class IngestionHealthTests(unittest.TestCase):
                 read=Mock(return_value=json.dumps({"status": status}).encode("utf-8"))
             )
         }
+
+    def test_scan_is_limited_to_recent_utc_dates(self):
+        self.now = datetime(2026, 10, 14, 0, 0, 30, tzinfo=timezone.utc)
+        key = "_manifests/date=2026-10-13/hour=23/cycle_test.json"
+
+        def list_partition(*, Bucket, Prefix):
+            self.assertEqual(Bucket, "bronze")
+            if Prefix == "_manifests/date=2026-10-13/":
+                return [
+                    {
+                        "Contents": [
+                            {
+                                "Key": key,
+                                "LastModified": self.now - timedelta(seconds=10),
+                            }
+                        ]
+                    }
+                ]
+            return [{"Contents": []}]
+
+        self.paginator.paginate.side_effect = list_partition
+        self.s3.get_object.return_value = {
+            "Body": Mock(read=Mock(return_value=b'{"status": "complete"}'))
+        }
+
+        healthy, _ = check_ingestion_health(self.s3, max_age_seconds=120, now=self.now)
+
+        self.assertTrue(healthy)
+        prefixes = {
+            call.kwargs["Prefix"] for call in self.paginator.paginate.call_args_list
+        }
+        self.assertEqual(
+            prefixes,
+            {
+                "_manifests/date=2026-10-14/",
+                "_manifests/date=2026-10-13/",
+            },
+        )
+        self.assertEqual(self.paginator.paginate.call_count, 2)
+        self.s3.get_object.assert_called_once_with(Bucket="bronze", Key=key)
 
     def test_non_object_manifest_is_unhealthy(self):
         for payload in ([], None, "complete", 123, True):
