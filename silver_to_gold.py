@@ -190,10 +190,17 @@ def diagnostic_manifest_uri(date_str: str, hour_str: str) -> str:
     return f"s3://gold/_diagnostics/{partition}/manifest.json"
 
 
-def write_publication_manifest(manifest_uri: str, manifest: dict) -> None:
+def write_publication_manifest(
+    manifest_uri: str,
+    manifest: dict,
+    s3_client=None,
+) -> None:
     """Atomically replace the single S3 commit manifest."""
     bucket, key = _parse_s3_uri(manifest_uri)
-    _s3_client().put_object(
+    if s3_client is None:
+        s3_client = _s3_client()
+
+    s3_client.put_object(
         Bucket=bucket,
         Key=key,
         Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
@@ -201,10 +208,17 @@ def write_publication_manifest(manifest_uri: str, manifest: dict) -> None:
     )
 
 
-def write_diagnostic_manifest(manifest_uri: str, manifest: dict) -> None:
+def write_diagnostic_manifest(
+    manifest_uri: str,
+    manifest: dict,
+    s3_client=None,
+) -> None:
     """Write a diagnostic manifest without replacing the full Gold commit."""
     bucket, key = _parse_s3_uri(manifest_uri)
-    _s3_client().put_object(
+    if s3_client is None:
+        s3_client = _s3_client()
+
+    s3_client.put_object(
         Bucket=bucket,
         Key=key,
         Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
@@ -730,7 +744,11 @@ def publish_tables(con, tables, uris: dict, s3_client=None) -> dict:
                     for table in tables
                 },
             }
-            write_publication_manifest(uris["manifest_uri"], manifest)
+            write_publication_manifest(
+                uris["manifest_uri"],
+                manifest,
+                s3_client=s3_client,
+            )
 
     finally:
         for table in tables:
@@ -800,6 +818,7 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
         write_diagnostic_manifest(
             diagnostic_manifest_uri(date_str, hour_str),
             diagnostic_manifest,
+            s3_client=s3_client,
         )
         if silver_present:
             raise ValueError(

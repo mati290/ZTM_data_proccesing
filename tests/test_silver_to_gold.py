@@ -532,6 +532,14 @@ class BuildGoldHourTests(unittest.TestCase):
         self.con.execute("SET TimeZone='UTC'")
         self.addCleanup(self.con.close)
 
+    def test_missing_silver_passes_client_to_diagnostic_manifest(self):
+        s3 = Mock()
+
+        with self.assertRaises(gold.SilverDataMissingError):
+            self.run_build(silver=False, s3_client=s3)
+
+        self.assertEqual(self.diagnostic_clients, [s3])
+
     def test_build_passes_s3_client_to_existence_check(self):
         s3 = Mock()
         silver_uri = "s3://silver/test/data.parquet"
@@ -641,7 +649,7 @@ class BuildGoldHourTests(unittest.TestCase):
 
         with (
             patch("silver_to_gold.read_completeness_marker", return_value=marker),
-            patch("silver_to_gold.write_diagnostic_manifest"),
+            patch("silver_to_gold.write_diagnostic_manifest") as write_diagnostic,
             patch(
                 "silver_to_gold.s3_object_exists",
                 side_effect=lambda uri, s3_client=None: (
@@ -666,6 +674,10 @@ class BuildGoldHourTests(unittest.TestCase):
                 )
             except Exception:
                 self.publish_calls = [c.args[1] for c in publish.call_args_list]
+                self.diagnostic_clients = [
+                    call.kwargs.get("s3_client")
+                    for call in write_diagnostic.call_args_list
+                ]
                 raise
         self.publish_calls = [c.args[1] for c in publish.call_args_list]
         self.publish_clients = [
@@ -745,6 +757,69 @@ class PublishTests(unittest.TestCase):
             self.assertTrue(uris["staging"][table].endswith(".parquet.pending"))
             self.assertIn("/_staging/", uris["staging"][table])
             self.assertIn(uris["publication_id"], uris["staging"][table])
+
+    def test_publication_passes_s3_client_to_commit_manifest(self):
+        con = Mock()
+        con.execute.return_value.fetchone.return_value = (1,)
+        s3 = Mock()
+        uris = {
+            "partition": "date=2026-01-15/hour=12",
+            "publication_id": "test-publication",
+            "silver": "s3://silver/test/data.parquet",
+            "manifest_uri": "s3://gold/_commits/test/manifest.json",
+            "staging": {
+                table: f"s3://gold/_staging/test/{table}.parquet"
+                for table in gold.GOLD_TABLES
+            },
+            "gold": {
+                table: f"s3://gold/_versions/test/{table}.parquet"
+                for table in gold.GOLD_TABLES
+            },
+        }
+
+        with (
+            patch.object(gold, "validate_staged_file"),
+            patch.object(gold, "copy_s3_object"),
+            patch.object(gold, "delete_s3_object"),
+            patch.object(gold, "write_publication_manifest") as write_manifest,
+        ):
+            gold.publish_tables(con, gold.GOLD_TABLES, uris, s3_client=s3)
+
+        write_manifest.assert_called_once()
+        self.assertEqual(write_manifest.call_args.args[0], uris["manifest_uri"])
+        self.assertIs(write_manifest.call_args.kwargs.get("s3_client"), s3)
+
+    def test_manifest_writers_use_supplied_s3_client(self):
+        cases = (
+            (
+                gold.write_publication_manifest,
+                "_commits/date=2026-01-15/hour=12/manifest.json",
+            ),
+            (
+                gold.write_diagnostic_manifest,
+                "_diagnostics/date=2026-01-15/hour=12/manifest.json",
+            ),
+        )
+        manifest = {"partition": "date=2026-01-15/hour=12"}
+
+        for writer, key in cases:
+            with self.subTest(writer=writer.__name__):
+                s3 = Mock()
+
+                with patch.object(gold, "_s3_client") as client_factory:
+                    writer(
+                        f"s3://gold/{key}",
+                        manifest,
+                        s3_client=s3,
+                    )
+
+                s3.put_object.assert_called_once_with(
+                    Bucket="gold",
+                    Key=key,
+                    Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                client_factory.assert_not_called()
 
     def test_publish_tables_passes_s3_client_to_copy(self):
         con = Mock()
@@ -841,7 +916,7 @@ class LocalPipelineTestCase(unittest.TestCase):
         )
         tmp.close()
 
-    def write_local_manifest(self, manifest_uri, manifest):
+    def write_local_manifest(self, manifest_uri, manifest, s3_client=None):
         path = manifest_uri.replace("\\", "/")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as file:
@@ -1289,7 +1364,7 @@ class GoldProcessTests(LocalPipelineTestCase):
         with open(manifest_uri, "r", encoding="utf-8") as file:
             previous_manifest = json.load(file)
 
-        def fail_manifest(uri, manifest):
+        def fail_manifest(uri, manifest, s3_client=None):
             raise RuntimeError("forced manifest write failure")
 
         next_run_at = RUN_AT + timedelta(seconds=1)
