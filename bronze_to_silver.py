@@ -291,23 +291,31 @@ def get_connection():
     password = os.getenv("MINIO_PASSWORD")
     if not user or not password:
         raise RuntimeError("MINIO_USER and MINIO_PASSWORD must be set")
+
     endpoint, use_ssl = parse_s3_endpoint(
         os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
     )
-
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute("SET TimeZone = 'UTC';")
 
     # DuckDB 1.2 does not accept bound parameters in CREATE SECRET.
     def literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
 
-    con.execute(
-        f"CREATE SECRET minio (TYPE s3, KEY_ID {literal(user)}, "
-        f"SECRET {literal(password)}, ENDPOINT {literal(endpoint)}, "
-        f"URL_STYLE 'path', USE_SSL {'true' if use_ssl else 'false'})"
-    )
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con.execute("SET TimeZone = 'UTC';")
+        con.execute(
+            f"CREATE SECRET minio (TYPE s3, KEY_ID {literal(user)}, "
+            f"SECRET {literal(password)}, ENDPOINT {literal(endpoint)}, "
+            f"URL_STYLE 'path', USE_SSL {'true' if use_ssl else 'false'})"
+        )
+    except duckdb.Error:
+        try:
+            con.close()
+        except duckdb.Error:
+            logger.error("Could not close connection after configuration failure")
+        raise
+
     return con
 
 

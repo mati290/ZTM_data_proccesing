@@ -1775,6 +1775,48 @@ class ConnectionConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_s3_endpoint("ftp://x")
 
+    def test_close_failure_preserves_configuration_failure(self):
+        env = {
+            "MINIO_USER": "test-user",
+            "MINIO_PASSWORD": "test-password",
+            "S3_ENDPOINT_URL": "http://minio:9000",
+        }
+        con = Mock()
+        setup_error = duckdb.Error("Simulated configuration failure")
+        con.execute.side_effect = setup_error
+        con.close.side_effect = duckdb.Error("Simulated close failure")
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("bronze_to_silver.duckdb.connect", return_value=con),
+            self.assertLogs(bronze_to_silver.logger, level="ERROR"),
+            self.assertRaises(duckdb.Error) as raised,
+        ):
+            get_connection()
+
+        self.assertIs(raised.exception, setup_error)
+        con.close.assert_called_once_with()
+
+    def test_configuration_failure_closes_connection(self):
+        env = {
+            "MINIO_USER": "test-user",
+            "MINIO_PASSWORD": "test-password",
+            "S3_ENDPOINT_URL": "http://minio:9000",
+        }
+        con = Mock()
+        setup_error = duckdb.Error("Simulated configuration failure")
+        con.execute.side_effect = setup_error
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("bronze_to_silver.duckdb.connect", return_value=con),
+            self.assertRaises(duckdb.Error) as raised,
+        ):
+            get_connection()
+
+        self.assertIs(raised.exception, setup_error)
+        con.close.assert_called_once_with()
+
     def test_get_connection_requires_credentials(self):
         with (
             patch.dict(os.environ, {}, clear=True),
