@@ -14,6 +14,41 @@ class IngestionHealthTests(unittest.TestCase):
         self.s3 = Mock()
         self.paginator = self.s3.get_paginator.return_value
 
+    def test_naive_check_time_is_unhealthy_before_storage_access(self):
+        healthy, message = check_ingestion_health(
+            self.s3,
+            max_age_seconds=120,
+            now=self.now.replace(tzinfo=None),
+        )
+
+        self.assertFalse(healthy)
+        self.assertIn("timezone-aware", message)
+        self.assertEqual(self.s3.mock_calls, [])
+
+    def test_check_uses_utc_dates_for_offset_timestamp(self):
+        self.now = datetime(2026, 10, 13, 23, 59, 30, tzinfo=timezone.utc)
+        self.set_manifest(30)
+        local_now = self.now.astimezone(timezone(timedelta(hours=2)))
+
+        healthy, _ = check_ingestion_health(
+            self.s3,
+            max_age_seconds=120,
+            now=local_now,
+        )
+
+        self.assertTrue(healthy)
+        prefixes = {
+            operation.kwargs["Prefix"]
+            for operation in self.paginator.paginate.call_args_list
+        }
+        self.assertEqual(
+            prefixes,
+            {
+                "_manifests/date=2026-10-13/",
+                "_manifests/date=2026-10-12/",
+            },
+        )
+
     def test_scan_covers_longer_freshness_window(self):
         self.paginator.paginate.return_value = [{"Contents": []}]
 

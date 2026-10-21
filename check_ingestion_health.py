@@ -19,7 +19,10 @@ def check_ingestion_health(s3, max_age_seconds=DEFAULT_MAX_AGE_SECONDS, now=None
     if max_age_seconds <= 0:
         return False, "INGESTION_MAX_MANIFEST_AGE_SECONDS must be positive"
 
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        return False, "Ingestion health check time must be timezone-aware"
+    now = now.astimezone(timezone.utc)
 
     try:
         paginator = s3.get_paginator("list_objects_v2")
