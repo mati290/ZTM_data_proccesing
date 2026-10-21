@@ -73,6 +73,7 @@ jobs:
           docker compose run --rm -T --no-deps \
             -v "$PWD/tests:/opt/airflow/src/tests:ro" \
             -v "$PWD/dags:/opt/airflow/src/dags:ro" \
+            -v "$PWD/analysis:/opt/airflow/src/analysis:ro" \
             -v "$PWD/ingest.py:/opt/airflow/src/ingest.py:ro" \
             -v "$PWD/check_ingestion_health.py:/opt/airflow/src/check_ingestion_health.py:ro" \
             -w /opt/airflow/src \

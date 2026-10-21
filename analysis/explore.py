@@ -71,11 +71,13 @@ def explore(date_str: str, hour_str: str) -> None:
             )
             SELECT
                 CASE
+                    WHEN delay IS NULL THEN '0: invalid/missing time'
+                    WHEN delay < INTERVAL 0 SECOND THEN '0: future GPS time'
                     WHEN delay < INTERVAL 1 MINUTE  THEN '1: < 1 min'
                     WHEN delay < INTERVAL 5 MINUTE  THEN '2: 1-5 min'
                     WHEN delay < INTERVAL 1 HOUR    THEN '3: 5-60 min'
                     WHEN delay < INTERVAL 1 DAY     THEN '4: 1-24 h'
-                    ELSE                                 '5: > 1 day'
+                    ELSE                                 '5: >= 1 day'
                 END AS bucket,
                 COUNT(*) AS records
             FROM d
