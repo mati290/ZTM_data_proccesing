@@ -845,10 +845,18 @@ def main():
     args = parser.parse_args()
 
     con = get_connection()
+    close_error = None
     try:
         build_gold_hour(con, args.date, args.hour)
     finally:
-        con.close()
+        try:
+            con.close()
+        except duckdb.Error as exc:
+            close_error = exc
+            logger.error("Could not close Silver-to-Gold CLI connection")
+
+    if close_error is not None:
+        raise close_error
 
 
 if __name__ == "__main__":

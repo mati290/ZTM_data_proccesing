@@ -2,6 +2,7 @@ import contextlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1343,6 +1344,50 @@ class GoldSilverContractTests(LocalPipelineTestCase):
 
         self.assertEqual(lines["unknown"], 2)
         self.assertEqual(sum(lines.values()), 6)
+
+
+class GoldCommandLineTests(unittest.TestCase):
+    def test_close_failure_does_not_hide_build_failure(self):
+        connection = Mock()
+        build_error = ValueError("Simulated Gold failure")
+        connection.close.side_effect = duckdb.Error("Simulated close failure")
+
+        with (
+            patch.object(gold, "get_connection", return_value=connection),
+            patch.object(gold, "build_gold_hour", side_effect=build_error),
+            patch.object(
+                sys,
+                "argv",
+                ["silver_to_gold.py", "--date", "2026-01-15", "--hour", "12"],
+            ),
+            self.assertRaises(ValueError) as raised,
+        ):
+            gold.main()
+
+        self.assertIs(raised.exception, build_error)
+        connection.close.assert_called_once_with()
+
+    def test_close_failure_after_success_is_reported(self):
+        connection = Mock()
+        close_error = duckdb.Error("Simulated close failure")
+        connection.close.side_effect = close_error
+
+        with (
+            patch.object(gold, "get_connection", return_value=connection),
+            patch.object(gold, "build_gold_hour") as build_gold,
+            patch.object(
+                sys,
+                "argv",
+                ["silver_to_gold.py", "--date", "2026-01-15", "--hour", "12"],
+            ),
+            self.assertLogs(gold.logger, level="ERROR"),
+            self.assertRaises(duckdb.Error) as raised,
+        ):
+            gold.main()
+
+        self.assertIs(raised.exception, close_error)
+        build_gold.assert_called_once_with(connection, "2026-01-15", "12")
+        connection.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
