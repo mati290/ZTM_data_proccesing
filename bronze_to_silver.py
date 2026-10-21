@@ -461,6 +461,7 @@ def write_silver_active_manifest(
     publication_id: str,
     artifacts: dict[str, str],
     source_inputs: list[dict] | None = None,
+    s3_client=None,
 ) -> None:
     """Publish a prepared Silver version by replacing its active manifest."""
     date_str, hour_str = validate_partition(date_str, hour_str)
@@ -496,7 +497,10 @@ def write_silver_active_manifest(
     if source_inputs is not None:
         validate_source_inputs(source_inputs, date_str, hour_str)
         manifest["source_inputs"] = source_inputs
-    _s3_client().put_object(
+    if s3_client is None:
+        s3_client = _s3_client()
+
+    s3_client.put_object(
         Bucket="silver",
         Key=f"vehicle_positions/{partition}/_active.json",
         Body=json.dumps(manifest, sort_keys=True).encode("utf-8"),
@@ -990,10 +994,19 @@ def assess_completeness(
     }
 
 
-def write_completeness_marker(completeness: dict, silver_dir: str) -> None:
+def write_completeness_marker(
+    completeness: dict,
+    silver_dir: str,
+    s3_client=None,
+) -> None:
     bucket, key = _parse_s3_uri(f"{silver_dir}/_completeness.json")
-    _s3_client().put_object(
-        Bucket=bucket, Key=key, Body=json.dumps(completeness).encode("utf-8")
+    if s3_client is None:
+        s3_client = _s3_client()
+
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(completeness).encode("utf-8"),
     )
 
 
@@ -1146,9 +1159,9 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
         )
 
         # Prepare the complete new version before switching the active pointer.
-        copy_s3_object(rejected_temp_file, rejected_file)
-        copy_s3_object(temp_file, output_file)
-        write_completeness_marker(completeness, version_dir)
+        copy_s3_object(rejected_temp_file, rejected_file, s3_client=s3_client)
+        copy_s3_object(temp_file, output_file, s3_client=s3_client)
+        write_completeness_marker(completeness, version_dir, s3_client=s3_client)
 
         # This is the publication point: readers now resolve the new version.
         write_silver_active_manifest(
@@ -1157,6 +1170,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
             publication_id,
             artifacts,
             source_inputs=source_inputs,
+            s3_client=s3_client,
         )
 
         if completeness["status"] != "complete":
@@ -1173,7 +1187,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
     finally:
         for temp_path in (temp_file, rejected_temp_file):
             try:
-                delete_s3_object(temp_path)
+                delete_s3_object(temp_path, s3_client=s3_client)
             except (BotoCoreError, ClientError) as exc:
                 logger.warning(
                     "Could not remove temporary Silver object %s: %s",

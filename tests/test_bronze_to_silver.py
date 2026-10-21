@@ -1473,6 +1473,40 @@ class TransformHourTests(unittest.TestCase):
         ]
         return connection
 
+    def test_transform_uses_supplied_client_for_publication_and_cleanup(self):
+        connection = self._happy_path_connection()
+        s3 = Mock()
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.copy_s3_object") as copy_object,
+            patch("bronze_to_silver.delete_s3_object") as delete_object,
+            patch("bronze_to_silver.write_silver_active_manifest") as write_active,
+        ):
+            transform_hour(
+                connection,
+                "2026-10-09",
+                "07",
+                s3_client=s3,
+            )
+
+        self.assertEqual(copy_object.call_count, 2)
+        self.assertEqual(delete_object.call_count, 2)
+        self.write_marker_mock.assert_called_once()
+        write_active.assert_called_once()
+
+        for operation in (
+            copy_object,
+            delete_object,
+            self.write_marker_mock,
+            write_active,
+        ):
+            for operation_call in operation.call_args_list:
+                self.assertIs(
+                    operation_call.kwargs.get("s3_client"),
+                    s3,
+                )
+
     def test_transform_passes_s3_client_to_completeness(self):
         connection = self._happy_path_connection()
         s3 = Mock()
@@ -1618,8 +1652,8 @@ class TransformHourTests(unittest.TestCase):
             f"{version_prefix}{publication_id}/quarantine.parquet",
         )
 
-        delete_mock.assert_any_call(data_source)
-        delete_mock.assert_any_call(rejected_source)
+        delete_mock.assert_any_call(data_source, s3_client=None)
+        delete_mock.assert_any_call(rejected_source, s3_client=None)
         self.assertEqual(delete_mock.call_count, 2)
 
         self.assess_mock.assert_called_once_with(
@@ -1631,6 +1665,7 @@ class TransformHourTests(unittest.TestCase):
         self.write_marker_mock.assert_called_once_with(
             self.completeness,
             f"{version_prefix}{publication_id}",
+            s3_client=None,
         )
         manifest_mock.assert_called_once_with(
             "2026-10-09",
@@ -1644,6 +1679,7 @@ class TransformHourTests(unittest.TestCase):
                 ),
             },
             source_inputs=self.source_inputs,
+            s3_client=None,
         )
 
     def test_warns_and_still_publishes_when_hour_is_incomplete(self):
@@ -1708,7 +1744,7 @@ class TransformHourTests(unittest.TestCase):
         connection = self._happy_path_connection()
         copy_calls = []
 
-        def fail_on_second_copy(source, destination):
+        def fail_on_second_copy(source, destination, s3_client=None):
             copy_calls.append((source, destination))
             if len(copy_calls) == 2:
                 raise RuntimeError("forced second publish failure")
