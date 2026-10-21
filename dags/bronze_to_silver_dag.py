@@ -1,6 +1,7 @@
 import logging
 from datetime import timedelta
 
+import duckdb
 import pendulum
 from airflow.sdk import dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowSkipException
@@ -33,6 +34,7 @@ def bronze_to_silver_hourly():
         hour_str = interval_start.strftime("%H")
 
         connection = bronze_to_silver.get_connection()
+        close_error = None
         try:
             bronze_to_silver.transform_hour(connection, date_str, hour_str)
         except bronze_to_silver.BronzeDataMissingError as exc:
@@ -56,7 +58,14 @@ def bronze_to_silver_hourly():
 
             raise
         finally:
-            connection.close()
+            try:
+                connection.close()
+            except duckdb.Error as exc:
+                close_error = exc
+                logger.error("Could not close Bronze-to-Silver task connection")
+
+        if close_error is not None:
+            raise close_error
 
     transform_bronze_to_silver()
 

@@ -1,5 +1,8 @@
 import os
 import unittest
+from unittest.mock import Mock, patch
+
+import duckdb
 
 try:
     from airflow.models import DagBag
@@ -28,6 +31,83 @@ class DagDefinitionTests(unittest.TestCase):
         self.assertEqual(
             dag.get_task("build_gold").upstream_task_ids, {"wait_for_silver"}
         )
+
+    def test_silver_task_reports_close_failure_after_success(self):
+        import bronze_to_silver
+
+        dag = self.bag.dags["bronze_to_silver_hourly"]
+        task_function = dag.get_task("transform_bronze_to_silver").python_callable
+
+        interval_start = Mock()
+        interval_start.in_timezone.return_value = interval_start
+        interval_start.strftime.side_effect = ["2026-01-15", "12"]
+
+        connection = Mock()
+        close_error = duckdb.Error("Simulated close failure")
+        connection.close.side_effect = close_error
+
+        with (
+            patch.dict(
+                task_function.__globals__,
+                {
+                    "get_current_context": lambda: {
+                        "data_interval_start": interval_start
+                    }
+                },
+            ),
+            patch.object(
+                bronze_to_silver,
+                "get_connection",
+                return_value=connection,
+            ),
+            patch.object(bronze_to_silver, "transform_hour") as transform,
+            self.assertRaises(duckdb.Error) as raised,
+        ):
+            task_function()
+
+        self.assertIs(raised.exception, close_error)
+        transform.assert_called_once_with(connection, "2026-01-15", "12")
+        connection.close.assert_called_once_with()
+
+    def test_silver_task_close_failure_preserves_transform_failure(self):
+        import bronze_to_silver
+
+        dag = self.bag.dags["bronze_to_silver_hourly"]
+        task_function = dag.get_task("transform_bronze_to_silver").python_callable
+
+        interval_start = Mock()
+        interval_start.in_timezone.return_value = interval_start
+        interval_start.strftime.side_effect = ["2026-01-15", "12"]
+
+        connection = Mock()
+        transform_error = ValueError("Simulated transform failure")
+        connection.close.side_effect = duckdb.Error("Simulated close failure")
+
+        with (
+            patch.dict(
+                task_function.__globals__,
+                {
+                    "get_current_context": lambda: {
+                        "data_interval_start": interval_start
+                    }
+                },
+            ),
+            patch.object(
+                bronze_to_silver,
+                "get_connection",
+                return_value=connection,
+            ),
+            patch.object(
+                bronze_to_silver,
+                "transform_hour",
+                side_effect=transform_error,
+            ),
+            self.assertRaises(ValueError) as raised,
+        ):
+            task_function()
+
+        self.assertIs(raised.exception, transform_error)
+        connection.close.assert_called_once_with()
 
     def test_gold_dag_has_retries_and_shares_silver_schedule(self):
         gold = self.bag.get_dag("silver_to_gold_hourly")
