@@ -269,6 +269,48 @@ class StaleHourTests(unittest.TestCase):
         )
         self.assertEqual(result, [("2026-01-15", "12")])
 
+    def test_scan_normalizes_aware_time_to_utc(self):
+        local_now = NOW.astimezone(timezone(timedelta(hours=2)))
+        s3 = Mock()
+
+        with patch.object(
+            late_data,
+            "is_hour_stale",
+            return_value=True,
+        ) as check_hour:
+            result = late_data.find_stale_hours(
+                now=local_now,
+                window_hours=2,
+                s3_client=s3,
+            )
+
+        self.assertEqual(
+            result,
+            [
+                ("2026-01-15", "11"),
+                ("2026-01-15", "12"),
+            ],
+        )
+        self.assertEqual(
+            check_hour.call_args_list,
+            [
+                call("2026-01-15", "11", s3),
+                call("2026-01-15", "12", s3),
+            ],
+        )
+
+    def test_naive_scan_time_is_rejected_before_storage_access(self):
+        s3 = Mock()
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            late_data.find_stale_hours(
+                now=NOW.replace(tzinfo=None),
+                window_hours=1,
+                s3_client=s3,
+            )
+
+        self.assertEqual(s3.mock_calls, [])
+
     def test_scan_failure_does_not_block_other_hours(self):
         s3 = Mock()
 

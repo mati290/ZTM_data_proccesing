@@ -211,7 +211,10 @@ def find_stale_hours(
     if window_hours <= 0:
         raise ValueError("window_hours must be a positive integer")
 
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.astimezone(timezone.utc)
     s3_client = s3_client or bronze_to_silver._s3_client()
     current_hour = now.replace(minute=0, second=0, microsecond=0)
 
