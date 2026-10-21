@@ -770,7 +770,10 @@ def publish_tables(con, tables, uris: dict, s3_client=None) -> dict:
 def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dict:
     """Build and publish all Gold tables for one UTC hour; safe to re-run."""
     date_str, hour_str = validate_partition(date_str, hour_str)
-    run_at = (run_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    run_at = run_at if run_at is not None else datetime.now(timezone.utc)
+    if run_at.tzinfo is None or run_at.utcoffset() is None:
+        raise ValueError("run_at must be timezone-aware")
+    run_at = run_at.astimezone(timezone.utc)
     uris = partition_uris(date_str, hour_str, s3_client=s3_client)
 
     completeness = load_completeness(date_str, hour_str, s3_client)

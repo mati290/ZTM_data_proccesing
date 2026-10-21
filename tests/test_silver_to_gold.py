@@ -532,6 +532,29 @@ class BuildGoldHourTests(unittest.TestCase):
         self.con.execute("SET TimeZone='UTC'")
         self.addCleanup(self.con.close)
 
+    def test_naive_run_time_is_rejected_before_storage_access(self):
+        s3 = Mock()
+        stop_at_resolution = RuntimeError("Unexpected storage resolution")
+
+        with (
+            patch.object(
+                gold,
+                "partition_uris",
+                side_effect=stop_at_resolution,
+            ) as resolve,
+            self.assertRaisesRegex(ValueError, "timezone-aware"),
+        ):
+            gold.build_gold_hour(
+                self.con,
+                "2026-01-15",
+                "12",
+                run_at=RUN_AT.replace(tzinfo=None),
+                s3_client=s3,
+            )
+
+        resolve.assert_not_called()
+        self.assertEqual(s3.mock_calls, [])
+
     def test_missing_silver_passes_client_to_diagnostic_manifest(self):
         s3 = Mock()
 
@@ -617,7 +640,9 @@ class BuildGoldHourTests(unittest.TestCase):
         ):
             self.run_build(path=silver_uri)
 
-    def run_build(self, status="complete", silver=True, path=None, s3_client=None):
+    def run_build(
+        self, status="complete", silver=True, path=None, s3_client=None, run_at=RUN_AT
+    ):
         marker = {"status": status, "cycles": 60, "complete_cycles": 60}
         silver_path = path or self.path
 
@@ -669,7 +694,7 @@ class BuildGoldHourTests(unittest.TestCase):
                     self.con,
                     "2026-01-15",
                     "12",
-                    RUN_AT,
+                    run_at,
                     s3_client=s3_client,
                 )
             except Exception:
@@ -684,6 +709,22 @@ class BuildGoldHourTests(unittest.TestCase):
             call.kwargs.get("s3_client") for call in publish.call_args_list
         ]
         return result
+
+    def test_aware_run_time_is_normalized_to_utc(self):
+        local_run_at = RUN_AT.astimezone(timezone(timedelta(hours=2)))
+
+        with patch.object(
+            gold,
+            "is_hour_final",
+            wraps=gold.is_hour_final,
+        ) as check_final:
+            self.run_build(run_at=local_run_at)
+
+        self.assertTrue(check_final.called)
+        for operation in check_final.call_args_list:
+            checked_time = operation.args[2]
+            self.assertEqual(checked_time, RUN_AT)
+            self.assertIs(checked_time.tzinfo, timezone.utc)
 
     def test_build_passes_s3_client_to_publication(self):
         s3 = Mock()
