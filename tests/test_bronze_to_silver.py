@@ -1861,6 +1861,57 @@ class CommandLineTests(unittest.TestCase):
         transform.assert_called_once_with(connection, "2026-10-09", "07")
         connection.close.assert_called_once()
 
+    def test_close_failure_after_success_is_reported(self):
+        connection = Mock()
+        close_error = duckdb.Error("Simulated close failure")
+        connection.close.side_effect = close_error
+
+        with (
+            patch(
+                "bronze_to_silver.get_connection",
+                return_value=connection,
+            ),
+            patch("bronze_to_silver.transform_hour") as transform,
+            patch.object(
+                sys,
+                "argv",
+                ["bronze_to_silver.py", "--date", "2026-10-09", "--hour", "07"],
+            ),
+            self.assertLogs(bronze_to_silver.logger, level="ERROR"),
+            self.assertRaises(duckdb.Error) as raised,
+        ):
+            main()
+
+        self.assertIs(raised.exception, close_error)
+        transform.assert_called_once_with(connection, "2026-10-09", "07")
+        connection.close.assert_called_once_with()
+
+    def test_close_failure_does_not_hide_transform_failure(self):
+        connection = Mock()
+        transform_error = ValueError("Simulated transform failure")
+        connection.close.side_effect = duckdb.Error("Simulated close failure")
+
+        with (
+            patch(
+                "bronze_to_silver.get_connection",
+                return_value=connection,
+            ),
+            patch(
+                "bronze_to_silver.transform_hour",
+                side_effect=transform_error,
+            ),
+            patch.object(
+                sys,
+                "argv",
+                ["bronze_to_silver.py", "--date", "2026-10-09", "--hour", "07"],
+            ),
+            self.assertRaises(ValueError) as raised,
+        ):
+            main()
+
+        self.assertIs(raised.exception, transform_error)
+        connection.close.assert_called_once_with()
+
 
 class SilverSchemaTests(unittest.TestCase):
     def setUp(self):
