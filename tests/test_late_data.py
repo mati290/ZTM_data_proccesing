@@ -913,6 +913,33 @@ class ReprocessTests(unittest.TestCase):
         build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW)
         self.assertEqual(result, expected)
 
+    def test_missing_bronze_stops_repair_before_gold_publication(self):
+        con = Mock()
+        con.execute.return_value.fetchone.return_value = None
+        s3 = Mock()
+
+        with (
+            patch.object(late_data, "is_hour_stale", return_value=True),
+            patch.object(late_data.silver_to_gold, "build_gold_hour") as build_gold,
+            patch.object(
+                late_data.bronze_to_silver, "write_silver_active_manifest"
+            ) as write_active,
+        ):
+            with self.assertRaises(bronze_to_silver.BronzeDataMissingError):
+                late_data.recompute_hour(
+                    con,
+                    "2026-01-15",
+                    "12",
+                    run_at=NOW,
+                    s3_client=s3,
+                )
+
+            build_gold.assert_not_called()
+            write_active.assert_not_called()
+
+        s3.put_object.assert_not_called()
+        s3.delete_object.assert_not_called()
+
     def test_nonfinal_gold_is_finalized_without_new_bronze(self):
         published_at = T0 + timedelta(minutes=35)
         silver_uri = (
