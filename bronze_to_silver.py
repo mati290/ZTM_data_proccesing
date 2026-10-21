@@ -757,6 +757,9 @@ def expected_slots_elapsed(
     if poll_interval_seconds <= 0:
         raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
 
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    date_str, hour_str = validate_partition(date_str, hour_str)
     hour_start = datetime.fromisoformat(f"{date_str}T{hour_str}:00:00+00:00")
     hour_end = hour_start + timedelta(hours=1)
     now_utc = now_utc.astimezone(timezone.utc)
@@ -869,6 +872,12 @@ def assess_completeness(
     source_inputs: list[dict] | None = None,
 ) -> dict:
     """Summarize ingestion cycle manifests for an hour (bus + tram both fetched)."""
+    date_str, hour_str = validate_partition(date_str, hour_str)
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    now_utc = now_utc.astimezone(timezone.utc)
     s3_client = s3_client or _s3_client()
     prefix = f"_manifests/date={date_str}/hour={hour_str}/"
     if source_inputs is None:
@@ -909,11 +918,6 @@ def assess_completeness(
     total = len(keys)
     if poll_interval_seconds is None:
         poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
-
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    elif now_utc.tzinfo is None:
-        raise ValueError("now_utc must be timezone-aware")
 
     expected_cycles = expected_slots_elapsed(
         date_str,

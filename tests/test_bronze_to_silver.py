@@ -57,6 +57,54 @@ class CompletenessTests(unittest.TestCase):
             client.get_object.return_value = {"Body": body}
         return client
 
+    def test_completeness_rejects_naive_time_before_storage_access(self):
+        client = Mock()
+        now = datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc).replace(tzinfo=None)
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            assess_completeness(
+                "2026-10-09",
+                "07",
+                client,
+                poll_interval_seconds=30,
+                now_utc=now,
+            )
+
+        self.assertEqual(client.mock_calls, [])
+
+    def test_completeness_normalizes_single_digit_hour(self):
+        client = self._client(
+            ["complete"],
+            ["2026-10-09T07:00:00+00:00"],
+        )
+
+        result = assess_completeness(
+            "2026-10-09",
+            "7",
+            client,
+            poll_interval_seconds=30,
+            now_utc=datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["expected_cycles"], 2)
+        self.assertEqual(result["observed_slots"], 1)
+        self.assertEqual(result["missing_cycles"], 1)
+        client.get_paginator.return_value.paginate.assert_called_once_with(
+            Bucket="bronze",
+            Prefix="_manifests/date=2026-10-09/hour=07/",
+        )
+
+    def test_expected_slots_reject_naive_time(self):
+        now = datetime(2026, 10, 9, 7, 0, 30, tzinfo=timezone.utc).replace(tzinfo=None)
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            bronze_to_silver.expected_slots_elapsed(
+                "2026-10-09",
+                "07",
+                now,
+                30,
+            )
+
     def test_elapsed_slots_follow_epoch_boundaries(self):
         hour_start = datetime(2026, 10, 9, 7, tzinfo=timezone.utc)
         start_epoch = int(hour_start.timestamp())
