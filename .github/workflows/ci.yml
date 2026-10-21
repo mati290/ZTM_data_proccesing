@@ -68,6 +68,13 @@ jobs:
       - name: Verify the Airflow image includes transformation dependencies
         run: docker compose run --rm --no-deps airflow python -c "import bronze_to_silver, silver_to_gold"
 
+      - name: Run DAG tests inside Airflow
+        run: |
+          docker compose run --rm -T --no-deps \
+            -v "$PWD/tests:/opt/airflow/src/tests:ro" \
+            -v "$PWD/dags:/opt/airflow/src/dags:ro" \
+            -w /opt/airflow/src \
+            airflow python -B -m unittest tests.test_dags -v
       - name: End-to-end smoke test (MinIO -> Silver on production DuckDB)
         run: |
           docker compose up -d minio

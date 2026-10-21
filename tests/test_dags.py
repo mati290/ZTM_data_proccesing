@@ -74,7 +74,7 @@ class DagDefinitionTests(unittest.TestCase):
                 connection.close.assert_called_once_with()
 
     def test_gold_dag_waits_for_silver_then_builds(self):
-        dag = self.bag.get_dag("silver_to_gold_hourly")
+        dag = self.bag.dags["silver_to_gold_hourly"]
         sensor = dag.get_task("wait_for_silver")
         self.assertEqual(sensor.external_dag_id, "bronze_to_silver_hourly")
         self.assertEqual(sensor.external_task_id, "transform_bronze_to_silver")
@@ -202,8 +202,8 @@ class DagDefinitionTests(unittest.TestCase):
         connection.close.assert_called_once_with()
 
     def test_gold_dag_has_retries_and_shares_silver_schedule(self):
-        gold = self.bag.get_dag("silver_to_gold_hourly")
-        silver = self.bag.get_dag("bronze_to_silver_hourly")
+        gold = self.bag.dags["silver_to_gold_hourly"]
+        silver = self.bag.dags["bronze_to_silver_hourly"]
         self.assertGreaterEqual(gold.default_args["retries"], 1)
         self.assertEqual(str(gold.timetable.summary), str(silver.timetable.summary))
         self.assertEqual(gold.max_active_runs, 1)
@@ -211,10 +211,10 @@ class DagDefinitionTests(unittest.TestCase):
     def test_hourly_dags_do_not_catch_up(self):
         for dag_id in ("bronze_to_silver_hourly", "silver_to_gold_hourly"):
             with self.subTest(dag_id=dag_id):
-                self.assertFalse(self.bag.get_dag(dag_id).catchup)
+                self.assertFalse(self.bag.dags[dag_id].catchup)
 
     def test_late_data_dag_is_single_run_with_retries(self):
-        dag = self.bag.get_dag("reprocess_late_data_hourly")
+        dag = self.bag.dags["reprocess_late_data_hourly"]
         self.assertIsNotNone(dag)
         self.assertEqual(dag.max_active_runs, 1)
         self.assertFalse(dag.catchup)
@@ -230,7 +230,7 @@ class DagDefinitionTests(unittest.TestCase):
         )
 
         for dag_id, task_id in writers:
-            task = self.bag.get_dag(dag_id).get_task(task_id)
+            task = self.bag.dags[dag_id].get_task(task_id)
             self.assertEqual(task.pool, expected_pool)
 
 
