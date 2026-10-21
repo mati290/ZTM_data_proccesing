@@ -1028,7 +1028,13 @@ class ReprocessTests(unittest.TestCase):
                 con=con,
             )
 
-        transform.assert_called_once_with(con, "2026-01-15", "12", overwrite=True)
+        transform.assert_called_once_with(
+            con,
+            "2026-01-15",
+            "12",
+            overwrite=True,
+            s3_client=s3,
+        )
         build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW, s3_client=s3)
         con.close.assert_not_called()
 
@@ -1240,7 +1246,13 @@ class ReprocessTests(unittest.TestCase):
         self.assertEqual(
             operations.mock_calls,
             [
-                call.silver(con, "2026-01-15", "12", overwrite=True),
+                call.silver(
+                    con,
+                    "2026-01-15",
+                    "12",
+                    overwrite=True,
+                    s3_client=s3,
+                ),
                 call.gold(con, "2026-01-15", "12", NOW, s3_client=s3),
             ],
         )

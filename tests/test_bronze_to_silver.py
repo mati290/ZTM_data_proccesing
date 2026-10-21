@@ -1473,6 +1473,40 @@ class TransformHourTests(unittest.TestCase):
         ]
         return connection
 
+    def test_overwrite_guard_uses_supplied_s3_client(self):
+        connection = self._happy_path_connection()
+        s3 = Mock()
+        artifacts = {
+            "data": "s3://silver/test/data.parquet",
+            "quarantine": "s3://silver/test/quarantine.parquet",
+        }
+
+        with (
+            patch.object(
+                bronze_to_silver,
+                "resolve_silver_artifacts",
+                return_value=artifacts,
+            ) as resolve,
+            patch.object(
+                bronze_to_silver,
+                "s3_object_exists",
+                return_value=True,
+            ) as exists,
+            patch.object(bronze_to_silver, "copy_s3_object") as copy_object,
+            self.assertRaises(FileExistsError),
+        ):
+            transform_hour(
+                connection,
+                "2026-10-09",
+                "07",
+                overwrite=False,
+                s3_client=s3,
+            )
+
+        resolve.assert_called_once_with("2026-10-09", "07", s3_client=s3)
+        exists.assert_called_once_with(artifacts["data"], s3_client=s3)
+        copy_object.assert_not_called()
+
     def test_transform_uses_supplied_client_for_publication_and_cleanup(self):
         connection = self._happy_path_connection()
         s3 = Mock()

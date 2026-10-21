@@ -250,7 +250,13 @@ def find_stale_hours(
 def recompute_hour(con, date_str, hour_str, run_at=None, s3_client=None):
     s3_client = s3_client or bronze_to_silver._s3_client()
     if is_hour_stale(date_str, hour_str, s3_client):
-        bronze_to_silver.transform_hour(con, date_str, hour_str, overwrite=True)
+        bronze_to_silver.transform_hour(
+            con,
+            date_str,
+            hour_str,
+            overwrite=True,
+            s3_client=s3_client,
+        )
     return silver_to_gold.build_gold_hour(
         con, date_str, hour_str, run_at, s3_client=s3_client
     )

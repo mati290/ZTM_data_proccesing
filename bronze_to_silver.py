@@ -1109,9 +1109,11 @@ def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
     rejected_count = before - after
 
     if not overwrite:
-        active_artifacts = resolve_silver_artifacts(date_str, hour_str)
+        active_artifacts = resolve_silver_artifacts(
+            date_str, hour_str, s3_client=s3_client
+        )
         if any(
-            s3_object_exists(path)
+            s3_object_exists(path, s3_client=s3_client)
             for path in (
                 active_artifacts["data"],
                 active_artifacts["quarantine"],
