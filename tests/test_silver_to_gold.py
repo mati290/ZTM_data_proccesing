@@ -532,6 +532,29 @@ class BuildGoldHourTests(unittest.TestCase):
         self.con.execute("SET TimeZone='UTC'")
         self.addCleanup(self.con.close)
 
+    def test_build_passes_s3_client_to_partition_resolution(self):
+        s3 = Mock()
+        stop_after_resolution = RuntimeError("Stop after partition resolution")
+
+        with (
+            patch.object(
+                gold,
+                "partition_uris",
+                side_effect=stop_after_resolution,
+            ) as resolve,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            gold.build_gold_hour(
+                self.con,
+                "2026-01-15",
+                "12",
+                RUN_AT,
+                s3_client=s3,
+            )
+
+        self.assertIs(raised.exception, stop_after_resolution)
+        resolve.assert_called_once_with("2026-01-15", "12", s3_client=s3)
+
     def test_legacy_silver_etag_is_captured_before_reading(self):
         silver_key = "vehicle_positions/date=2026-01-15/hour=12/data.parquet"
         silver_uri = f"s3://silver/{silver_key}"
@@ -560,7 +583,7 @@ class BuildGoldHourTests(unittest.TestCase):
         marker = {"status": status, "cycles": 60, "complete_cycles": 60}
         silver_path = path or self.path
 
-        def fake_uris(date_str, hour_str):
+        def fake_uris(date_str, hour_str, s3_client=None):
             partition = f"date={date_str}/hour={hour_str}"
             publication_id = "test-publication"
 
@@ -673,6 +696,28 @@ class PublishTests(unittest.TestCase):
             self.assertIn("/_staging/", uris["staging"][table])
             self.assertIn(uris["publication_id"], uris["staging"][table])
 
+    def test_partition_uris_uses_supplied_s3_client(self):
+        s3 = Mock()
+        artifacts = {
+            "data": "s3://silver/test/data.parquet",
+            "quarantine": "s3://silver/test/quarantine.parquet",
+        }
+
+        with patch.object(
+            gold,
+            "resolve_silver_artifacts",
+            return_value=artifacts,
+        ) as resolve:
+            uris = gold.partition_uris(
+                "2026-01-15",
+                "09",
+                s3_client=s3,
+            )
+
+        resolve.assert_called_once_with("2026-01-15", "09", s3_client=s3)
+        self.assertEqual(uris["silver"], artifacts["data"])
+        self.assertEqual(uris["quarantine"], artifacts["quarantine"])
+
     def test_partition_uris_include_commit_manifest(self):
         with patch(
             "silver_to_gold.resolve_silver_artifacts",
@@ -722,7 +767,7 @@ class LocalPipelineTestCase(unittest.TestCase):
             json.dump(manifest, file, sort_keys=True)
 
     # Generates local URIs for gold, staging, and manifest files.
-    def local_uris(self, date_str, hour_str):
+    def local_uris(self, date_str, hour_str, s3_client=None):
         partition = f"date={date_str}/hour={hour_str}"
         publication_id = gold.uuid.uuid4().hex
 
@@ -870,8 +915,8 @@ class GoldProcessTests(LocalPipelineTestCase):
         self.write_quarantine(["duplicate", "stale_gps_time"])
         original_local_uris = self.local_uris
 
-        def local_uris_with_etag(date_str, hour_str):
-            uris = original_local_uris(date_str, hour_str)
+        def local_uris_with_etag(date_str, hour_str, s3_client=None):
+            uris = original_local_uris(date_str, hour_str, s3_client=s3_client)
             uris["source_silver_etag"] = '"source-etag"'
             return uris
 

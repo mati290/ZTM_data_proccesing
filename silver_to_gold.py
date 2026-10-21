@@ -151,12 +151,12 @@ class SilverDataMissingError(FileNotFoundError):
     """Raised when the Silver partition for the hour does not exist."""
 
 
-def partition_uris(date_str: str, hour_str: str) -> dict:
+def partition_uris(date_str: str, hour_str: str, s3_client=None) -> dict:
     date_str, hour_str = validate_partition(date_str, hour_str)
     partition = f"date={date_str}/hour={hour_str}"
     publication_id = uuid.uuid4().hex
 
-    silver_artifacts = resolve_silver_artifacts(date_str, hour_str)
+    silver_artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
 
     return {
         "silver": silver_artifacts["data"],
@@ -746,7 +746,7 @@ def build_gold_hour(con, date_str, hour_str, run_at=None, s3_client=None) -> dic
     """Build and publish all Gold tables for one UTC hour; safe to re-run."""
     date_str, hour_str = validate_partition(date_str, hour_str)
     run_at = (run_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    uris = partition_uris(date_str, hour_str)
+    uris = partition_uris(date_str, hour_str, s3_client=s3_client)
 
     completeness = load_completeness(date_str, hour_str, s3_client)
     silver_present = s3_object_exists(uris["silver"])
