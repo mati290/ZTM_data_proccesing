@@ -1473,6 +1473,56 @@ class TransformHourTests(unittest.TestCase):
         ]
         return connection
 
+    def test_transform_passes_s3_client_to_completeness(self):
+        connection = self._happy_path_connection()
+        s3 = Mock()
+
+        with (
+            patch("bronze_to_silver.validate_silver_schema"),
+            patch("bronze_to_silver.copy_s3_object"),
+            patch("bronze_to_silver.delete_s3_object"),
+            patch("bronze_to_silver.write_silver_active_manifest"),
+        ):
+            transform_hour(
+                connection,
+                "2026-10-09",
+                "07",
+                s3_client=s3,
+            )
+
+        self.assess_mock.assert_called_once_with(
+            "2026-10-09",
+            "07",
+            s3_client=s3,
+            source_inputs=self.source_inputs,
+        )
+
+    def test_transform_passes_s3_client_to_input_capture(self):
+        connection = Mock()
+        connection.execute.return_value.fetchone.return_value = (
+            "s3://bronze/test/data.jsonl",
+        )
+        s3 = Mock()
+        stop_after_capture = RuntimeError("Stop at input capture")
+
+        with (
+            patch.object(
+                bronze_to_silver,
+                "capture_bronze_inputs",
+                side_effect=stop_after_capture,
+            ) as capture,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            transform_hour(
+                connection,
+                "2026-10-09",
+                "07",
+                s3_client=s3,
+            )
+
+        self.assertIs(raised.exception, stop_after_capture)
+        capture.assert_called_once_with("2026-10-09", "07", s3_client=s3)
+
     def test_fails_when_bronze_partition_has_no_files(self):
         connection = Mock()
         connection.execute.return_value.fetchone.return_value = None
@@ -1573,7 +1623,10 @@ class TransformHourTests(unittest.TestCase):
         self.assertEqual(delete_mock.call_count, 2)
 
         self.assess_mock.assert_called_once_with(
-            "2026-10-09", "07", source_inputs=self.source_inputs
+            "2026-10-09",
+            "07",
+            s3_client=None,
+            source_inputs=self.source_inputs,
         )
         self.write_marker_mock.assert_called_once_with(
             self.completeness,

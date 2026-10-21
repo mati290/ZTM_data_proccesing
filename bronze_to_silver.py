@@ -1036,7 +1036,7 @@ def validate_output_quality(
         )
 
 
-def transform_hour(con, date_str, hour_str, overwrite=True):
+def transform_hour(con, date_str, hour_str, overwrite=True, s3_client=None):
     date_str, hour_str = validate_partition(date_str, hour_str)
     partition = f"date={date_str}/hour={hour_str}"
     bronze_path = f"s3://bronze/vehicle_type=*/date={date_str}/hour={hour_str}/*.jsonl"
@@ -1068,7 +1068,7 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
             "refusing to report success for an empty partition."
         )
 
-    source_inputs = capture_bronze_inputs(date_str, hour_str)
+    source_inputs = capture_bronze_inputs(date_str, hour_str, s3_client=s3_client)
     data_files = [
         f"s3://bronze/{obj['key']}"
         for obj in source_inputs
@@ -1139,7 +1139,10 @@ def transform_hour(con, date_str, hour_str, overwrite=True):
             )
 
         completeness = assess_completeness(
-            date_str, hour_str, source_inputs=source_inputs
+            date_str,
+            hour_str,
+            s3_client=s3_client,
+            source_inputs=source_inputs,
         )
 
         # Prepare the complete new version before switching the active pointer.
