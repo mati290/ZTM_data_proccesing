@@ -53,7 +53,16 @@ def is_hour_stale(date_str, hour_str, s3_client) -> bool:
             bronze_latest = modified
 
     if bronze_latest is None:
-        return False
+        recorded_inputs = bronze_to_silver.read_silver_source_inputs(
+            date_str, hour_str, s3_client
+        )
+        if recorded_inputs is None:
+            return False
+
+        current_inputs = bronze_to_silver.capture_bronze_inputs(
+            date_str, hour_str, s3_client
+        )
+        return current_inputs != recorded_inputs
 
     try:
         artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)

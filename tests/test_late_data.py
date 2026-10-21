@@ -268,6 +268,30 @@ class StaleHourTests(unittest.TestCase):
         )
         self.assertEqual(result, [("2026-01-15", "12")])
 
+    def test_deleted_bronze_inputs_make_existing_silver_stale(self):
+        objects = dict([bronze("12", T0)])
+        s3 = FakeS3(objects)
+        captured = bronze_to_silver.capture_bronze_inputs("2026-01-15", "12", s3)
+        self.assertTrue(captured)
+
+        objects.clear()
+        objects.update(
+            [
+                silver("12", T0 + timedelta(minutes=35)),
+                silver_completeness("12", T0 + timedelta(minutes=35)),
+                silver_quarantine("12", T0 + timedelta(minutes=35)),
+            ]
+        )
+
+        with patch.object(
+            bronze_to_silver,
+            "read_silver_source_inputs",
+            return_value=captured,
+        ):
+            result = late_data.is_hour_stale("2026-01-15", "12", s3)
+
+        self.assertTrue(result)
+
     def test_window_requires_integer_before_storage_access(self):
         for window_hours in (True, False, 1.5, "24", None):
             with self.subTest(window_hours=window_hours):
