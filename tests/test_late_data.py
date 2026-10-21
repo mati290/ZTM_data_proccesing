@@ -268,6 +268,35 @@ class StaleHourTests(unittest.TestCase):
         )
         self.assertEqual(result, [("2026-01-15", "12")])
 
+    def test_scan_failure_does_not_block_other_hours(self):
+        s3 = Mock()
+
+        with (
+            patch.object(
+                late_data,
+                "is_hour_stale",
+                side_effect=[
+                    ValueError("Invalid Silver manifest"),
+                    True,
+                ],
+            ) as check_hour,
+            self.assertLogs(late_data.logger, level="ERROR"),
+        ):
+            result = late_data.find_stale_hours(
+                now=NOW,
+                window_hours=2,
+                s3_client=s3,
+            )
+
+        self.assertEqual(
+            result,
+            [
+                ("2026-01-15", "11"),
+                ("2026-01-15", "12"),
+            ],
+        )
+        self.assertEqual(check_hour.call_count, 2)
+
     def test_deleted_bronze_inputs_make_existing_silver_stale(self):
         objects = dict([bronze("12", T0)])
         s3 = FakeS3(objects)
@@ -880,6 +909,37 @@ class ReprocessTests(unittest.TestCase):
         with patch.object(late_data, "find_stale_hours", return_value=[]):
             result = late_data.reprocess_late_data(con=None)
         self.assertEqual(result["recomputed"], [])
+
+    def test_scan_failure_allows_other_repairs_but_run_fails(self):
+        con = Mock()
+        s3 = Mock()
+
+        def check_hour(date_str, hour_str, s3_client):
+            if hour_str == "11":
+                raise ValueError("Invalid Silver manifest")
+            return True
+
+        with (
+            patch.object(late_data, "is_hour_stale", side_effect=check_hour),
+            patch.object(late_data.bronze_to_silver, "transform_hour") as transform,
+            patch.object(
+                late_data.silver_to_gold,
+                "build_gold_hour",
+                return_value={"status": "complete"},
+            ) as build_gold,
+            self.assertLogs(late_data.logger, level="ERROR"),
+            self.assertRaisesRegex(RuntimeError, "2026-01-15 11"),
+        ):
+            late_data.reprocess_late_data(
+                now=NOW,
+                window_hours=2,
+                s3_client=s3,
+                con=con,
+            )
+
+        transform.assert_called_once_with(con, "2026-01-15", "12", overwrite=True)
+        build_gold.assert_called_once_with(con, "2026-01-15", "12", NOW)
+        con.close.assert_not_called()
 
     def test_gold_repair_does_not_rebuild_fresh_silver(self):
         con = Mock()

@@ -14,6 +14,8 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
+from botocore.exceptions import BotoCoreError
+
 import bronze_to_silver
 import silver_to_gold
 from bronze_to_silver import (
@@ -216,19 +218,31 @@ def find_stale_hours(
     for offset in range(window_hours, 0, -1):
         hour_start = current_hour - timedelta(hours=offset)
         date_str, hour_str = hour_start.strftime("%Y-%m-%d"), hour_start.strftime("%H")
-        if is_hour_stale(date_str, hour_str, s3_client):
-            stale.append((date_str, hour_str))
-            continue
 
-        artifacts = resolve_silver_artifacts(date_str, hour_str, s3_client=s3_client)
-        bucket, key = _parse_s3_uri(artifacts["data"])
-        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
-        silver_exists = any(
-            obj.get("Key") == key for obj in response.get("Contents", [])
-        )
+        try:
+            if is_hour_stale(date_str, hour_str, s3_client):
+                stale.append((date_str, hour_str))
+                continue
 
-        if silver_exists and is_gold_stale(date_str, hour_str, s3_client, now=now):
+            artifacts = resolve_silver_artifacts(
+                date_str, hour_str, s3_client=s3_client
+            )
+            bucket, key = _parse_s3_uri(artifacts["data"])
+            response = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+            silver_exists = any(
+                obj.get("Key") == key for obj in response.get("Contents", [])
+            )
+
+            if silver_exists and is_gold_stale(date_str, hour_str, s3_client, now=now):
+                stale.append((date_str, hour_str))
+        except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
+            logger.exception(
+                "Could not inspect %s hour %s; scheduling a repair attempt",
+                date_str,
+                hour_str,
+            )
             stale.append((date_str, hour_str))
+
     return stale
 
 
