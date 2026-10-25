@@ -28,7 +28,7 @@ class ZTMApiError(Exception):
     """Raised when the ZTM API returns an error message instead of data."""
 
 
-url = "https://api.um.warszawa.pl/api/action/busestrams_get/"
+url = "https://dane.um.warszawa.pl/api/action/get_ztm_lokalizacja_pojazdow"
 
 
 def _safe_error_summary(error: Exception) -> str:
@@ -67,15 +67,18 @@ def fetch_positions(
 ) -> list[dict]:
     if max_attempts <= 0:
         raise ValueError("max_attempts must be positive")
-    params = {
-        "resource_id": "f2e5503e-927d-4ad3-9500-4ab9e55deb59",
-        "apikey": api_key,
-        "type": vehicle_type,
-    }
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.post(
+                url,
+                headers={"Authorization": api_key},
+                json={"type": vehicle_type},
+                timeout=10,
+                allow_redirects=False,
+            )
             response.raise_for_status()
+            if 300 <= response.status_code < 400:
+                raise ZTMApiError("API redirect refused to protect credentials")
             data = response.json()
             if not isinstance(data, dict) or "result" not in data:
                 raise ZTMApiError("API response is missing the result field")

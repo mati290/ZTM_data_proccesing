@@ -197,14 +197,20 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(saved_record["_ingested_at"], fixed_time.isoformat())
 
     def test_fetch_positions_returns_api_records(self):
-        response = Mock()
+        response = Mock(status_code=200)
         response.json.return_value = {"result": [{"VehicleNumber": "123"}]}
 
-        with patch("ingest.requests.get", return_value=response) as request:
+        with patch("ingest.requests.post", return_value=response) as request:
             records = fetch_positions(1, "test-key", max_attempts=1)
 
         self.assertEqual(records, [{"VehicleNumber": "123"}])
-        self.assertEqual(request.call_args.kwargs["params"]["type"], 1)
+        request.assert_called_once_with(
+            "https://dane.um.warszawa.pl/api/action/get_ztm_lokalizacja_pojazdow",
+            headers={"Authorization": "test-key"},
+            json={"type": 1},
+            timeout=10,
+            allow_redirects=False,
+        )
 
     def test_cycle_crossing_midnight_keeps_data_and_manifest_in_slot_partition(self):
         s3 = Mock()
@@ -247,24 +253,35 @@ class SaveToBronzeTests(unittest.TestCase):
         self.assertEqual(manifest["ingested_at"], manifest_written_at.isoformat())
 
     def test_fetch_positions_rejects_api_error_result(self):
-        response = Mock()
+        response = Mock(status_code=200)
         response.json.return_value = {"result": "Invalid API key"}
 
         with (
-            patch("ingest.requests.get", return_value=response) as request,
+            patch("ingest.requests.post", return_value=response) as request,
             self.assertRaises(ZTMApiError),
         ):
             fetch_positions(1, "test-key", max_attempts=1)
         request.assert_called_once()
 
+    def test_fetch_positions_refuses_redirect_without_forwarding_key(self):
+        response = Mock(status_code=302)
+        with (
+            patch("ingest.requests.post", return_value=response) as request,
+            self.assertRaisesRegex(ZTMApiError, "redirect refused"),
+        ):
+            fetch_positions(1, "test-key")
+        request.assert_called_once()
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        response.json.assert_not_called()
+
     def test_fetch_positions_rejects_malformed_api_payload_without_retry(self):
         malformed_payloads = ({}, {"result": {"VehicleNumber": "123"}})
         for payload in malformed_payloads:
             with self.subTest(payload=payload):
-                response = Mock()
+                response = Mock(status_code=200)
                 response.json.return_value = payload
                 with (
-                    patch("ingest.requests.get", return_value=response) as request,
+                    patch("ingest.requests.post", return_value=response) as request,
                     patch("ingest.time.sleep") as sleep,
                     self.assertRaises(ZTMApiError),
                 ):
@@ -274,14 +291,14 @@ class SaveToBronzeTests(unittest.TestCase):
 
     def test_fetch_positions_does_not_log_api_key_on_http_error(self):
         api_key = "test-secret-key"
-        response = Mock()
+        response = Mock(status_code=200)
         response.raise_for_status.side_effect = HTTPError(
             f"401 Client Error for url: https://example.test/?apikey={api_key}",
             response=Mock(status_code=401),
         )
 
         with (
-            patch("ingest.requests.get", return_value=response),
+            patch("ingest.requests.post", return_value=response),
             patch("ingest.time.sleep"),
             self.assertLogs("ingest", level="WARNING") as captured,
             self.assertRaises(HTTPError),
@@ -298,7 +315,7 @@ class SaveToBronzeTests(unittest.TestCase):
             with (
                 self.subTest(status=status),
                 patch(
-                    "ingest.requests.get", side_effect=HTTPError(response=response)
+                    "ingest.requests.post", side_effect=HTTPError(response=response)
                 ) as request,
                 patch("ingest.time.sleep") as sleep,
                 self.assertRaises(HTTPError),
@@ -309,11 +326,11 @@ class SaveToBronzeTests(unittest.TestCase):
 
     def test_rate_limit_honors_retry_after_before_retry(self):
         limited = Mock(status_code=429, headers={"Retry-After": "90"})
-        success = Mock()
+        success = Mock(status_code=200)
         success.json.return_value = {"result": []}
         with (
             patch(
-                "ingest.requests.get",
+                "ingest.requests.post",
                 side_effect=[HTTPError(response=limited), success],
             ),
             patch("ingest.time.sleep") as sleep,
@@ -324,7 +341,7 @@ class SaveToBronzeTests(unittest.TestCase):
     def test_rate_limit_honors_retry_after_on_last_attempt(self):
         limited = Mock(status_code=429, headers={"Retry-After": "120"})
         with (
-            patch("ingest.requests.get", side_effect=HTTPError(response=limited)),
+            patch("ingest.requests.post", side_effect=HTTPError(response=limited)),
             patch("ingest.time.sleep") as sleep,
             self.assertRaises(HTTPError),
         ):
@@ -334,12 +351,12 @@ class SaveToBronzeTests(unittest.TestCase):
     def test_transient_http_errors_still_retry(self):
         for status in (408, 500, 502, 503, 504):
             response = Mock(status_code=status)
-            success = Mock()
+            success = Mock(status_code=200)
             success.json.return_value = {"result": []}
             with (
                 self.subTest(status=status),
                 patch(
-                    "ingest.requests.get",
+                    "ingest.requests.post",
                     side_effect=[HTTPError(response=response), success],
                 ) as request,
                 patch("ingest.time.sleep") as sleep,
@@ -349,11 +366,11 @@ class SaveToBronzeTests(unittest.TestCase):
             sleep.assert_called_once_with(2)
 
     def test_fetch_positions_retries_after_timeout(self):
-        response = Mock()
+        response = Mock(status_code=200)
         response.json.return_value = {"result": []}
 
         with (
-            patch("ingest.requests.get", side_effect=[Timeout(), response]) as request,
+            patch("ingest.requests.post", side_effect=[Timeout(), response]) as request,
             patch("ingest.time.sleep") as sleep,
         ):
             records = fetch_positions(2, "test-key", max_attempts=2)
